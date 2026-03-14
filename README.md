@@ -2,6 +2,40 @@
 
 Ein lokaler OpenAI-kompatibler Orchestrator fuer VS Code Clients, der Requests an einen externen `llama.cpp`-Server mit `Qwen2.5-Coder` weiterleitet.
 
+## Praxis-Setup
+
+Dieses Repository ist fuer ein konkretes, praxisnahes Homelab-/Workstation-Setup gedacht:
+
+- Proxmox als Host
+- eine dedizierte VM mit AMD MI50 per PCIe-Passthrough
+- auf der MI50-VM laeuft `llama.cpp`
+- ein separater LXC-Container oder kleiner Linux-Host betreibt diesen Gateway
+- VS Code oder Continue sprechen nur mit dem Gateway, nicht direkt mit `llama.cpp`
+
+Die grobe Architektur sieht so aus:
+
+```text
+VS Code / Continue
+        |
+        v
+llm-gateway (FastAPI, Python, Uvicorn)
+        |
+        v
+MI50-VM mit llama.cpp + Qwen2.5-Coder
+```
+
+Warum diese Aufteilung sinnvoll ist:
+
+- Die GPU-VM bleibt auf Inferenz konzentriert.
+- Der Gateway kann Auth, Logging, Modell-Mapping, Health-Checks und Admin-Funktionen uebernehmen.
+- VS Code Clients bekommen eine einfache OpenAI-kompatible HTTP-Schnittstelle.
+- Netzwerk, Neustarts und spaetere Routing-Logik landen nicht direkt auf der GPU-VM.
+
+Wichtige praktische Annahme:
+
+- Der Gateway kennt nur die HTTP-Adresse des `llama.cpp`-Backends, zum Beispiel `http://192.168.40.111:8080`.
+- Wenn du auf der MI50-VM den echten Kontext von 8K auf 16K erhoehst, muss `llama.cpp` dort selbst mit passendem Kontext gestartet werden. Der Gateway-Wert allein reicht dafuer nicht.
+
 ## Ziel
 
 Dieses Grundgeruest stellt drei Endpunkte bereit:
