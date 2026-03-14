@@ -1,0 +1,10 @@
+name: llm-gateway
+version: 0.0.1
+schema: v1
+
+models:
+  - name: qwen2.5-coder-local
+    provider: openai
+    model: qwen2.5-coder
+    apiBase: http://127.0.0.1:8000/v1
+    apiKey: CHANGE_ME
