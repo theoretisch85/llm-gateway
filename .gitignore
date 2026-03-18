@@ -5,6 +5,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+.ssh/
 deploy/continue.config.local.yaml
 .vscode/
 .idea/

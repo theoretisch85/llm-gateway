@@ -53,23 +53,23 @@ Dieses Grundgeruest stellt drei Endpunkte bereit:
 Die Minimalversion priorisiert:
 
 - einfache lokale Startbarkeit
-- ein oeffentliches Modellalias `qwen2.5-coder`
+- standardmaessig `devstral-q3` als oeffentliches Modell
 - konfigurierbare Weiterleitung an `llama.cpp`
 - saubere Timeout- und Fehlerbehandlung
 
 ## Modell-Mapping
 
-Der Gateway bietet genau einen oeffentlichen Modellnamen an:
+Der Gateway bietet standardmaessig genau einen oeffentlichen Modellnamen an:
 
-- `PUBLIC_MODEL_NAME=qwen2.5-coder`
+- `PUBLIC_MODEL_NAME=devstral-q3`
 
 Intern sendet der Gateway Requests an das echte Backend-Modell:
 
-- `BACKEND_MODEL_NAME=qwen2.5-coder-7b-instruct-q4_k_m.gguf`
+- `BACKEND_MODEL_NAME=devstral-q3.gguf`
 
 Das bedeutet:
 
-- Clients sprechen immer gegen `qwen2.5-coder`
+- Clients sprechen standardmaessig gegen `devstral-q3`
 - der Gateway mappt intern auf das reale `llama.cpp`-Modell
 - Antworten werden wieder auf den oeffentlichen Modellnamen zurueckgeschrieben, damit Clients konsistent bleiben
 
@@ -77,7 +77,7 @@ Das bedeutet:
 
 Der Gateway ist nicht mehr nur ein einzelner Qwen-Proxy, sondern die erste kleine AI-Plattform-Stufe:
 
-- Fast Model, z. B. `qwen2.5-coder`
+- Fast Model, aktuell ebenfalls `devstral-q3`
 - Deep Model, z. B. `devstral`
 - Auto-Routing fuer einfache vs. komplexere Aufgaben
 - Admin-Chatseite mit Session-Verlauf und Streaming
@@ -98,7 +98,7 @@ Wenn du aktuell nur ein Modell gleichzeitig auf der MI50 fahren kannst, ist das 
 
 Empfohlener Ist-Zustand:
 
-- `FAST_MODEL_*` auf dein laufendes Qwen setzen
+- `FAST_MODEL_*` auf dein laufendes Devstral setzen
 - `DEEP_MODEL_*` leer lassen oder noch nicht aktiv verwenden
 - `Auto-Routing` faellt dann automatisch auf das Fast Model zurueck
 
@@ -345,15 +345,15 @@ CONTEXT_RESPONSE_RESERVE=1024
 CONTEXT_CHARS_PER_TOKEN=4.0
 DEFAULT_MAX_TOKENS=512
 
-PUBLIC_MODEL_NAME=qwen2.5-coder
-BACKEND_MODEL_NAME=qwen2.5-coder-7b-instruct-q4_k_m.gguf
-FAST_MODEL_PUBLIC_NAME=qwen2.5-coder
-FAST_MODEL_BACKEND_NAME=qwen2.5-coder-7b-instruct-q4_k_m.gguf
+PUBLIC_MODEL_NAME=devstral-q3
+BACKEND_MODEL_NAME=devstral-q3.gguf
+FAST_MODEL_PUBLIC_NAME=devstral-q3
+FAST_MODEL_BACKEND_NAME=devstral-q3.gguf
 FAST_MODEL_BASE_URL=http://192.168.40.111:8080
-DEEP_MODEL_PUBLIC_NAME=devstral
-DEEP_MODEL_BACKEND_NAME=devstral-medium
-DEEP_MODEL_BASE_URL=http://192.168.40.111:8080
-ADMIN_DEFAULT_MODE=auto
+DEEP_MODEL_PUBLIC_NAME=
+DEEP_MODEL_BACKEND_NAME=
+DEEP_MODEL_BASE_URL=
+ADMIN_DEFAULT_MODE=fast
 ROUTING_DEEP_KEYWORDS=architektur,analyse,refactor,refactoring,debug,design,plan,root cause,komplex
 ROUTING_LENGTH_THRESHOLD=1200
 ROUTING_HISTORY_THRESHOLD=8
@@ -535,8 +535,23 @@ Verfuegbar:
 - `kai restart`
 - `kai health`
 - `kai models`
+- `kai telemetry`
 
 Das ist bewusst kontrollierter als ein generisches Browser-Terminal. Fuer spaeter kann daraus ein groesseres Panel werden, aber die V1 bleibt absichtlich enger.
+
+Auf dem Dashboard koennen zusaetzlich einfache MI50-Telemetriedaten aus `rocm-smi` erscheinen:
+
+- VRAM belegt / gesamt
+- Temperatur
+- Watt
+
+Wenn `rocm-smi` keine sauberen Used/Total-Werte liefert, faellt das Dashboard fuer VRAM auf den Prozentwert (`VRAM%`) zurueck.
+
+Voraussetzung dafuer:
+
+- SSH-Zugriff vom Gateway zur MI50-VM
+- `rocm-smi` auf der MI50-VM verfuegbar
+- ein passender Command in `MI50_ROCM_SMI_COMMAND`
 
 Genutzte MI50-/SSH-Schalter:
 
@@ -546,6 +561,7 @@ Genutzte MI50-/SSH-Schalter:
 - `MI50_RESTART_COMMAND`
 - `MI50_STATUS_COMMAND`
 - `MI50_LOGS_COMMAND`
+- `MI50_ROCM_SMI_COMMAND`
 
 ## Raspberry Pi / Device API
 
@@ -604,8 +620,10 @@ Passend dazu im Gateway:
 ```env
 LLAMACPP_BASE_URL=http://DEINE_MI50_VM:8080
 LLAMACPP_API_KEY=DEIN_BACKEND_TOKEN
-FAST_MODEL_PUBLIC_NAME=qwen2.5-coder
-FAST_MODEL_BACKEND_NAME=qwen2.5-coder
+PUBLIC_MODEL_NAME=devstral-q3
+BACKEND_MODEL_NAME=devstral-q3.gguf
+FAST_MODEL_PUBLIC_NAME=devstral-q3
+FAST_MODEL_BACKEND_NAME=devstral-q3.gguf
 FAST_MODEL_BASE_URL=http://DEINE_MI50_VM:8080
 DEEP_MODEL_PUBLIC_NAME=
 DEEP_MODEL_BACKEND_NAME=
@@ -613,6 +631,7 @@ DEEP_MODEL_BASE_URL=
 BACKEND_CONTEXT_WINDOW=16384
 CONTEXT_RESPONSE_RESERVE=2048
 DEFAULT_MAX_TOKENS=1024
+ADMIN_DEFAULT_MODE=fast
 ```
 
 Wenn du spaeter ein Deep-Modell als zweiten Prozess oder auf einer zweiten GPU startest, bekommt es einfach einen zweiten Port oder Host und wird ueber `DEEP_MODEL_BASE_URL` eingebunden.
@@ -678,7 +697,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H "Authorization: Bearer change-me" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen2.5-coder",
+    "model": "devstral-q3",
     "messages": [
       {"role": "system", "content": "You are a helpful coding assistant."},
       {"role": "user", "content": "Write a Python function that adds two numbers."}
@@ -696,7 +715,7 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
   -H "Authorization: Bearer change-me" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen2.5-coder",
+    "model": "devstral-q3",
     "messages": [
       {"role": "user", "content": "Explain quicksort in 5 lines."}
     ],
@@ -733,7 +752,7 @@ Fehlerfall fuer unvollstaendige Chat-Anfrage:
 curl -i http://127.0.0.1:8000/v1/chat/completions \
   -H "Authorization: Bearer change-me" \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen2.5-coder"}'
+  -d '{"model":"devstral-q3"}'
 ```
 
 Metrics ohne Token:
@@ -774,9 +793,9 @@ version: 0.0.1
 schema: v1
 
 models:
-  - name: qwen2.5-coder-local
+  - name: devstral-q3-local
     provider: openai
-    model: qwen2.5-coder
+    model: devstral-q3
     apiBase: http://127.0.0.1:8000/v1
     apiKey: CHANGE_ME
 ```
@@ -879,6 +898,8 @@ Es liest diese Variablen aus `.env` oder aus der aktuellen Shell:
 - `MI50_SSH_PORT`
 - `MI50_RESTART_COMMAND`
 - `MI50_STATUS_COMMAND`
+- `MI50_LOGS_COMMAND`
+- `MI50_ROCM_SMI_COMMAND`
 
 Beispiel:
 
@@ -886,8 +907,10 @@ Beispiel:
 MI50_SSH_HOST=192.168.40.111
 MI50_SSH_USER=llmadmin
 MI50_SSH_PORT=22
-MI50_RESTART_COMMAND=sudo systemctl restart llama.cpp
-MI50_STATUS_COMMAND=sudo systemctl status llama.cpp --no-pager
+MI50_RESTART_COMMAND=sudo systemctl restart kai
+MI50_STATUS_COMMAND=sudo systemctl status kai --no-pager
+MI50_LOGS_COMMAND=journalctl -u kai -n 80 --no-pager
+MI50_ROCM_SMI_COMMAND=rocm-smi --showtemp --showpower --showmemuse --json
 ```
 
 Aufruf:

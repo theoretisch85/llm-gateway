@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     mi50_restart_command: str | None = Field(default=None, alias="MI50_RESTART_COMMAND")
     mi50_status_command: str | None = Field(default=None, alias="MI50_STATUS_COMMAND")
     mi50_logs_command: str | None = Field(default=None, alias="MI50_LOGS_COMMAND")
+    mi50_rocm_smi_command: str | None = Field(default=None, alias="MI50_ROCM_SMI_COMMAND")
 
     @property
     def backend_chat_completions_url(self) -> str:

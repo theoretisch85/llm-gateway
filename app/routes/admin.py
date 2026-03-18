@@ -50,6 +50,7 @@ class AdminConfigUpdate(BaseModel):
     MI50_RESTART_COMMAND: str
     MI50_STATUS_COMMAND: str
     MI50_LOGS_COMMAND: str
+    MI50_ROCM_SMI_COMMAND: str
 
 
 @router.get("/internal/admin", response_class=HTMLResponse, response_model=None)
@@ -89,6 +90,7 @@ async def get_admin_config() -> dict[str, str]:
     current.setdefault("MI50_RESTART_COMMAND", settings.mi50_restart_command or "sudo systemctl restart kai")
     current.setdefault("MI50_STATUS_COMMAND", settings.mi50_status_command or "systemctl status kai --no-pager")
     current.setdefault("MI50_LOGS_COMMAND", settings.mi50_logs_command or "journalctl -u kai -n 80 --no-pager")
+    current.setdefault("MI50_ROCM_SMI_COMMAND", settings.mi50_rocm_smi_command or "rocm-smi --showtemp --showpower --showmemuse --json")
     return current
 
 
@@ -410,6 +412,21 @@ def _admin_html(username: str) -> str:
                   <strong id="backendCallsValue">-</strong>
                   <div class="muted">inkl. Health Checks</div>
                 </div>
+                <div class="card stat">
+                  <div class="muted">GPU Temp</div>
+                  <strong id="gpuTempValue">-</strong>
+                  <div class="muted">MI50 edge temp</div>
+                </div>
+                <div class="card stat">
+                  <div class="muted">Board Power</div>
+                  <strong id="gpuPowerValue">-</strong>
+                  <div class="muted">rocm-smi watt</div>
+                </div>
+                <div class="card stat">
+                  <div class="muted">VRAM</div>
+                  <strong id="gpuVramValue">-</strong>
+                  <div class="muted">belegt / gesamt</div>
+                </div>
               </div>
               <div class="two-col" style="margin-top:18px;">
                 <div class="card">
@@ -438,6 +455,7 @@ def _admin_html(username: str) -> str:
                       <label style="grid-column:1/-1;"><span>MI50_RESTART_COMMAND</span><input id="MI50_RESTART_COMMAND"></label>
                       <label style="grid-column:1/-1;"><span>MI50_STATUS_COMMAND</span><input id="MI50_STATUS_COMMAND"></label>
                       <label style="grid-column:1/-1;"><span>MI50_LOGS_COMMAND</span><input id="MI50_LOGS_COMMAND"></label>
+                      <label style="grid-column:1/-1;"><span>MI50_ROCM_SMI_COMMAND</span><input id="MI50_ROCM_SMI_COMMAND"></label>
                     </div>
                     <div class="actions">
                       <button class="primary" type="submit">Speichern</button>
@@ -481,6 +499,7 @@ def _admin_html(username: str) -> str:
                     <option value="health">health</option>
                     <option value="uptime">uptime (gateway)</option>
                     <option value="models">models (kai)</option>
+                    <option value="telemetry">telemetry (kai)</option>
                   </select>
                   <button class="secondary" type="button" onclick="opsAction('status')">Status</button>
                   <button class="secondary" type="button" onclick="opsAction('logs')">Logs</button>
@@ -549,7 +568,8 @@ def _admin_html(username: str) -> str:
               "MI50_SSH_PORT",
               "MI50_RESTART_COMMAND",
               "MI50_STATUS_COMMAND",
-              "MI50_LOGS_COMMAND"
+              "MI50_LOGS_COMMAND",
+              "MI50_ROCM_SMI_COMMAND"
             ];
 
             function switchTab(id, button) {
@@ -584,6 +604,15 @@ def _admin_html(username: str) -> str:
                 const metrics = await metricsRes.json();
                 const config = await configRes.json();
                 window.currentConfig = config;
+                let telemetry = null;
+                try {
+                  const telemetryRes = await fetch("/api/admin/ops/kai/run/telemetry");
+                  if (telemetryRes.ok) {
+                    telemetry = await telemetryRes.json();
+                  }
+                } catch (error) {
+                  telemetry = null;
+                }
 
                 document.getElementById("gatewayState").textContent = health.gateway?.status || "-";
                 document.getElementById("gatewayInfo").textContent = "Gateway antwortet";
@@ -591,6 +620,16 @@ def _admin_html(username: str) -> str:
                 document.getElementById("backendInfo").textContent = `${health.backend?.model || "-"} @ ${health.backend?.base_url || "-"}`;
                 document.getElementById("requestsValue").textContent = metrics.total_requests ?? "-";
                 document.getElementById("backendCallsValue").textContent = metrics.backend_calls ?? "-";
+                document.getElementById("gpuTempValue").textContent = telemetry?.temperature_c != null ? `${telemetry.temperature_c} C` : "n/a";
+                document.getElementById("gpuPowerValue").textContent = telemetry?.power_w != null ? `${telemetry.power_w} W` : "n/a";
+                if (telemetry?.vram_used_gib != null && telemetry?.vram_total_gib != null) {
+                  document.getElementById("gpuVramValue").textContent =
+                    `${telemetry.vram_used_gib} / ${telemetry.vram_total_gib} GiB (${telemetry.vram_percent ?? "?"}%)`;
+                } else if (telemetry?.vram_percent != null) {
+                  document.getElementById("gpuVramValue").textContent = `${telemetry.vram_percent}%`;
+                } else {
+                  document.getElementById("gpuVramValue").textContent = "n/a";
+                }
 
                 for (const key of configFields) {
                   const node = document.getElementById(key);
@@ -614,6 +653,7 @@ def _admin_html(username: str) -> str:
               payload.MI50_RESTART_COMMAND = payload.MI50_RESTART_COMMAND || "sudo systemctl restart kai";
               payload.MI50_STATUS_COMMAND = payload.MI50_STATUS_COMMAND || "systemctl status kai --no-pager";
               payload.MI50_LOGS_COMMAND = payload.MI50_LOGS_COMMAND || "journalctl -u kai -n 80 --no-pager";
+              payload.MI50_ROCM_SMI_COMMAND = payload.MI50_ROCM_SMI_COMMAND || "rocm-smi --showtemp --showpower --showmemuse --json";
 
               const res = await fetch("/internal/admin/config", {
                 method: "POST",
