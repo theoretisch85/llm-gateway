@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import JSONResponse
 
-from app.auth import require_bearer_token
+from app.auth import require_admin_api_auth
 from app.config import get_settings
 from app.services.llamacpp_client import LlamaCppClient, LlamaCppError, LlamaCppTimeoutError
 
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["internal-health"])
 
 
-@router.get("/internal/health", dependencies=[Depends(require_bearer_token)])
+@router.get("/internal/health", dependencies=[Depends(require_admin_api_auth)])
 async def internal_health(request: Request) -> JSONResponse:
     settings = get_settings()
     client = LlamaCppClient(settings)

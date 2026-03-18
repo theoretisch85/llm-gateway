@@ -45,7 +45,10 @@ Dieses Grundgeruest stellt drei Endpunkte bereit:
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - `GET /internal/metrics`
+- `GET /admin/login`
 - `GET /internal/admin`
+- `GET /internal/chat`
+- `POST /api/device/ask`
 
 Die Minimalversion priorisiert:
 
@@ -69,6 +72,110 @@ Das bedeutet:
 - Clients sprechen immer gegen `qwen2.5-coder`
 - der Gateway mappt intern auf das reale `llama.cpp`-Modell
 - Antworten werden wieder auf den oeffentlichen Modellnamen zurueckgeschrieben, damit Clients konsistent bleiben
+
+## Plattform-V1
+
+Der Gateway ist nicht mehr nur ein einzelner Qwen-Proxy, sondern die erste kleine AI-Plattform-Stufe:
+
+- Fast Model, z. B. `qwen2.5-coder`
+- Deep Model, z. B. `devstral`
+- Auto-Routing fuer einfache vs. komplexere Aufgaben
+- Admin-Chatseite mit Session-Verlauf und Streaming
+- vorbereitete PostgreSQL-Zielstruktur fuer spaeteren persistenten Memory-Betrieb
+- Login-Grundlage fuer Browser-Adminseiten
+- vorbereiteter Device-Endpunkt fuer spaetere Raspberry-Pi-/TTS-Anbindung
+
+Wichtige ehrliche Einschraenkung der aktuellen V1:
+
+- Die neue Admin-Chat-/Session-Schicht nutzt aktuell einen In-Memory-Store im Gateway-Prozess.
+- Das bedeutet: Sessions und Zusammenfassungen ueberleben keinen Neustart.
+- Das PostgreSQL-Zielschema liegt bereits unter `deploy/postgres_schema.sql`, ist aber noch nicht als harte Runtime-Abhaengigkeit aktiviert.
+- Diese Entscheidung ist bewusst pragmatisch: neue Plattformfunktionen sofort nutzbar halten, ohne den laufenden Gateway bei fehlender DB zu blockieren.
+
+## Ein-Modell-Betrieb jetzt, Deep-Modell spaeter
+
+Wenn du aktuell nur ein Modell gleichzeitig auf der MI50 fahren kannst, ist das kein Problem.
+
+Empfohlener Ist-Zustand:
+
+- `FAST_MODEL_*` auf dein laufendes Qwen setzen
+- `DEEP_MODEL_*` leer lassen oder noch nicht aktiv verwenden
+- `Auto-Routing` faellt dann automatisch auf das Fast Model zurueck
+
+Das ist bewusst im Code abgefangen:
+
+- `deep` ohne konfiguriertes Deep Model -> Fallback auf Fast
+- `auto` ohne konfiguriertes Deep Model -> Fast
+
+Sobald spaeter eine zweite GPU oder ein zweiter separater Modellprozess dazukommt, kannst du `DEEP_MODEL_*` einfach nachziehen.
+
+## Routing
+
+Es gibt drei Modi:
+
+- `fast`
+  Erzwingt das schnelle Modell.
+- `deep`
+  Erzwingt das tiefere Modell.
+- `auto`
+  Der Gateway entscheidet regelbasiert.
+
+Die Auto-Regeln sind absichtlich einfach und nachvollziehbar:
+
+- Deep, wenn Deep-Keywords vorkommen
+- Deep, wenn die Eingabe laenger als `ROUTING_LENGTH_THRESHOLD` ist
+- Deep, wenn der Chat-Verlauf laenger als `ROUTING_HISTORY_THRESHOLD` ist
+- sonst Fast
+
+Konfigurierbar per `.env`:
+
+- `FAST_MODEL_PUBLIC_NAME`
+- `FAST_MODEL_BACKEND_NAME`
+- `FAST_MODEL_BASE_URL`
+- `DEEP_MODEL_PUBLIC_NAME`
+- `DEEP_MODEL_BACKEND_NAME`
+- `DEEP_MODEL_BASE_URL`
+- `ADMIN_DEFAULT_MODE`
+- `ROUTING_DEEP_KEYWORDS`
+- `ROUTING_LENGTH_THRESHOLD`
+- `ROUTING_HISTORY_THRESHOLD`
+- `DATABASE_URL`
+- `ADMIN_USERNAME`
+- `ADMIN_PASSWORD`
+- `ADMIN_SESSION_SECRET`
+- `ADMIN_SESSION_TTL_HOURS`
+- `ADMIN_COOKIE_SECURE`
+- `DEVICE_SHARED_TOKEN`
+
+## Session- und Context-Management
+
+Fuer die neue Admin-Chatseite arbeitet der Gateway mit drei einfachen Bausteinen:
+
+- Session-Verlauf
+  Letzte Nachrichten einer Session werden gespeichert.
+- Sliding Window
+  Fuer den Modellaufruf werden nur die letzten relevanten Nachrichten verwendet.
+- Rolling Summary
+  Wenn eine Session laenger wird, erzeugt der Gateway eine knappe Text-Zusammenfassung aelterer Inhalte statt sie einfach stumpf zu verwerfen.
+
+Das ist bewusst keine magische Langzeit-KI-Memory-Schicht. Es ist eine kleine, robuste V1 gegen offensichtliche Kontextueberlaeufe.
+
+## PostgreSQL-Zielstruktur
+
+Fuer den spaeteren persistenten Memory-Ausbau liegt ein startbarer Schema-Entwurf hier:
+
+- `deploy/postgres_schema.sql`
+
+Enthalten sind:
+
+- `chat_sessions`
+- `chat_messages`
+- `memory_summaries`
+- `routing_events`
+
+Konfigurationsschalter:
+
+- `DATABASE_URL`
 
 ## Authentifizierung
 
@@ -240,6 +347,23 @@ DEFAULT_MAX_TOKENS=512
 
 PUBLIC_MODEL_NAME=qwen2.5-coder
 BACKEND_MODEL_NAME=qwen2.5-coder-7b-instruct-q4_k_m.gguf
+FAST_MODEL_PUBLIC_NAME=qwen2.5-coder
+FAST_MODEL_BACKEND_NAME=qwen2.5-coder-7b-instruct-q4_k_m.gguf
+FAST_MODEL_BASE_URL=http://192.168.40.111:8080
+DEEP_MODEL_PUBLIC_NAME=devstral
+DEEP_MODEL_BACKEND_NAME=devstral-medium
+DEEP_MODEL_BASE_URL=http://192.168.40.111:8080
+ADMIN_DEFAULT_MODE=auto
+ROUTING_DEEP_KEYWORDS=architektur,analyse,refactor,refactoring,debug,design,plan,root cause,komplex
+ROUTING_LENGTH_THRESHOLD=1200
+ROUTING_HISTORY_THRESHOLD=8
+DATABASE_URL=
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=
+ADMIN_SESSION_SECRET=
+ADMIN_SESSION_TTL_HOURS=24
+ADMIN_COOKIE_SECURE=false
+DEVICE_SHARED_TOKEN=
 ```
 
 ## Entwicklungsstart
@@ -276,7 +400,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `GET /health` ist nur ein Liveness-Check ohne Upstream-Pruefung.
 - `GET /internal/health` ist der geschuetzte Readiness-Check gegen das Backend.
 - `GET /internal/metrics` zeigt einfache Laufzeitdaten seit Prozessstart.
-- `GET /internal/admin` liefert eine kleine interne Admin-Seite fuer ausgewaehlte Runtime-Einstellungen.
+- `GET /admin/login` liefert den Browser-Login fuer die geschuetzten Admin-Seiten.
+- `GET /internal/admin` liefert jetzt einen echten Admin-Hub mit Menueleiste.
+- `GET /internal/chat` bleibt als eigenstaendige Chat-Seite bestehen und wird im Hub eingebettet.
 - Wenn das Backend echtes SSE-Streaming liefert, leitet der Gateway dieses durch.
 - Wenn das Backend bei `stream=true` nur JSON liefert, erzeugt der Gateway einen einfachen SSE-Fallback.
 - Dieser Fallback ist absichtlich minimal: brauchbar fuer OpenAI-aehnliche Clients, aber nicht gleichwertig zu nativer Token-fuer-Token-Ausgabe.
@@ -312,33 +438,184 @@ Wichtige Einschraenkung:
 - Fuer Coding-Workflows waere so ein automatisches Zerstueckeln oft semantisch kaputt.
 - Diese V1 ist nur ein Schutz gegen offensichtliche Kontext-Ueberlaeufe.
 
-## Interne Admin-Seite
+## Admin-Hub
 
-Unter `GET /internal/admin` gibt es eine kleine Browser-Oberflaeche fuer:
+Unter `GET /internal/admin` gibt es jetzt einen Browser-Hub mit Login und Menueleiste fuer:
 
 - `LLAMACPP_BASE_URL`
 - `PUBLIC_MODEL_NAME`
 - `BACKEND_MODEL_NAME`
+- `FAST_MODEL_*`
+- `DEEP_MODEL_*`
 - `BACKEND_CONTEXT_WINDOW`
 - `CONTEXT_RESPONSE_RESERVE`
 - `CONTEXT_CHARS_PER_TOKEN`
 - `DEFAULT_MAX_TOKENS`
+- `ADMIN_DEFAULT_MODE`
+- Routing-Regeln
 - `MI50_SSH_HOST`
 - `MI50_SSH_USER`
 - `MI50_SSH_PORT`
 - `MI50_RESTART_COMMAND`
 - `MI50_STATUS_COMMAND`
+- `MI50_LOGS_COMMAND`
 - Continue-YAML-Vorschau
 
 Wichtig:
 
-- Die HTML-Seite selbst ist leicht aufrufbar.
-- Die eigentlichen Daten-Endpunkte dahinter bleiben per Bearer-Token geschuetzt.
+- Browser-Zugriff laeuft jetzt ueber `GET /admin/login` und ein Session-Cookie.
+- API-Endpunkte im Admin-Bereich akzeptieren Session-Cookie oder Bearer-Token.
 - Aenderungen werden in `.env` geschrieben und fuer neue Requests sofort uebernommen.
-- Das ist bewusst nur eine kleine interne Betriebsseite, kein komplettes Admin-System.
+- Das ist bewusst noch kein vollwertiges Internet-Admin-System, aber eine saubere V1 fuer spaeteren Reverse-Proxy-Betrieb.
 - Ueber die Admin-Seite kann auch ein geschuetzter MI50-Neustart per SSH angestossen werden.
 - Ein groesserer Wert bei `BACKEND_CONTEXT_WINDOW` aendert nur die Gateway-Heuristik.
 - Wenn das entfernte `llama.cpp` wirklich mit 16K statt 8K laufen soll, muss der MI50-Startbefehl selbst entsprechend angepasst werden, zum Beispiel mit `-c 16384` oder ueber eine passende entfernte systemd-Konfiguration.
+
+## Admin-Chatseite
+
+Unter `GET /internal/chat` gibt es jetzt eine getrennte Chatoberflaeche fuer den direkten Betrieb:
+
+- Cookie-Login ueber den Admin-Hub oder Bearer-Token fuer direkte API-Tests
+- Sessions anlegen, laden, resetten und loeschen
+- `Auto`, `Fast` oder `Deep` waehlen
+- Antworten direkt streamen
+- den aufgeloesten Modellnamen und die Routing-Regel pro Session sehen
+
+Im Hub wird diese Seite ueber den Chat-Tab eingebettet, damit du nicht mehr staendig zwischen komplett getrennten Browser-Seiten springen musst.
+
+Wichtige Grenze:
+
+- Die Session-Daten sind in der aktuellen V1 noch prozesslokal im Speicher.
+- Fuer persistenten Betrieb ist der naechste Ausbau die Aktivierung des PostgreSQL-Memory-Layers.
+
+## Admin-Login und Hub
+
+Die Browser-Adminseiten laufen jetzt ueber einen einfachen Login mit Session-Cookie.
+
+Wichtige Endpunkte:
+
+- `GET /admin/login`
+- `POST /admin/login`
+- `POST /admin/logout`
+- `GET /internal/admin`
+
+Pragmatische Standardregel:
+
+- Wenn `ADMIN_PASSWORD` leer bleibt, wird vorerst dein bestehender `API_BEARER_TOKEN` als Login-Passwort verwendet.
+- Wenn `ADMIN_SESSION_SECRET` leer bleibt, wird derselbe Wert als Signatur-Secret fuer das Session-Cookie genutzt.
+
+Wichtige Schalter:
+
+- `ADMIN_USERNAME`
+- `ADMIN_PASSWORD`
+- `ADMIN_SESSION_SECRET`
+- `ADMIN_SESSION_TTL_HOURS`
+- `ADMIN_COOKIE_SECURE`
+
+Empfehlung fuer spaeteren Reverse-Proxy-/Internet-Betrieb:
+
+- `ADMIN_PASSWORD` explizit setzen
+- `ADMIN_SESSION_SECRET` explizit setzen
+- `ADMIN_COOKIE_SECURE=true`
+- HTTPS am Reverse Proxy erzwingen
+
+## Ops-Panel
+
+Im Admin-Hub gibt es jetzt eine erste sichere Ops-Konsole statt eines freien Web-Terminals.
+
+Verfuegbar:
+
+- `gateway status`
+- `gateway logs`
+- `gateway restart`
+- `gateway health`
+- `gateway uptime`
+- `kai status`
+- `kai logs`
+- `kai restart`
+- `kai health`
+- `kai models`
+
+Das ist bewusst kontrollierter als ein generisches Browser-Terminal. Fuer spaeter kann daraus ein groesseres Panel werden, aber die V1 bleibt absichtlich enger.
+
+Genutzte MI50-/SSH-Schalter:
+
+- `MI50_SSH_HOST`
+- `MI50_SSH_USER`
+- `MI50_SSH_PORT`
+- `MI50_RESTART_COMMAND`
+- `MI50_STATUS_COMMAND`
+- `MI50_LOGS_COMMAND`
+
+## Raspberry Pi / Device API
+
+Fuer spaetere Pi-Anbindung ist ein einfacher Device-Endpunkt vorbereitet:
+
+- `POST /api/device/ask`
+
+Gedacht fuer:
+
+- Raspberry Pi mit lokalem TTS/STT
+- Gateway uebernimmt Routing und Kontext
+- der Pi liest die Antwort lokal vor
+
+Auth:
+
+- `DEVICE_SHARED_TOKEN`
+- wenn leer, faellt der Device-Endpunkt auf `API_BEARER_TOKEN` zurueck
+- damit kann ein Raspberry Pi spaeter mit eigenem Token arbeiten, ohne den Browser-/Admin-Login zu benutzen
+
+Beispiel:
+
+```bash
+curl -s http://127.0.0.1:8000/api/device/ask \
+  -H "Authorization: Bearer DEVICE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message":"Wie ist der Status von Kai?",
+    "mode":"auto"
+  }'
+```
+
+## llama.cpp Startbefehl
+
+Fuer dein aktuelles Ein-Modell-Setup ist der pragmatische Weg:
+
+```bash
+./llama-server \
+  -m /pfad/zu/qwen2.5-coder.gguf \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --api-key DEIN_BACKEND_TOKEN \
+  -c 16384 \
+  -ngl 999 \
+  -t 8
+```
+
+Wichtige Punkte:
+
+- `--api-key` schuetzt den `llama-server`
+- der Gateway sendet diesen Token ueber `LLAMACPP_API_KEY`
+- `-c 16384` setzt das echte Kontextfenster im Backend
+- wenn du aktuell eher konservativ starten willst, kannst du auch zuerst mit `8192` testen
+
+Passend dazu im Gateway:
+
+```env
+LLAMACPP_BASE_URL=http://DEINE_MI50_VM:8080
+LLAMACPP_API_KEY=DEIN_BACKEND_TOKEN
+FAST_MODEL_PUBLIC_NAME=qwen2.5-coder
+FAST_MODEL_BACKEND_NAME=qwen2.5-coder
+FAST_MODEL_BASE_URL=http://DEINE_MI50_VM:8080
+DEEP_MODEL_PUBLIC_NAME=
+DEEP_MODEL_BACKEND_NAME=
+DEEP_MODEL_BASE_URL=
+BACKEND_CONTEXT_WINDOW=16384
+CONTEXT_RESPONSE_RESERVE=2048
+DEFAULT_MAX_TOKENS=1024
+```
+
+Wenn du spaeter ein Deep-Modell als zweiten Prozess oder auf einer zweiten GPU startest, bekommt es einfach einen zweiten Port oder Host und wird ueber `DEEP_MODEL_BASE_URL` eingebunden.
 
 ## Tests mit curl
 
@@ -510,19 +787,25 @@ Wichtige Annahme:
 - Wenn VS Code per SSH, Dev Container oder WSL laeuft, ist `127.0.0.1` unter Umstaenden nicht der richtige Host.
 - Dann musst du statt `127.0.0.1` die aus Sicht des VS-Code-Clients erreichbare Adresse verwenden.
 
-## Admin-Seite
+## Browser-Zugriff
 
-Die interne Admin-Seite liegt unter:
+Die Admin-Oberflaeche liegt jetzt hier:
 
+- `GET /admin/login`
 - `GET /internal/admin`
 
-Wichtig:
+Der Hub enthaelt:
 
-- Die HTML-Seite selbst ist absichtlich leicht erreichbar.
-- Ohne Bearer-Token kann die Seite nur den offenen Liveness-Check `GET /health` abfragen.
-- Dann wird der Gateway-Status gruen gezeigt, wenn der Prozess lebt.
-- Der MI50- bzw. Backend-Status bleibt ohne Token bewusst gelb mit Hinweis, weil `/internal/health`, `/internal/metrics` und die Konfigurationsdaten geschuetzt sind.
-- Fuer den vollstaendigen Status also erst den Bearer-Token eintragen und dann `Alles aktualisieren` klicken.
+- Dashboard / Konfiguration
+- Chat-Tab mit eingebetteter Admin-Chat-Oberflaeche
+- Ops-Tab fuer Gateway und Kai
+- Device-/Pi-Vorbereitung
+
+Pragmatischer Default:
+
+- Login-Benutzername: `ADMIN_USERNAME` oder standardmaessig `admin`
+- Login-Passwort: `ADMIN_PASSWORD`
+- wenn `ADMIN_PASSWORD` leer ist, gilt vorerst dein `API_BEARER_TOKEN` als Browser-Passwort
 
 ## Bekannte Grenzen dieses MVP
 

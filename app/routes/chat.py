@@ -58,13 +58,15 @@ async def create_chat_completion(
 
     backend_payload = payload.model_dump(exclude_none=True)
     backend_payload["messages"] = guard_result.messages
-    backend_payload["model"] = settings.map_public_to_backend_model(payload.model)
+    target = settings.resolve_target_for_public_model(payload.model)
+    backend_payload["model"] = target.backend_name
     if backend_payload.get("max_tokens") is None:
         backend_payload["max_tokens"] = settings.default_max_tokens
     logger.info(
-        "backend model mapping public_model=%s backend_model=%s",
+        "backend model mapping public_model=%s backend_model=%s base_url=%s",
         payload.model,
         backend_payload["model"],
+        target.base_url,
     )
 
     try:
@@ -72,9 +74,10 @@ async def create_chat_completion(
         if payload.stream:
             stream = client.stream_chat_completion(
                 backend_payload=backend_payload,
-                public_model_name=settings.public_model_name,
-                backend_model_name=settings.backend_model_name,
+                public_model_name=target.public_name,
+                backend_model_name=target.backend_name,
                 request_id=request_id,
+                base_url=target.base_url,
             )
             return StreamingResponse(
                 stream,
@@ -85,7 +88,7 @@ async def create_chat_completion(
                 },
             )
 
-        response_payload = await client.create_chat_completion(backend_payload)
+        response_payload = await client.create_chat_completion(backend_payload, base_url=target.base_url)
         response_payload["model"] = settings.map_backend_to_public_model(
             response_payload.get("model", backend_payload["model"])
         )

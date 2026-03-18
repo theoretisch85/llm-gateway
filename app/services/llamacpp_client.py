@@ -38,23 +38,24 @@ class LlamaCppClient:
     def _timeout(self) -> httpx.Timeout:
         return httpx.Timeout(self._settings.llamacpp_timeout_seconds)
 
-    async def fetch_models(self) -> tuple[dict, float]:
+    async def fetch_models(self, base_url: str | None = None) -> tuple[dict, float]:
+        models_url = self._settings.models_url_for(base_url or self._settings.llamacpp_base_url)
         metrics.record_backend_call()
-        logger.info("backend models request url=%s", self._settings.backend_models_url)
+        logger.info("backend models request url=%s", models_url)
         started_at = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=self._timeout()) as client:
                 response = await client.get(
-                    self._settings.backend_models_url,
+                    models_url,
                     headers=self._headers(),
                 )
         except httpx.TimeoutException as exc:
             metrics.record_backend_timeout()
-            logger.warning("backend models timeout url=%s", self._settings.backend_models_url)
+            logger.warning("backend models timeout url=%s", models_url)
             raise LlamaCppTimeoutError("The upstream llama.cpp backend timed out.") from exc
         except httpx.HTTPError as exc:
             metrics.record_backend_error()
-            logger.exception("backend models transport error url=%s", self._settings.backend_models_url)
+            logger.exception("backend models transport error url=%s", models_url)
             raise LlamaCppError("Could not reach llama.cpp backend.", status_code=502) from exc
 
         logger.info("backend models response status=%s", response.status_code)
@@ -62,28 +63,29 @@ class LlamaCppClient:
         latency_ms = round((time.perf_counter() - started_at) * 1000, 2)
         return payload, latency_ms
 
-    async def create_chat_completion(self, payload: dict) -> dict:
+    async def create_chat_completion(self, payload: dict, base_url: str | None = None) -> dict:
+        chat_url = self._settings.chat_completions_url_for(base_url or self._settings.llamacpp_base_url)
         metrics.record_backend_call()
         logger.info(
             "backend request url=%s model=%s stream=%s",
-            self._settings.backend_chat_completions_url,
+            chat_url,
             payload.get("model"),
             payload.get("stream", False),
         )
         try:
             async with httpx.AsyncClient(timeout=self._timeout()) as client:
                 response = await client.post(
-                    self._settings.backend_chat_completions_url,
+                    chat_url,
                     headers=self._headers(),
                     json=payload,
                 )
         except httpx.TimeoutException as exc:
             metrics.record_backend_timeout()
-            logger.warning("backend timeout url=%s", self._settings.backend_chat_completions_url)
+            logger.warning("backend timeout url=%s", chat_url)
             raise LlamaCppTimeoutError("The upstream llama.cpp backend timed out.") from exc
         except httpx.HTTPError as exc:
             metrics.record_backend_error()
-            logger.exception("backend transport error url=%s", self._settings.backend_chat_completions_url)
+            logger.exception("backend transport error url=%s", chat_url)
             raise LlamaCppError("Could not reach llama.cpp backend.", status_code=502) from exc
 
         logger.info("backend response status=%s", response.status_code)
@@ -95,18 +97,20 @@ class LlamaCppClient:
         public_model_name: str,
         backend_model_name: str,
         request_id: str,
+        base_url: str | None = None,
     ) -> AsyncIterator[bytes]:
+        chat_url = self._settings.chat_completions_url_for(base_url or self._settings.llamacpp_base_url)
         metrics.record_backend_call()
         logger.info(
             "backend stream request url=%s model=%s",
-            self._settings.backend_chat_completions_url,
+            chat_url,
             backend_payload.get("model"),
         )
         try:
             async with httpx.AsyncClient(timeout=self._timeout()) as client:
                 async with client.stream(
                     "POST",
-                    self._settings.backend_chat_completions_url,
+                    chat_url,
                     headers=self._headers(),
                     json=backend_payload,
                 ) as response:
@@ -149,11 +153,11 @@ class LlamaCppClient:
                         yield chunk
         except httpx.TimeoutException as exc:
             metrics.record_backend_timeout()
-            logger.warning("backend stream timeout url=%s", self._settings.backend_chat_completions_url)
+            logger.warning("backend stream timeout url=%s", chat_url)
             raise LlamaCppTimeoutError("The upstream llama.cpp backend timed out.") from exc
         except httpx.HTTPError as exc:
             metrics.record_backend_error()
-            logger.exception("backend stream transport error url=%s", self._settings.backend_chat_completions_url)
+            logger.exception("backend stream transport error url=%s", chat_url)
             raise LlamaCppError("Could not reach llama.cpp backend.", status_code=502) from exc
 
     def _parse_json_response(self, response: httpx.Response) -> dict:

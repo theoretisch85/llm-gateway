@@ -11,5 +11,4 @@ router = APIRouter(tags=["models"])
 @router.get("/v1/models", response_model=ModelListResponse, dependencies=[Depends(require_bearer_token)])
 async def list_models() -> ModelListResponse:
     settings = get_settings()
-    model = ModelCard(id=settings.public_model_name)
-    return ModelListResponse(data=[model])
+    return ModelListResponse(data=[ModelCard(id=item.public_name) for item in settings.listed_models])

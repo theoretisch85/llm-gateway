@@ -1,13 +1,22 @@
 import logging
+from html import escape
 from textwrap import dedent
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
-from app.auth import require_bearer_token
+from app.auth import get_admin_session_username, require_admin_api_auth
 from app.config import get_settings
-from app.services.backend_control import restart_mi50_backend
+from app.services.backend_control import (
+    gateway_logs,
+    gateway_status,
+    kai_logs,
+    kai_status,
+    restart_gateway,
+    restart_mi50_backend,
+    run_ops_command,
+)
 from app.services.config_store import read_runtime_config, write_runtime_config
 
 
@@ -20,23 +29,38 @@ class AdminConfigUpdate(BaseModel):
     LLAMACPP_TIMEOUT_SECONDS: str
     PUBLIC_MODEL_NAME: str
     BACKEND_MODEL_NAME: str
+    FAST_MODEL_PUBLIC_NAME: str
+    FAST_MODEL_BACKEND_NAME: str
+    FAST_MODEL_BASE_URL: str
+    DEEP_MODEL_PUBLIC_NAME: str
+    DEEP_MODEL_BACKEND_NAME: str
+    DEEP_MODEL_BASE_URL: str
     BACKEND_CONTEXT_WINDOW: str
     CONTEXT_RESPONSE_RESERVE: str
     CONTEXT_CHARS_PER_TOKEN: str
     DEFAULT_MAX_TOKENS: str
+    ADMIN_DEFAULT_MODE: str
+    ROUTING_DEEP_KEYWORDS: str
+    ROUTING_LENGTH_THRESHOLD: str
+    ROUTING_HISTORY_THRESHOLD: str
+    DATABASE_URL: str
     MI50_SSH_HOST: str
     MI50_SSH_USER: str
     MI50_SSH_PORT: str
     MI50_RESTART_COMMAND: str
     MI50_STATUS_COMMAND: str
+    MI50_LOGS_COMMAND: str
 
 
-@router.get("/internal/admin", response_class=HTMLResponse)
-async def admin_page() -> HTMLResponse:
-    return HTMLResponse(_admin_html())
+@router.get("/internal/admin", response_class=HTMLResponse, response_model=None)
+async def admin_page(request: Request) -> HTMLResponse | RedirectResponse:
+    username = get_admin_session_username(request)
+    if not username:
+        return RedirectResponse(url="/admin/login?next=/internal/admin", status_code=303)
+    return HTMLResponse(_admin_html(username=username))
 
 
-@router.get("/internal/admin/config", dependencies=[Depends(require_bearer_token)])
+@router.get("/internal/admin/config", dependencies=[Depends(require_admin_api_auth)])
 async def get_admin_config() -> dict[str, str]:
     settings = get_settings()
     current = read_runtime_config()
@@ -44,24 +68,36 @@ async def get_admin_config() -> dict[str, str]:
     current.setdefault("LLAMACPP_TIMEOUT_SECONDS", str(settings.llamacpp_timeout_seconds))
     current.setdefault("PUBLIC_MODEL_NAME", settings.public_model_name)
     current.setdefault("BACKEND_MODEL_NAME", settings.backend_model_name)
+    current.setdefault("FAST_MODEL_PUBLIC_NAME", settings.fast_model_public_name or settings.public_model_name)
+    current.setdefault("FAST_MODEL_BACKEND_NAME", settings.fast_model_backend_name or settings.backend_model_name)
+    current.setdefault("FAST_MODEL_BASE_URL", settings.fast_model_base_url or settings.llamacpp_base_url)
+    current.setdefault("DEEP_MODEL_PUBLIC_NAME", settings.deep_model_public_name or "")
+    current.setdefault("DEEP_MODEL_BACKEND_NAME", settings.deep_model_backend_name or "")
+    current.setdefault("DEEP_MODEL_BASE_URL", settings.deep_model_base_url or "")
     current.setdefault("BACKEND_CONTEXT_WINDOW", str(settings.backend_context_window))
     current.setdefault("CONTEXT_RESPONSE_RESERVE", str(settings.context_response_reserve))
     current.setdefault("CONTEXT_CHARS_PER_TOKEN", str(settings.context_chars_per_token))
     current.setdefault("DEFAULT_MAX_TOKENS", str(settings.default_max_tokens))
-    current.setdefault("MI50_SSH_HOST", "")
-    current.setdefault("MI50_SSH_USER", "")
-    current.setdefault("MI50_SSH_PORT", "22")
-    current.setdefault("MI50_RESTART_COMMAND", "sudo systemctl restart llama.cpp")
-    current.setdefault("MI50_STATUS_COMMAND", "sudo systemctl status llama.cpp --no-pager")
+    current.setdefault("ADMIN_DEFAULT_MODE", settings.admin_default_mode)
+    current.setdefault("ROUTING_DEEP_KEYWORDS", settings.routing_deep_keywords)
+    current.setdefault("ROUTING_LENGTH_THRESHOLD", str(settings.routing_length_threshold))
+    current.setdefault("ROUTING_HISTORY_THRESHOLD", str(settings.routing_history_threshold))
+    current.setdefault("DATABASE_URL", settings.database_url or "")
+    current.setdefault("MI50_SSH_HOST", settings.mi50_ssh_host or "")
+    current.setdefault("MI50_SSH_USER", settings.mi50_ssh_user or "")
+    current.setdefault("MI50_SSH_PORT", str(settings.mi50_ssh_port))
+    current.setdefault("MI50_RESTART_COMMAND", settings.mi50_restart_command or "sudo systemctl restart kai")
+    current.setdefault("MI50_STATUS_COMMAND", settings.mi50_status_command or "systemctl status kai --no-pager")
+    current.setdefault("MI50_LOGS_COMMAND", settings.mi50_logs_command or "journalctl -u kai -n 80 --no-pager")
     return current
 
 
-@router.post("/internal/admin/config", dependencies=[Depends(require_bearer_token)])
+@router.post("/internal/admin/config", dependencies=[Depends(require_admin_api_auth)])
 async def update_admin_config(payload: AdminConfigUpdate) -> dict[str, str]:
     return write_runtime_config(payload.model_dump())
 
 
-@router.get("/internal/admin/continue-config", dependencies=[Depends(require_bearer_token)])
+@router.get("/internal/admin/continue-config", dependencies=[Depends(require_admin_api_auth)])
 async def get_continue_config(request: Request) -> JSONResponse:
     settings = get_settings()
     host_base = str(request.base_url).rstrip("/")
@@ -72,7 +108,7 @@ async def get_continue_config(request: Request) -> JSONResponse:
         schema: v1
 
         models:
-          - name: qwen2.5-coder-local
+          - name: llm-gateway-local
             provider: openai
             model: {settings.public_model_name}
             apiBase: {host_base}/v1
@@ -82,7 +118,7 @@ async def get_continue_config(request: Request) -> JSONResponse:
     return JSONResponse({"yaml": rendered})
 
 
-@router.post("/internal/admin/restart-backend", dependencies=[Depends(require_bearer_token)])
+@router.post("/internal/admin/restart-backend", dependencies=[Depends(require_admin_api_auth)])
 async def restart_backend(request: Request) -> JSONResponse:
     request.state.backend_called = True
     logger.info("admin requested mi50 backend restart")
@@ -92,577 +128,574 @@ async def restart_backend(request: Request) -> JSONResponse:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def _admin_html() -> str:
-    return dedent(
+@router.get("/api/admin/ops/{target}/status", dependencies=[Depends(require_admin_api_auth)])
+async def ops_status(target: str) -> JSONResponse:
+    try:
+        if target == "gateway":
+            return JSONResponse(gateway_status())
+        if target == "kai":
+            return JSONResponse(kai_status())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    raise HTTPException(status_code=404, detail="Unknown ops target.")
+
+
+@router.get("/api/admin/ops/{target}/logs", dependencies=[Depends(require_admin_api_auth)])
+async def ops_logs(target: str) -> JSONResponse:
+    try:
+        if target == "gateway":
+            return JSONResponse(gateway_logs())
+        if target == "kai":
+            return JSONResponse(kai_logs())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    raise HTTPException(status_code=404, detail="Unknown ops target.")
+
+
+@router.post("/api/admin/ops/{target}/restart", dependencies=[Depends(require_admin_api_auth)])
+async def ops_restart(request: Request, target: str) -> JSONResponse:
+    request.state.backend_called = target == "kai"
+    try:
+        if target == "gateway":
+            return JSONResponse(restart_gateway())
+        if target == "kai":
+            return JSONResponse(restart_mi50_backend())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    raise HTTPException(status_code=404, detail="Unknown ops target.")
+
+
+@router.get("/api/admin/ops/{target}/run/{command_name}", dependencies=[Depends(require_admin_api_auth)])
+async def ops_run(request: Request, target: str, command_name: str) -> JSONResponse:
+    request.state.backend_called = target == "kai"
+    try:
+        return JSONResponse(run_ops_command(target, command_name))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _admin_html(username: str) -> str:
+    html = dedent(
         """\
         <!doctype html>
         <html lang="de">
         <head>
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>llm-gateway admin</title>
+          <title>llm-gateway admin hub</title>
           <style>
             :root {
-              --bg: #f4efe6;
-              --card: rgba(255, 252, 244, 0.92);
-              --ink: #17231b;
-              --muted: #5b675f;
-              --line: #d8cfbf;
-              --accent: #165f44;
-              --accent-soft: #dff5e7;
-              --ok: #1a7f4b;
-              --ok-soft: #dff6e6;
-              --warn: #a46117;
-              --warn-soft: #fff0d7;
-              --err: #942f2f;
-              --err-soft: #f9dddd;
+              --bg:#0b0f14;
+              --bg-deep:#06080c;
+              --card:#11161d;
+              --card-2:#161c24;
+              --ink:#d8e4ef;
+              --muted:#7f92a3;
+              --line:#2b3744;
+              --accent:#8be28b;
+              --accent-2:#67c1ff;
+              --accent-soft:rgba(139,226,139,.10);
+              --warn-soft:rgba(255,196,94,.12);
+              --err-soft:rgba(255,107,107,.12);
+              --chrome:#1b232d;
             }
-            * { box-sizing: border-box; }
+            * { box-sizing:border-box; }
             body {
-              margin: 0;
-              font-family: Georgia, "Times New Roman", serif;
-              color: var(--ink);
+              margin:0;
+              font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
+              color:var(--ink);
               background:
-                radial-gradient(circle at top left, rgba(22,95,68,.14), transparent 28%),
-                radial-gradient(circle at bottom right, rgba(164,97,23,.10), transparent 24%),
-                linear-gradient(180deg, #faf7f1 0%, var(--bg) 100%);
+                linear-gradient(180deg, #10151c 0%, var(--bg) 45%, var(--bg-deep) 100%);
+              min-height:100vh;
             }
-            main { max-width: 1180px; margin: 0 auto; padding: 28px 20px 64px; }
-            .hero {
-              display: grid;
-              grid-template-columns: 1.5fr 1fr;
-              gap: 18px;
-              margin-bottom: 24px;
+            body::before {
+              content:"";
+              position:fixed;
+              inset:0;
+              pointer-events:none;
+              background-image:
+                linear-gradient(rgba(67,81,96,.10) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(67,81,96,.10) 1px, transparent 1px);
+              background-size:24px 24px;
+              mask-image:linear-gradient(180deg, rgba(0,0,0,.7), rgba(0,0,0,.15));
             }
-            .hero-panel {
-              background: linear-gradient(145deg, rgba(255,255,255,0.9), rgba(244,239,230,0.95));
-              border: 1px solid var(--line);
-              border-radius: 24px;
-              padding: 22px;
-              box-shadow: 0 16px 40px rgba(23, 35, 27, 0.08);
+            header {
+              position:sticky;
+              top:0;
+              z-index:10;
+              background:rgba(9,12,16,.92);
+              backdrop-filter:blur(10px);
+              border-bottom:1px solid var(--line);
             }
-            h1 { margin: 0 0 8px; font-size: 2.4rem; }
-            p { margin: 0; color: var(--muted); line-height: 1.45; }
-            .hero-badges {
-              display: flex;
-              gap: 10px;
-              flex-wrap: wrap;
-              margin-top: 16px;
+            .nav {
+              max-width:1320px;
+              margin:0 auto;
+              padding:14px 20px;
+              display:flex;
+              gap:14px;
+              align-items:center;
+              justify-content:space-between;
             }
-            .badge {
-              border-radius: 999px;
-              padding: 8px 12px;
-              background: rgba(22,95,68,0.08);
-              color: var(--ink);
-              border: 1px solid rgba(22,95,68,0.12);
-              font-size: .92rem;
+            .brand {
+              font-size:1.05rem;
+              font-weight:700;
+              letter-spacing:.14em;
+              text-transform:uppercase;
+              color:var(--accent);
             }
-            .grid {
-              display: grid;
-              grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-              gap: 20px;
-              margin-top: 24px;
+            .nav-buttons { display:flex; gap:10px; flex-wrap:wrap; }
+            .nav-buttons button, .nav form button, button, select, input, textarea {
+              font:inherit;
             }
-            .card {
-              background: var(--card);
-              border: 1px solid var(--line);
-              border-radius: 18px;
-              padding: 18px;
-              box-shadow: 0 12px 30px rgba(20, 34, 22, 0.06);
-              backdrop-filter: blur(10px);
+            .nav-buttons button, .nav form button, button.primary, button.secondary {
+              border:1px solid var(--line);
+              border-radius:8px;
+              padding:10px 14px;
+              cursor:pointer;
+              text-transform:uppercase;
+              letter-spacing:.06em;
             }
-            .wide { grid-column: 1 / -1; }
-            .status-grid {
-              display: grid;
-              grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-              gap: 14px;
+            .nav-buttons button, .nav form button, button.secondary {
+              background:var(--chrome);
+              color:var(--ink);
             }
-            .stat {
-              border-radius: 18px;
-              padding: 16px;
-              border: 1px solid var(--line);
-              background: rgba(255,255,255,0.72);
+            .nav-buttons button.active, button.primary {
+              background:#1b2a1f;
+              color:var(--accent);
+              border-color:#2e5131;
             }
-            .stat h3 {
-              margin: 0 0 8px;
-              font-size: .9rem;
-              text-transform: uppercase;
-              letter-spacing: .06em;
-              color: var(--muted);
+            .userbox { display:flex; gap:10px; align-items:center; color:var(--muted); }
+            main { max-width:1320px; margin:0 auto; padding:24px 20px 56px; }
+            .panel { display:none; }
+            .panel.active { display:block; }
+            .hero, .card {
+              position:relative;
+              background:linear-gradient(180deg, var(--card-2), var(--card));
+              border:1px solid var(--line);
+              border-radius:10px;
+              box-shadow:none;
             }
+            .hero::before, .card::before {
+              content:"";
+              position:absolute;
+              top:0;
+              left:0;
+              right:0;
+              height:28px;
+              border-bottom:1px solid var(--line);
+              border-radius:10px 10px 0 0;
+              background:
+                radial-gradient(circle at 16px 14px, #ff5f56 0 4px, transparent 5px),
+                radial-gradient(circle at 34px 14px, #ffbd2e 0 4px, transparent 5px),
+                radial-gradient(circle at 52px 14px, #27c93f 0 4px, transparent 5px),
+                linear-gradient(180deg, #1a222b, #161d26);
+            }
+            .hero { padding:44px 22px 22px; margin-bottom:20px; }
+            .hero h1 {
+              margin:0 0 8px;
+              font-size:1.75rem;
+              letter-spacing:.08em;
+              text-transform:uppercase;
+            }
+            .hero p, .muted { color:var(--muted); line-height:1.45; }
+            .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:16px; margin-top:18px; }
+            .card { padding:44px 18px 18px; }
             .stat strong {
-              display: block;
-              font-size: 1.5rem;
+              display:block;
+              font-size:1.4rem;
+              color:var(--accent);
             }
-            .health-card {
-              display: flex;
-              align-items: center;
-              gap: 14px;
-              min-height: 88px;
-            }
-            .lamp {
-              width: 18px;
-              height: 18px;
-              border-radius: 50%;
-              background: #bbb;
-              box-shadow: 0 0 0 6px rgba(0,0,0,0.04);
-              flex: 0 0 auto;
-            }
-            .lamp.neutral { background: #b7b7b7; box-shadow: 0 0 0 6px rgba(120,120,120,0.10); }
-            .lamp.ok { background: var(--ok); box-shadow: 0 0 0 6px rgba(26,127,75,0.13); }
-            .lamp.warn { background: var(--warn); box-shadow: 0 0 0 6px rgba(164,97,23,0.12); }
-            .lamp.err { background: var(--err); box-shadow: 0 0 0 6px rgba(148,47,47,0.13); }
-            .health-copy strong { font-size: 1.1rem; display: block; }
-            .health-copy small { color: var(--muted); line-height: 1.4; display: block; margin-top: 4px; }
-            .state-tag {
-              display: inline-flex;
-              align-items: center;
-              gap: 6px;
-              margin-top: 8px;
-              padding: 5px 10px;
-              border-radius: 999px;
-              font-size: .82rem;
-              font-weight: 700;
-              letter-spacing: .02em;
-              background: rgba(120,120,120,0.10);
-              color: var(--muted);
-            }
-            .state-tag.ok { background: var(--ok-soft); color: var(--ok); }
-            .state-tag.warn { background: var(--warn-soft); color: var(--warn); }
-            .state-tag.err { background: var(--err-soft); color: var(--err); }
-            .state-tag.neutral { background: rgba(120,120,120,0.10); color: var(--muted); }
-            .legend {
-              display: flex;
-              gap: 10px;
-              flex-wrap: wrap;
-              margin-top: 12px;
-              color: var(--muted);
-              font-size: .88rem;
-            }
-            .legend span {
-              display: inline-flex;
-              align-items: center;
-              gap: 6px;
-              margin: 0;
-              font-weight: 500;
-            }
-            .dot {
-              width: 10px;
-              height: 10px;
-              border-radius: 50%;
-              display: inline-block;
-            }
-            .dot.neutral { background: #b7b7b7; }
-            .dot.ok { background: var(--ok); }
-            .dot.warn { background: var(--warn); }
-            .dot.err { background: var(--err); }
-            label { display: block; font-size: .92rem; margin-bottom: 12px; }
-            span { display: block; margin-bottom: 6px; font-weight: 600; }
-            input, textarea {
-              width: 100%;
-              border: 1px solid var(--line);
-              border-radius: 10px;
-              padding: 10px 12px;
-              font: inherit;
-              background: white;
-            }
-            textarea { min-height: 220px; resize: vertical; }
-            .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
-            button {
-              border: 0;
-              border-radius: 999px;
-              padding: 10px 16px;
-              font: inherit;
-              font-weight: 700;
-              cursor: pointer;
-              background: var(--accent);
-              color: white;
-            }
-            button.secondary { background: #d8e2d8; color: var(--ink); }
-            button.ghost { background: #efe7d6; color: var(--ink); }
+            .two-col { display:grid; grid-template-columns:1.1fr .9fr; gap:18px; }
             .status {
-              margin-top: 12px;
-              padding: 10px 12px;
-              border-radius: 10px;
-              background: var(--accent-soft);
-              color: var(--ink);
-              min-height: 44px;
+              margin-top:12px;
+              padding:10px 12px;
+              border-radius:8px;
+              background:var(--accent-soft);
+              border:1px solid #284131;
             }
-            .status.error { background: var(--err-soft); color: var(--err); }
-            .status.warn { background: var(--warn-soft); color: var(--warn); }
-            .muted { color: var(--muted); }
-            code.inline {
-              display: inline-block;
-              padding: 3px 8px;
-              border-radius: 999px;
-              background: rgba(23,35,27,0.06);
-              font-size: .92rem;
+            label { display:block; margin-bottom:12px; }
+            label span {
+              display:block;
+              margin-bottom:6px;
+              font-weight:700;
+              font-size:.92rem;
+              letter-spacing:.06em;
+              text-transform:uppercase;
+              color:#a4b5c5;
             }
-            @media (max-width: 900px) {
-              .hero { grid-template-columns: 1fr; }
+            input, select, textarea {
+              width:100%;
+              border:1px solid var(--line);
+              border-radius:8px;
+              padding:10px 12px;
+              background:#0a0f14;
+              color:var(--ink);
+            }
+            input:focus, select:focus, textarea:focus {
+              outline:none;
+              border-color:#4b8d4b;
+              box-shadow:0 0 0 2px rgba(139,226,139,.10);
+            }
+            textarea { min-height:140px; resize:vertical; }
+            .actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
+            iframe {
+              width:100%;
+              min-height:78vh;
+              border:1px solid var(--line);
+              border-radius:10px;
+              background:#0a0f14;
+              box-shadow:none;
+            }
+            pre {
+              margin:0;
+              white-space:pre-wrap;
+              word-break:break-word;
+              font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+            }
+            ul { margin:8px 0 0 18px; padding:0; }
+            code {
+              padding:2px 8px;
+              border-radius:6px;
+              background:#0d141b;
+              color:var(--accent);
+              border:1px solid var(--line);
+            }
+            @media (max-width:1000px) {
+              .two-col { grid-template-columns:1fr; }
+              .nav { flex-direction:column; align-items:flex-start; }
             }
           </style>
         </head>
         <body>
+          <header>
+            <div class="nav">
+              <div class="brand">llm-gateway Admin Hub</div>
+              <div class="nav-buttons">
+                <button class="active" data-tab="dashboard" onclick="switchTab('dashboard', this)">Dashboard</button>
+                <button data-tab="chat" onclick="switchTab('chat', this)">Chat</button>
+                <button data-tab="ops" onclick="switchTab('ops', this)">Ops</button>
+                <button data-tab="devices" onclick="switchTab('devices', this)">Pi / Devices</button>
+              </div>
+              <div class="userbox">
+                <span>eingeloggt als __USERNAME__</span>
+                <form method="post" action="/admin/logout"><button type="submit">Logout</button></form>
+              </div>
+            </div>
+          </header>
           <main>
-            <section class="hero">
-              <div class="hero-panel">
-                <h1>llm-gateway Admin</h1>
-                <p>Interne Betriebsseite fuer Gateway, MI50-Backend, Kontextfenster und Continue-Konfiguration. Alles Wichtige auf einen Blick, ohne blind in YAML und Logs zu springen.</p>
-                <div class="hero-badges">
-                  <span class="badge">Gateway + Health</span>
-                  <span class="badge">MI50 / llama.cpp Status</span>
-                  <span class="badge">Kontext / Max Tokens</span>
-                  <span class="badge">Continue YAML</span>
+            <section id="dashboard" class="panel active">
+              <div class="hero">
+                <h1>Betrieb, Routing und Plattform-Konfig</h1>
+                <p>Ein Hub fuer Gateway, Kai, Modellrouting, Continue-Anbindung, Browser-Login und die naechsten Schritte Richtung Pi- und Upload-Plattform.</p>
+                <div id="dashboardStatus" class="status">Lade Admin-Daten...</div>
+              </div>
+              <div class="grid">
+                <div class="card stat">
+                  <div class="muted">Gateway</div>
+                  <strong id="gatewayState">-</strong>
+                  <div id="gatewayInfo" class="muted">-</div>
                 </div>
-                <div class="legend">
-                  <span><i class="dot neutral"></i>Noch nicht geladen</span>
-                  <span><i class="dot ok"></i>Läuft</span>
-                  <span><i class="dot warn"></i>Lädt / Problem</span>
-                  <span><i class="dot err"></i>Fehler / offline</span>
+                <div class="card stat">
+                  <div class="muted">Kai / MI50</div>
+                  <strong id="backendState">-</strong>
+                  <div id="backendInfo" class="muted">-</div>
+                </div>
+                <div class="card stat">
+                  <div class="muted">Requests</div>
+                  <strong id="requestsValue">-</strong>
+                  <div class="muted">seit Prozessstart</div>
+                </div>
+                <div class="card stat">
+                  <div class="muted">Backend Calls</div>
+                  <strong id="backendCallsValue">-</strong>
+                  <div class="muted">inkl. Health Checks</div>
                 </div>
               </div>
-              <div class="hero-panel">
-                <label>
-                  <span>Bearer Token</span>
-                  <input id="token" type="password" placeholder="API_BEARER_TOKEN">
-                </label>
-                <div class="actions">
-                  <button type="button" onclick="refreshAll()">Alles aktualisieren</button>
-                  <button type="button" class="ghost" onclick="loadContinueConfig()">Continue YAML</button>
+              <div class="two-col" style="margin-top:18px;">
+                <div class="card">
+                  <h2>Gateway / Routing</h2>
+                  <form onsubmit="saveConfig(event)">
+                    <div class="grid">
+                      <label><span>LLAMACPP_BASE_URL</span><input id="LLAMACPP_BASE_URL"></label>
+                      <label><span>PUBLIC_MODEL_NAME</span><input id="PUBLIC_MODEL_NAME"></label>
+                      <label><span>BACKEND_MODEL_NAME</span><input id="BACKEND_MODEL_NAME"></label>
+                      <label><span>FAST_MODEL_PUBLIC_NAME</span><input id="FAST_MODEL_PUBLIC_NAME"></label>
+                      <label><span>FAST_MODEL_BACKEND_NAME</span><input id="FAST_MODEL_BACKEND_NAME"></label>
+                      <label><span>FAST_MODEL_BASE_URL</span><input id="FAST_MODEL_BASE_URL"></label>
+                      <label><span>DEEP_MODEL_PUBLIC_NAME</span><input id="DEEP_MODEL_PUBLIC_NAME"></label>
+                      <label><span>DEEP_MODEL_BACKEND_NAME</span><input id="DEEP_MODEL_BACKEND_NAME"></label>
+                      <label><span>DEEP_MODEL_BASE_URL</span><input id="DEEP_MODEL_BASE_URL"></label>
+                      <label><span>BACKEND_CONTEXT_WINDOW</span><input id="BACKEND_CONTEXT_WINDOW"></label>
+                      <label><span>CONTEXT_RESPONSE_RESERVE</span><input id="CONTEXT_RESPONSE_RESERVE"></label>
+                      <label><span>DEFAULT_MAX_TOKENS</span><input id="DEFAULT_MAX_TOKENS"></label>
+                      <label><span>ADMIN_DEFAULT_MODE</span><input id="ADMIN_DEFAULT_MODE"></label>
+                      <label><span>ROUTING_LENGTH_THRESHOLD</span><input id="ROUTING_LENGTH_THRESHOLD"></label>
+                      <label><span>ROUTING_HISTORY_THRESHOLD</span><input id="ROUTING_HISTORY_THRESHOLD"></label>
+                      <label><span>MI50_SSH_HOST</span><input id="MI50_SSH_HOST"></label>
+                      <label><span>MI50_SSH_USER</span><input id="MI50_SSH_USER"></label>
+                      <label><span>MI50_SSH_PORT</span><input id="MI50_SSH_PORT"></label>
+                      <label style="grid-column:1/-1;"><span>ROUTING_DEEP_KEYWORDS</span><input id="ROUTING_DEEP_KEYWORDS"></label>
+                      <label style="grid-column:1/-1;"><span>MI50_RESTART_COMMAND</span><input id="MI50_RESTART_COMMAND"></label>
+                      <label style="grid-column:1/-1;"><span>MI50_STATUS_COMMAND</span><input id="MI50_STATUS_COMMAND"></label>
+                      <label style="grid-column:1/-1;"><span>MI50_LOGS_COMMAND</span><input id="MI50_LOGS_COMMAND"></label>
+                    </div>
+                    <div class="actions">
+                      <button class="primary" type="submit">Speichern</button>
+                      <button class="secondary" type="button" onclick="loadContinueConfig()">Continue YAML</button>
+                    </div>
+                  </form>
                 </div>
-                <div id="status" class="status">Token eingeben und dann alles laden.</div>
+                <div class="card">
+                  <h2>Continue / Persistenz</h2>
+                  <label><span>DATABASE_URL</span><input id="DATABASE_URL"></label>
+                  <label><span>Continue YAML</span><textarea id="continueYaml" readonly></textarea></label>
+                </div>
               </div>
             </section>
 
-            <section class="grid">
-              <div class="card wide">
-                <div class="status-grid">
-                  <div class="stat health-card">
-                    <div id="gatewayLamp" class="lamp neutral"></div>
-                    <div class="health-copy">
-                      <strong>Gateway</strong>
-                      <small id="gatewayText">Noch nicht geladen</small>
-                      <span id="gatewayState" class="state-tag neutral">Noch nicht geladen</span>
-                    </div>
-                  </div>
-                  <div class="stat health-card">
-                    <div id="backendLamp" class="lamp neutral"></div>
-                    <div class="health-copy">
-                      <strong>MI50 / llama.cpp</strong>
-                      <small id="backendText">Noch nicht geladen</small>
-                      <span id="backendState" class="state-tag neutral">Noch nicht geladen</span>
-                    </div>
-                  </div>
-                  <div class="stat">
-                    <h3>Backend-Latenz</h3>
-                    <strong id="latencyValue">-</strong>
-                    <span class="muted">ms fuer /v1/models Check</span>
-                  </div>
-                  <div class="stat">
-                    <h3>Requests</h3>
-                    <strong id="requestsValue">-</strong>
-                    <span class="muted">seit Prozessstart</span>
-                  </div>
-                  <div class="stat">
-                    <h3>Backend Calls</h3>
-                    <strong id="backendCallsValue">-</strong>
-                    <span class="muted">inkl. Health Checks</span>
-                  </div>
-                  <div class="stat">
-                    <h3>Uptime</h3>
-                    <strong id="uptimeValue">-</strong>
-                    <span class="muted">Sekunden</span>
-                  </div>
+            <section id="chat" class="panel">
+              <div class="hero">
+                <h1>Admin Chat</h1>
+                <p>Session-Chat, Auto-Routing und Streaming bleiben im Hub. Fuer jetzt wird die bestehende Chat-Oberflaeche direkt eingebettet.</p>
+              </div>
+              <div class="card">
+                <iframe src="/internal/chat?embedded=1" title="Admin Chat"></iframe>
+              </div>
+            </section>
+
+            <section id="ops" class="panel">
+              <div class="hero">
+                <h1>Ops Konsole</h1>
+                <p>Kein freies Root-Webterminal. Stattdessen eine sichere Terminal-V1 mit Status, Logs, Restart und freigegebenen Preset-Befehlen fuer Gateway und Kai.</p>
+              </div>
+              <div class="card">
+                <div class="actions">
+                  <select id="opsTarget">
+                    <option value="gateway">gateway</option>
+                    <option value="kai">kai</option>
+                  </select>
+                  <select id="opsCommand">
+                    <option value="status">status</option>
+                    <option value="logs">logs</option>
+                    <option value="restart">restart</option>
+                    <option value="health">health</option>
+                    <option value="uptime">uptime (gateway)</option>
+                    <option value="models">models (kai)</option>
+                  </select>
+                  <button class="secondary" type="button" onclick="opsAction('status')">Status</button>
+                  <button class="secondary" type="button" onclick="opsAction('logs')">Logs</button>
+                  <button class="primary" type="button" onclick="opsAction('restart')">Restart</button>
+                  <button class="secondary" type="button" onclick="runPresetCommand()">Preset ausfuehren</button>
+                </div>
+                <div id="opsStatus" class="status">Waehle ein Ziel und eine Aktion.</div>
+                <div class="card" style="margin-top:14px; background:#fcfaf4;">
+                  <pre id="opsOutput">Noch keine Ausgabe.</pre>
                 </div>
               </div>
+            </section>
 
-              <form class="card wide" onsubmit="saveConfig(event)">
-                <p class="muted" style="margin-bottom:16px;">Hier stellst du Gateway-Konfiguration und MI50-SSH-Steuerung ein. Die Werte werden direkt in <code class="inline">.env</code> geschrieben. Wichtig: Ein groesseres Gateway-Kontextfenster allein macht das entfernte <code class="inline">llama.cpp</code> nicht automatisch zu 16K-faehig. Dafuer muss das Backend selbst mit passendem Kontext gestartet werden, zum Beispiel ueber einen angepassten MI50-Restart-Command.</p>
-                <div class="grid">
-                  <label><span>LLAMACPP_BASE_URL</span><input id="LLAMACPP_BASE_URL"></label>
-                  <label><span>LLAMACPP_TIMEOUT_SECONDS</span><input id="LLAMACPP_TIMEOUT_SECONDS"></label>
-                  <label><span>PUBLIC_MODEL_NAME</span><input id="PUBLIC_MODEL_NAME"></label>
-                  <label><span>BACKEND_MODEL_NAME</span><input id="BACKEND_MODEL_NAME"></label>
-                  <label><span>BACKEND_CONTEXT_WINDOW</span><input id="BACKEND_CONTEXT_WINDOW"></label>
-                  <label><span>CONTEXT_RESPONSE_RESERVE</span><input id="CONTEXT_RESPONSE_RESERVE"></label>
-                  <label><span>CONTEXT_CHARS_PER_TOKEN</span><input id="CONTEXT_CHARS_PER_TOKEN"></label>
-                  <label><span>DEFAULT_MAX_TOKENS</span><input id="DEFAULT_MAX_TOKENS"></label>
-                  <label><span>MI50_SSH_HOST</span><input id="MI50_SSH_HOST" placeholder="192.168.40.111"></label>
-                  <label><span>MI50_SSH_USER</span><input id="MI50_SSH_USER" placeholder="llmadmin"></label>
-                  <label><span>MI50_SSH_PORT</span><input id="MI50_SSH_PORT" placeholder="22"></label>
-                  <label><span>MI50_RESTART_COMMAND</span><input id="MI50_RESTART_COMMAND" placeholder="sudo systemctl restart llama.cpp"></label>
-                  <label><span>MI50_STATUS_COMMAND</span><input id="MI50_STATUS_COMMAND" placeholder="sudo systemctl status llama.cpp --no-pager"></label>
+            <section id="devices" class="panel">
+              <div class="hero">
+                <h1>Pi / Device Vorbereitung</h1>
+                <p>Der Raspberry Pi soll spaeter lokal TTS/STT machen und den Gateway nur fuer Chat, Routing und Session-Memory ansprechen.</p>
+              </div>
+              <div class="two-col">
+                <div class="card">
+                  <h2>Device API</h2>
+                  <p class="muted">Der vorbereitete Pfad ist <code>/api/device/ask</code>. Das ist die Grundlage fuer einen Pi-Client mit Mikrofon, Lautsprecher und lokalem TTS.</p>
+                  <label style="margin-top:12px;">
+                    <span>Beispiel-Request</span>
+                    <textarea readonly>curl -s http://GATEWAY:8000/api/device/ask \
+  -H "Authorization: Bearer DEVICE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Wie ist der Status von Kai?","mode":"auto"}'</textarea>
+                  </label>
                 </div>
-                <div class="actions">
-                  <button type="submit">Speichern</button>
-                  <button type="button" class="secondary" onclick="restartBackend()">MI50 neu starten</button>
+                <div class="card">
+                  <h2>Naechste sinnvolle Schritte</h2>
+                  <ul>
+                    <li>echtes Browser-Login statt Token-Eingabefeld</li>
+                    <li>Pi mit eigenem Device-Token</li>
+                    <li>Upload fuer Text und PDF</li>
+                    <li>spaeter ein kleines Voice-Frontend auf dem Pi</li>
+                    <li>persistentes Memory ueber PostgreSQL</li>
+                  </ul>
                 </div>
-              </form>
-
-              <div class="card wide">
-                <label>
-                  <span>Continue YAML</span>
-                  <textarea id="continueYaml" readonly></textarea>
-                </label>
               </div>
             </section>
           </main>
-
           <script>
-            const fields = [
+            window.currentConfig = {};
+            const configFields = [
               "LLAMACPP_BASE_URL",
-              "LLAMACPP_TIMEOUT_SECONDS",
               "PUBLIC_MODEL_NAME",
               "BACKEND_MODEL_NAME",
+              "FAST_MODEL_PUBLIC_NAME",
+              "FAST_MODEL_BACKEND_NAME",
+              "FAST_MODEL_BASE_URL",
+              "DEEP_MODEL_PUBLIC_NAME",
+              "DEEP_MODEL_BACKEND_NAME",
+              "DEEP_MODEL_BASE_URL",
               "BACKEND_CONTEXT_WINDOW",
               "CONTEXT_RESPONSE_RESERVE",
-              "CONTEXT_CHARS_PER_TOKEN",
               "DEFAULT_MAX_TOKENS",
+              "ADMIN_DEFAULT_MODE",
+              "ROUTING_DEEP_KEYWORDS",
+              "ROUTING_LENGTH_THRESHOLD",
+              "ROUTING_HISTORY_THRESHOLD",
+              "DATABASE_URL",
               "MI50_SSH_HOST",
               "MI50_SSH_USER",
               "MI50_SSH_PORT",
               "MI50_RESTART_COMMAND",
               "MI50_STATUS_COMMAND",
+              "MI50_LOGS_COMMAND"
             ];
 
-            const tokenInput = document.getElementById("token");
-            tokenInput.value = localStorage.getItem("llmGatewayToken") || "";
+            function switchTab(id, button) {
+              document.querySelectorAll(".panel").forEach((panel) => panel.classList.remove("active"));
+              document.querySelectorAll(".nav-buttons button").forEach((node) => node.classList.remove("active"));
+              document.getElementById(id).classList.add("active");
+              button.classList.add("active");
+              const url = new URL(window.location.href);
+              url.searchParams.set("tab", id);
+              history.replaceState(null, "", url);
+            }
 
-            function setStatus(message, level = "ok") {
-              const node = document.getElementById("status");
+            function setDashboardStatus(message, error = false) {
+              const node = document.getElementById("dashboardStatus");
               node.textContent = message;
-              node.className = level === "error" ? "status error" : level === "warn" ? "status warn" : "status";
+              node.style.background = error ? "#f9dddd" : "#dff5e7";
+              node.style.color = error ? "#942f2f" : "#16231b";
             }
 
-            function authHeaders() {
-              const token = tokenInput.value.trim();
-              localStorage.setItem("llmGatewayToken", token);
-              return {
-                "Authorization": `Bearer ${token}`,
-                "Content-Type": "application/json",
-              };
-            }
-
-            function setLamp(id, state) {
-              const lamp = document.getElementById(id);
-              lamp.className = `lamp ${state}`;
-            }
-
-            function setStateTag(id, state, text) {
-              const node = document.getElementById(id);
-              node.className = `state-tag ${state}`;
-              node.textContent = text;
-            }
-
-            function formatSeconds(seconds) {
-              if (!Number.isFinite(seconds)) return "-";
-              if (seconds < 60) return `${seconds.toFixed(0)} s`;
-              const minutes = Math.floor(seconds / 60);
-              const rest = Math.floor(seconds % 60);
-              return `${minutes} m ${rest} s`;
-            }
-
-            async function loadConfig() {
+            async function loadDashboard() {
               try {
-                const res = await fetch("/internal/admin/config", {
-                  headers: authHeaders(),
-                });
-                if (!res.ok) {
-                  throw new Error(`Laden fehlgeschlagen: ${res.status}`);
+                const [healthRes, metricsRes, configRes] = await Promise.all([
+                  fetch("/internal/health"),
+                  fetch("/internal/metrics"),
+                  fetch("/internal/admin/config"),
+                ]);
+                if (!healthRes.ok || !metricsRes.ok || !configRes.ok) {
+                  throw new Error("Dashboard-Daten konnten nicht geladen werden.");
                 }
-                const data = await res.json();
-                for (const key of fields) {
-                  document.getElementById(key).value = data[key] || "";
+
+                const health = await healthRes.json();
+                const metrics = await metricsRes.json();
+                const config = await configRes.json();
+                window.currentConfig = config;
+
+                document.getElementById("gatewayState").textContent = health.gateway?.status || "-";
+                document.getElementById("gatewayInfo").textContent = "Gateway antwortet";
+                document.getElementById("backendState").textContent = health.backend?.status || "-";
+                document.getElementById("backendInfo").textContent = `${health.backend?.model || "-"} @ ${health.backend?.base_url || "-"}`;
+                document.getElementById("requestsValue").textContent = metrics.total_requests ?? "-";
+                document.getElementById("backendCallsValue").textContent = metrics.backend_calls ?? "-";
+
+                for (const key of configFields) {
+                  const node = document.getElementById(key);
+                  if (node) node.value = config[key] || "";
                 }
-                setStatus("Konfiguration geladen.");
+                setDashboardStatus("Dashboard und Konfiguration geladen.");
               } catch (error) {
-                setStatus(error.message, "error");
+                setDashboardStatus(error.message, true);
               }
             }
 
             async function saveConfig(event) {
               event.preventDefault();
-              const payload = {};
-              for (const key of fields) {
+              const payload = { ...window.currentConfig };
+              for (const key of configFields) {
                 payload[key] = document.getElementById(key).value.trim();
               }
-              try {
-                const res = await fetch("/internal/admin/config", {
-                  method: "POST",
-                  headers: authHeaders(),
-                  body: JSON.stringify(payload),
-                });
-                if (!res.ok) {
-                  throw new Error(`Speichern fehlgeschlagen: ${res.status}`);
-                }
-                await res.json();
-                setStatus("Gespeichert. Neue Werte gelten fuer neue Requests.");
-                await loadContinueConfig();
-                await loadConfig();
-                await loadMetrics();
-                await loadHealth();
-              } catch (error) {
-                setStatus(error.message, "error");
-              }
-            }
+              payload.LLAMACPP_TIMEOUT_SECONDS = payload.LLAMACPP_TIMEOUT_SECONDS || "60.0";
+              payload.CONTEXT_CHARS_PER_TOKEN = payload.CONTEXT_CHARS_PER_TOKEN || "4.0";
+              payload.MI50_SSH_PORT = payload.MI50_SSH_PORT || "22";
+              payload.MI50_RESTART_COMMAND = payload.MI50_RESTART_COMMAND || "sudo systemctl restart kai";
+              payload.MI50_STATUS_COMMAND = payload.MI50_STATUS_COMMAND || "systemctl status kai --no-pager";
+              payload.MI50_LOGS_COMMAND = payload.MI50_LOGS_COMMAND || "journalctl -u kai -n 80 --no-pager";
 
-            async function restartBackend() {
-              if (!tokenInput.value.trim()) {
-                setStatus("Fuer den MI50-Neustart wird ein Bearer-Token benoetigt.", "warn");
+              const res = await fetch("/internal/admin/config", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+              });
+              if (!res.ok) {
+                setDashboardStatus(`Speichern fehlgeschlagen: ${res.status}`, true);
                 return;
               }
-              if (!confirm("MI50-Backend wirklich per SSH neu starten?")) {
-                return;
-              }
-              try {
-                setStatus("MI50-Backend wird neu gestartet ...", "warn");
-                const res = await fetch("/internal/admin/restart-backend", {
-                  method: "POST",
-                  headers: authHeaders(),
-                });
-                const data = await res.json();
-                if (!res.ok) {
-                  throw new Error(data?.error?.message || `Restart fehlgeschlagen: ${res.status}`);
-                }
-                setStatus("MI50-Neustart angestossen. Health wird neu geladen.");
-                await loadHealth();
-                await loadMetrics();
-              } catch (error) {
-                setStatus(`MI50-Restart fehlgeschlagen: ${error.message}`, "error");
-              }
+              await loadDashboard();
+              setDashboardStatus("Gespeichert. Neue Werte gelten fuer neue Requests.");
             }
 
             async function loadContinueConfig() {
-              try {
-                const res = await fetch("/internal/admin/continue-config", {
-                  headers: authHeaders(),
-                });
-                if (!res.ok) {
-                  throw new Error(`Continue YAML fehlgeschlagen: ${res.status}`);
-                }
-                const data = await res.json();
-                document.getElementById("continueYaml").value = data.yaml;
-                setStatus("Continue YAML aktualisiert.");
-              } catch (error) {
-                setStatus(error.message, "error");
-              }
-            }
-
-            async function loadHealth() {
-              try {
-                setLamp("gatewayLamp", "neutral");
-                setLamp("backendLamp", "neutral");
-                setStateTag("gatewayState", "neutral", "Wird geladen");
-                setStateTag("backendState", "neutral", "Wird geladen");
-                const res = await fetch("/internal/health", {
-                  headers: authHeaders(),
-                });
-                const data = await res.json();
-                const gatewayOk = data.gateway?.status === "ok";
-                const backendOk = data.backend?.status === "ok";
-
-                setLamp("gatewayLamp", gatewayOk ? "ok" : "err");
-                setLamp("backendLamp", backendOk ? "ok" : data.status === "degraded" ? "warn" : "err");
-                setStateTag("gatewayState", gatewayOk ? "ok" : "err", gatewayOk ? "Laeuft" : "Fehler");
-                setStateTag(
-                  "backendState",
-                  backendOk ? "ok" : data.status === "degraded" ? "warn" : "err",
-                  backendOk ? "Laeuft" : "Nicht bereit"
-                );
-
-                document.getElementById("gatewayText").textContent = gatewayOk
-                  ? "Gateway laeuft"
-                  : "Gateway meldet Fehler";
-
-                const backendMessage = backendOk
-                  ? `${data.backend.model} @ ${data.backend.base_url}`
-                  : (data.backend?.message || "Backend nicht bereit");
-
-                document.getElementById("backendText").textContent = backendMessage;
-                document.getElementById("latencyValue").textContent =
-                  data.backend?.latency_ms != null ? `${data.backend.latency_ms}` : "-";
-
-                if (!res.ok) {
-                  setStatus("Health zeigt ein Problem am Backend.", "warn");
-                }
-              } catch (error) {
-                setLamp("gatewayLamp", "warn");
-                setLamp("backendLamp", "warn");
-                setStateTag("gatewayState", "warn", "Keine Daten");
-                setStateTag("backendState", "warn", "Keine Daten");
-                document.getElementById("gatewayText").textContent = "Nicht erreichbar";
-                document.getElementById("backendText").textContent = "Keine Health-Daten";
-                document.getElementById("latencyValue").textContent = "-";
-                setStatus(`Health fehlgeschlagen: ${error.message}`, "error");
-              }
-            }
-
-            async function loadPublicHealth() {
-              try {
-                const res = await fetch("/health");
-                if (!res.ok) {
-                  throw new Error(`Public health fehlgeschlagen: ${res.status}`);
-                }
-                await res.json();
-                setLamp("gatewayLamp", "ok");
-                setStateTag("gatewayState", "ok", "Laeuft");
-                document.getElementById("gatewayText").textContent = "Gateway antwortet auf /health";
-
-                setLamp("backendLamp", "warn");
-                setStateTag("backendState", "warn", "Token fehlt");
-                document.getElementById("backendText").textContent = "Fuer MI50-Status erst Bearer-Token eingeben";
-                document.getElementById("latencyValue").textContent = "-";
-                setStatus("Gateway laeuft. Fuer MI50-Status bitte Bearer-Token eingeben.", "warn");
-              } catch (error) {
-                setLamp("gatewayLamp", "err");
-                setStateTag("gatewayState", "err", "Fehler");
-                document.getElementById("gatewayText").textContent = "Gateway antwortet nicht auf /health";
-                setLamp("backendLamp", "neutral");
-                setStateTag("backendState", "neutral", "Noch nicht geladen");
-                document.getElementById("backendText").textContent = "Noch nicht geladen";
-                setStatus(`Public health fehlgeschlagen: ${error.message}`, "error");
-              }
-            }
-
-            async function loadMetrics() {
-              try {
-                const res = await fetch("/internal/metrics", {
-                  headers: authHeaders(),
-                });
-                if (!res.ok) {
-                  throw new Error(`Metrics fehlgeschlagen: ${res.status}`);
-                }
-                const data = await res.json();
-                document.getElementById("requestsValue").textContent = data.total_requests ?? "-";
-                document.getElementById("backendCallsValue").textContent = data.backend_calls ?? "-";
-                document.getElementById("uptimeValue").textContent = formatSeconds(data.uptime_seconds);
-              } catch (error) {
-                document.getElementById("requestsValue").textContent = "-";
-                document.getElementById("backendCallsValue").textContent = "-";
-                document.getElementById("uptimeValue").textContent = "-";
-                setStatus(error.message, "error");
-              }
-            }
-
-            async function refreshAll() {
-              if (!tokenInput.value.trim()) {
-                await loadPublicHealth();
+              const res = await fetch("/internal/admin/continue-config");
+              if (!res.ok) {
+                setDashboardStatus(`Continue YAML fehlgeschlagen: ${res.status}`, true);
                 return;
               }
-              await loadConfig();
-              await loadHealth();
-              await loadMetrics();
-              await loadContinueConfig();
+              const data = await res.json();
+              document.getElementById("continueYaml").value = data.yaml;
+              setDashboardStatus("Continue YAML geladen.");
             }
 
-            if (tokenInput.value.trim()) {
-              refreshAll();
-            } else {
-              loadPublicHealth();
+            async function opsAction(action) {
+              const target = document.getElementById("opsTarget").value;
+              const statusNode = document.getElementById("opsStatus");
+              const outputNode = document.getElementById("opsOutput");
+              statusNode.textContent = `${target}: ${action} laeuft...`;
+              statusNode.style.background = "#e8dcc7";
+
+              let res;
+              if (action === "status" || action === "logs") {
+                res = await fetch(`/api/admin/ops/${target}/${action}`);
+              } else {
+                res = await fetch(`/api/admin/ops/${target}/restart`, { method: "POST" });
+              }
+              const data = await res.json();
+              if (!res.ok) {
+                statusNode.textContent = data?.error?.message || `Ops-Fehler (${res.status})`;
+                statusNode.style.background = "#f9dddd";
+                outputNode.textContent = JSON.stringify(data, null, 2);
+                return;
+              }
+              statusNode.textContent = `${target}: ${action} erfolgreich`;
+              statusNode.style.background = "#dff5e7";
+              outputNode.textContent = data.output || JSON.stringify(data, null, 2);
             }
+
+            async function runPresetCommand() {
+              const target = document.getElementById("opsTarget").value;
+              const command = document.getElementById("opsCommand").value;
+              const statusNode = document.getElementById("opsStatus");
+              const outputNode = document.getElementById("opsOutput");
+              statusNode.textContent = `${target}: ${command} laeuft...`;
+              statusNode.style.background = "#e8dcc7";
+
+              const res = await fetch(`/api/admin/ops/${target}/run/${command}`);
+              const data = await res.json();
+              if (!res.ok) {
+                statusNode.textContent = data?.error?.message || `Ops-Fehler (${res.status})`;
+                statusNode.style.background = "#f9dddd";
+                outputNode.textContent = JSON.stringify(data, null, 2);
+                return;
+              }
+              statusNode.textContent = `${target}: ${command} erfolgreich`;
+              statusNode.style.background = "#dff5e7";
+              outputNode.textContent = data.output || JSON.stringify(data, null, 2);
+            }
+
+            const requestedTab = new URL(window.location.href).searchParams.get("tab");
+            if (requestedTab) {
+              const button = document.querySelector(`.nav-buttons button[data-tab="${requestedTab}"]`);
+              if (button) switchTab(requestedTab, button);
+            }
+
+            loadDashboard();
+            loadContinueConfig();
           </script>
         </body>
         </html>
         """
     )
+    return html.replace("__USERNAME__", escape(username))

@@ -10,8 +10,11 @@ from app.api_errors import error_response, get_request_id, normalize_http_except
 from app.config import get_settings
 from app.metrics import metrics
 from app.request_context import RequestIdFilter, request_id_var
+from app.routes.admin_auth import router as admin_auth_router
+from app.routes.admin_chat import router as admin_chat_router
 from app.routes.chat import router as chat_router
 from app.routes.admin import router as admin_router
+from app.routes.device import router as device_router
 from app.routes.health import router as health_router
 from app.routes.internal_health import router as internal_health_router
 from app.routes.metrics import router as metrics_router
@@ -90,7 +93,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 
 app.include_router(health_router)
+app.include_router(admin_auth_router)
 app.include_router(admin_router)
+app.include_router(admin_chat_router)
+app.include_router(device_router)
 app.include_router(internal_health_router)
 app.include_router(metrics_router)
 app.include_router(models_router)
