@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api_errors import error_response, get_request_id, normalize_http_exception, normalize_validation_exception
+from app.api_errors import error_response, normalize_http_exception, normalize_validation_exception
 from app.config import get_settings
 from app.metrics import metrics
 from app.request_context import RequestIdFilter, request_id_var
@@ -16,6 +16,7 @@ from app.routes.chat import router as chat_router
 from app.routes.admin import router as admin_router
 from app.routes.device import router as device_router
 from app.routes.health import router as health_router
+from app.routes.home_assistant import router as home_assistant_router
 from app.routes.internal_health import router as internal_health_router
 from app.routes.metrics import router as metrics_router
 from app.routes.models import router as models_router
@@ -34,7 +35,7 @@ for handler in logging.getLogger().handlers:
 
 app = FastAPI(
     title="llm-gateway",
-    version="0.1.0",
+    version="1.2.0",
     description="OpenAI-compatible local orchestrator for llama.cpp backends.",
 )
 
@@ -97,6 +98,7 @@ app.include_router(admin_auth_router)
 app.include_router(admin_router)
 app.include_router(admin_chat_router)
 app.include_router(device_router)
+app.include_router(home_assistant_router)
 app.include_router(internal_health_router)
 app.include_router(metrics_router)
 app.include_router(models_router)

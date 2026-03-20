@@ -21,6 +21,20 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        env_settings,
+        dotenv_settings,
+        file_secret_settings,
+    ):
+        # The admin UI writes runtime config back to .env.
+        # Prioritize the current file over the process environment so
+        # changes apply immediately without a full service restart.
+        return init_settings, dotenv_settings, env_settings, file_secret_settings
+
     host: str = Field(default="127.0.0.1", alias="HOST")
     port: int = Field(default=8000, alias="PORT")
     log_level: str = Field(default="info", alias="LOG_LEVEL")
@@ -56,6 +70,17 @@ class Settings(BaseSettings):
     admin_session_ttl_hours: int = Field(default=24, alias="ADMIN_SESSION_TTL_HOURS")
     admin_cookie_secure: bool = Field(default=False, alias="ADMIN_COOKIE_SECURE")
     device_shared_token: str | None = Field(default=None, alias="DEVICE_SHARED_TOKEN")
+    home_assistant_base_url: str | None = Field(default=None, alias="HOME_ASSISTANT_BASE_URL")
+    home_assistant_token: str | None = Field(default=None, alias="HOME_ASSISTANT_TOKEN")
+    home_assistant_timeout_seconds: float = Field(default=10.0, alias="HOME_ASSISTANT_TIMEOUT_SECONDS")
+    home_assistant_allowed_services: str = Field(
+        default="light.turn_on,light.turn_off,switch.turn_on,switch.turn_off,climate.set_temperature,script.turn_on",
+        alias="HOME_ASSISTANT_ALLOWED_SERVICES",
+    )
+    home_assistant_allowed_entity_prefixes: str = Field(
+        default="light.,switch.,climate.,script.",
+        alias="HOME_ASSISTANT_ALLOWED_ENTITY_PREFIXES",
+    )
     mi50_ssh_host: str | None = Field(default=None, alias="MI50_SSH_HOST")
     mi50_ssh_user: str | None = Field(default=None, alias="MI50_SSH_USER")
     mi50_ssh_port: int = Field(default=22, alias="MI50_SSH_PORT")
@@ -101,6 +126,14 @@ class Settings(BaseSettings):
     @property
     def parsed_routing_deep_keywords(self) -> list[str]:
         return [item.strip().lower() for item in self.routing_deep_keywords.split(",") if item.strip()]
+
+    @property
+    def parsed_home_assistant_allowed_services(self) -> list[str]:
+        return [item.strip().lower() for item in self.home_assistant_allowed_services.split(",") if item.strip()]
+
+    @property
+    def parsed_home_assistant_allowed_entity_prefixes(self) -> list[str]:
+        return [item.strip().lower() for item in self.home_assistant_allowed_entity_prefixes.split(",") if item.strip()]
 
     def models_url_for(self, base_url: str) -> str:
         return f"{base_url.rstrip('/')}/v1/models"

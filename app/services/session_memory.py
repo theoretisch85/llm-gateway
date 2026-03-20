@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Lock
 from uuid import uuid4
 
@@ -12,12 +13,19 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+SCHEMA_FILE = Path("/opt/llm-gateway/deploy/postgres_schema.sql")
+
+
 @dataclass
 class SessionMessage:
     id: str
     role: str
     content: str
     model_used: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    tokens_per_second: float | None
     created_at: datetime
 
 
@@ -34,14 +42,27 @@ class ChatSession:
     messages: list[SessionMessage] = field(default_factory=list)
 
 
+@dataclass
+class MemorySummaryRecord:
+    id: str
+    session_id: str
+    session_title: str
+    summary_kind: str
+    content: str
+    source_message_count: int
+    resolved_model: str | None
+    created_at: datetime
+
+
 class InMemorySessionStore:
     def __init__(self) -> None:
         self._sessions: dict[str, ChatSession] = {}
         self._lock = Lock()
 
-    async def list_sessions(self) -> list[ChatSession]:
+    async def list_sessions(self, limit: int | None = None) -> list[ChatSession]:
         with self._lock:
-            return sorted(self._sessions.values(), key=lambda item: item.updated_at, reverse=True)
+            sessions = sorted(self._sessions.values(), key=lambda item: item.updated_at, reverse=True)
+            return sessions[:limit] if limit is not None else sessions
 
     async def create_session(self, title: str | None, mode: str) -> ChatSession:
         with self._lock:
@@ -80,7 +101,17 @@ class InMemorySessionStore:
             session.updated_at = utcnow()
             return session
 
-    async def add_message(self, session_id: str, role: str, content: str, model_used: str | None = None) -> SessionMessage:
+    async def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        model_used: str | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        total_tokens: int | None = None,
+        tokens_per_second: float | None = None,
+    ) -> SessionMessage:
         with self._lock:
             session = self._sessions[session_id]
             message = SessionMessage(
@@ -88,6 +119,10 @@ class InMemorySessionStore:
                 role=role,
                 content=content,
                 model_used=model_used,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                tokens_per_second=tokens_per_second,
                 created_at=utcnow(),
             )
             session.messages.append(message)
@@ -103,6 +138,40 @@ class InMemorySessionStore:
             session.mode = mode
             session.updated_at = utcnow()
             return session
+
+    async def list_memory_summaries(self, session_id: str | None = None, limit: int = 20) -> list[MemorySummaryRecord]:
+        with self._lock:
+            sessions = sorted(self._sessions.values(), key=lambda item: item.updated_at, reverse=True)
+            records: list[MemorySummaryRecord] = []
+            for session in sessions:
+                if session_id and session.id != session_id:
+                    continue
+                if not session.summary:
+                    continue
+                records.append(
+                    MemorySummaryRecord(
+                        id=f"inmemory-{session.id}",
+                        session_id=session.id,
+                        session_title=session.title,
+                        summary_kind="rolling",
+                        content=session.summary,
+                        source_message_count=max(0, len(session.messages) - 6),
+                        resolved_model=session.resolved_model,
+                        created_at=session.updated_at,
+                    )
+                )
+            return records[:limit]
+
+    async def get_memory_stats(self) -> dict[str, int | str | bool]:
+        with self._lock:
+            sessions = list(self._sessions.values())
+            return {
+                "store_mode": "memory",
+                "persistent": False,
+                "sessions_count": len(sessions),
+                "messages_count": sum(len(item.messages) for item in sessions),
+                "summaries_count": sum(1 for item in sessions if item.summary),
+            }
 
 
 class PostgresSessionStore:
@@ -120,18 +189,39 @@ class PostgresSessionStore:
             raise RuntimeError("DATABASE_URL ist gesetzt, aber asyncpg ist nicht installiert.") from exc
 
         self._pool = await asyncpg.create_pool(self._database_url, min_size=1, max_size=5)
+        await self._ensure_schema()
         return self._pool
 
-    async def list_sessions(self) -> list[ChatSession]:
+    async def _ensure_schema(self) -> None:
+        if self._pool is None:
+            return
+        if not SCHEMA_FILE.exists():
+            raise RuntimeError("postgres_schema.sql wurde nicht gefunden.")
+        schema_sql = SCHEMA_FILE.read_text(encoding="utf-8")
+        async with self._pool.acquire() as conn:
+            await conn.execute(schema_sql)
+
+    async def list_sessions(self, limit: int | None = None) -> list[ChatSession]:
         pool = await self._pool_instance()
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                select id, title, selected_mode, resolved_model, route_reason, rolling_summary, created_at, updated_at
-                from chat_sessions
-                order by updated_at desc
-                """
-            )
+            if limit is not None:
+                rows = await conn.fetch(
+                    """
+                    select id, title, selected_mode, resolved_model, route_reason, rolling_summary, created_at, updated_at
+                    from chat_sessions
+                    order by updated_at desc
+                    limit $1
+                    """,
+                    limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    select id, title, selected_mode, resolved_model, route_reason, rolling_summary, created_at, updated_at
+                    from chat_sessions
+                    order by updated_at desc
+                    """
+                )
             sessions = []
             for row in rows:
                 messages = await self._fetch_messages(conn, row["id"])
@@ -196,20 +286,37 @@ class PostgresSessionStore:
             )
             return self._session_from_row(row, [])
 
-    async def add_message(self, session_id: str, role: str, content: str, model_used: str | None = None) -> SessionMessage:
+    async def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        model_used: str | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        total_tokens: int | None = None,
+        tokens_per_second: float | None = None,
+    ) -> SessionMessage:
         pool = await self._pool_instance()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                insert into chat_messages (session_id, role, content, model_used, token_estimate)
-                values ($1::uuid, $2, $3, $4, $5)
-                returning id, role, content, model_used, created_at
+                insert into chat_messages (
+                  session_id, role, content, model_used, token_estimate,
+                  prompt_tokens, completion_tokens, total_tokens, tokens_per_second
+                )
+                values ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9)
+                returning id, role, content, model_used, prompt_tokens, completion_tokens, total_tokens, tokens_per_second, created_at
                 """,
                 session_id,
                 role,
                 content,
                 model_used,
                 max(1, len(content) // 4),
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                tokens_per_second,
             )
             messages = await self._fetch_messages(conn, session_id)
             summary = _build_rolling_summary(messages)
@@ -237,6 +344,10 @@ class PostgresSessionStore:
                 role=row["role"],
                 content=row["content"],
                 model_used=row["model_used"],
+                prompt_tokens=row["prompt_tokens"],
+                completion_tokens=row["completion_tokens"],
+                total_tokens=row["total_tokens"],
+                tokens_per_second=row["tokens_per_second"],
                 created_at=row["created_at"],
             )
 
@@ -271,10 +382,81 @@ class PostgresSessionStore:
             messages = await self._fetch_messages(conn, session_id)
             return self._session_from_row(row, messages)
 
+    async def list_memory_summaries(self, session_id: str | None = None, limit: int = 20) -> list[MemorySummaryRecord]:
+        pool = await self._pool_instance()
+        async with pool.acquire() as conn:
+            if session_id:
+                rows = await conn.fetch(
+                    """
+                    select
+                      ms.id,
+                      ms.session_id,
+                      cs.title as session_title,
+                      ms.summary_kind,
+                      ms.content,
+                      ms.source_message_count,
+                      cs.resolved_model,
+                      ms.created_at
+                    from memory_summaries ms
+                    join chat_sessions cs on cs.id = ms.session_id
+                    where ms.session_id = $1::uuid
+                    order by ms.created_at desc
+                    limit $2
+                    """,
+                    session_id,
+                    limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    select
+                      ms.id,
+                      ms.session_id,
+                      cs.title as session_title,
+                      ms.summary_kind,
+                      ms.content,
+                      ms.source_message_count,
+                      cs.resolved_model,
+                      ms.created_at
+                    from memory_summaries ms
+                    join chat_sessions cs on cs.id = ms.session_id
+                    order by ms.created_at desc
+                    limit $1
+                    """,
+                    limit,
+                )
+            return [
+                MemorySummaryRecord(
+                    id=str(row["id"]),
+                    session_id=str(row["session_id"]),
+                    session_title=row["session_title"],
+                    summary_kind=row["summary_kind"],
+                    content=row["content"],
+                    source_message_count=row["source_message_count"],
+                    resolved_model=row["resolved_model"],
+                    created_at=row["created_at"],
+                )
+                for row in rows
+            ]
+
+    async def get_memory_stats(self) -> dict[str, int | str | bool]:
+        pool = await self._pool_instance()
+        async with pool.acquire() as conn:
+            sessions_count = await conn.fetchval("select count(*) from chat_sessions")
+            messages_count = await conn.fetchval("select count(*) from chat_messages")
+            summaries_count = await conn.fetchval("select count(*) from memory_summaries")
+            return {
+                "store_mode": "postgres",
+                "persistent": True,
+                "sessions_count": int(sessions_count or 0),
+                "messages_count": int(messages_count or 0),
+                "summaries_count": int(summaries_count or 0),
+            }
+
     async def _fetch_messages(self, conn, session_id: str) -> list[SessionMessage]:
         rows = await conn.fetch(
             """
-            select id, role, content, model_used, created_at
+            select id, role, content, model_used, prompt_tokens, completion_tokens, total_tokens, tokens_per_second, created_at
             from chat_messages
             where session_id = $1::uuid
             order by created_at asc
@@ -287,6 +469,10 @@ class PostgresSessionStore:
                 role=row["role"],
                 content=row["content"],
                 model_used=row["model_used"],
+                prompt_tokens=row["prompt_tokens"],
+                completion_tokens=row["completion_tokens"],
+                total_tokens=row["total_tokens"],
+                tokens_per_second=row["tokens_per_second"],
                 created_at=row["created_at"],
             )
             for row in rows

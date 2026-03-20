@@ -5,9 +5,8 @@ import json
 import logging
 import secrets
 import time
-from typing import Any
 
-from fastapi import Cookie, Header, HTTPException, Request
+from fastapi import Cookie, Header, Request
 from fastapi.responses import RedirectResponse
 
 from app.api_errors import unauthorized_error
@@ -32,6 +31,8 @@ def _effective_admin_session_secret(settings: Settings) -> str:
 
 
 def create_admin_session_token(settings: Settings, username: str) -> str:
+    # The admin UI uses a signed cookie so browser logins work without
+    # introducing a separate server-side session store.
     payload = {
         "username": username,
         "exp": int(time.time()) + settings.admin_session_ttl_hours * 3600,
@@ -95,20 +96,6 @@ def get_admin_session_username(request: Request) -> str | None:
     settings = get_settings()
     cookie_value = request.cookies.get(ADMIN_SESSION_COOKIE)
     return parse_admin_session_token(settings, cookie_value)
-
-
-def require_admin_login_or_redirect(request: Request) -> str:
-    username = get_admin_session_username(request)
-    if username:
-        return username
-    return_url = request.url.path
-    if request.url.query:
-        return_url = f"{return_url}?{request.url.query}"
-    raise HTTPException(
-        status_code=303,
-        detail="Login required.",
-        headers={"Location": f"/admin/login?next={return_url}"},
-    )
 
 
 async def require_bearer_token(authorization: str | None = Header(default=None)) -> None:

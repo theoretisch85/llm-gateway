@@ -3,6 +3,7 @@ set -euo pipefail
 
 BASE_URL="${1:-http://127.0.0.1:8000}"
 TOKEN="${API_BEARER_TOKEN:-dev-local-token}"
+MODEL_NAME="${PUBLIC_MODEL_NAME:-devstral-q3}"
 
 echo "[1/5] health"
 curl -fsS "$BASE_URL/health"
@@ -26,7 +27,7 @@ curl -fsS "$BASE_URL/v1/chat/completions" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen2.5-coder",
+    "model": "'"$MODEL_NAME"'",
     "messages": [
       {"role": "user", "content": "Reply with exactly the word OK."}
     ],

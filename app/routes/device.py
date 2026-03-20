@@ -19,6 +19,7 @@ class DeviceAskRequest(BaseModel):
     mode: str = "auto"
     session_id: str | None = None
     max_tokens: int | None = None
+    document_ids: list[str] = []
 
 
 @router.post("/api/device/ask", dependencies=[Depends(require_device_token)])
@@ -42,10 +43,10 @@ async def device_ask(payload: DeviceAskRequest, request: Request) -> JSONRespons
         )
 
     try:
-        decision, backend_payload = _prepare_admin_backend_payload(
+        decision, backend_payload = await _prepare_admin_backend_payload(
             settings,
             session,
-            type("Payload", (), {"message": payload.message, "mode": payload.mode, "temperature": None, "max_tokens": payload.max_tokens})(),
+            type("Payload", (), {"message": payload.message, "mode": payload.mode, "temperature": None, "max_tokens": payload.max_tokens, "document_ids": payload.document_ids})(),
         )
         await store.add_message(session.id, "user", payload.message)
         await store.update_route(session.id, decision.resolved_model, decision.reason, payload.mode or session.mode)

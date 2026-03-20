@@ -1,6 +1,6 @@
 # llm-gateway
 
-Ein lokaler OpenAI-kompatibler Orchestrator fuer VS Code Clients, der Requests an einen externen `llama.cpp`-Server mit `Qwen2.5-Coder` weiterleitet.
+Ein lokaler OpenAI-kompatibler Orchestrator fuer VS Code Clients, der Requests an einen externen `llama.cpp`-Server weiterleitet. Der aktuelle Standardbetrieb ist `devstral-q3`, optional mit umschaltbaren MI50-Profilen wie `Qwen`.
 
 ## Praxis-Setup
 
@@ -21,7 +21,7 @@ VS Code / Continue
 llm-gateway (FastAPI, Python, Uvicorn)
         |
         v
-MI50-VM mit llama.cpp + Qwen2.5-Coder
+MI50-VM mit llama.cpp + Devstral oder Qwen
 ```
 
 Warum diese Aufteilung sinnvoll ist:
@@ -49,6 +49,10 @@ Dieses Grundgeruest stellt drei Endpunkte bereit:
 - `GET /internal/admin`
 - `GET /internal/chat`
 - `POST /api/device/ask`
+- `GET /api/admin/home-assistant/status`
+- `GET /api/admin/home-assistant/entities`
+- `POST /api/admin/home-assistant/action`
+- `POST /api/device/home-assistant/action`
 
 Die Minimalversion priorisiert:
 
@@ -65,7 +69,7 @@ Der Gateway bietet standardmaessig genau einen oeffentlichen Modellnamen an:
 
 Intern sendet der Gateway Requests an das echte Backend-Modell:
 
-- `BACKEND_MODEL_NAME=devstral-q3.gguf`
+- `BACKEND_MODEL_NAME=Devstral-Small-2-24B-Instruct-2512-Q3_K_M.gguf`
 
 Das bedeutet:
 
@@ -84,13 +88,15 @@ Der Gateway ist nicht mehr nur ein einzelner Qwen-Proxy, sondern die erste klein
 - vorbereitete PostgreSQL-Zielstruktur fuer spaeteren persistenten Memory-Betrieb
 - Login-Grundlage fuer Browser-Adminseiten
 - vorbereiteter Device-Endpunkt fuer spaetere Raspberry-Pi-/TTS-Anbindung
+- vorbereitete Home-Assistant-Integration mit sicherer Service-Whitelist
 
 Wichtige ehrliche Einschraenkung der aktuellen V1:
 
-- Die neue Admin-Chat-/Session-Schicht nutzt aktuell einen In-Memory-Store im Gateway-Prozess.
-- Das bedeutet: Sessions und Zusammenfassungen ueberleben keinen Neustart.
-- Das PostgreSQL-Zielschema liegt bereits unter `deploy/postgres_schema.sql`, ist aber noch nicht als harte Runtime-Abhaengigkeit aktiviert.
-- Diese Entscheidung ist bewusst pragmatisch: neue Plattformfunktionen sofort nutzbar halten, ohne den laufenden Gateway bei fehlender DB zu blockieren.
+- Ohne gesetzte `DATABASE_URL` nutzt die neue Admin-Chat-/Session-Schicht weiterhin den In-Memory-Store im Gateway-Prozess.
+- Das bedeutet dann: Sessions und Zusammenfassungen ueberleben keinen Neustart.
+- Mit gesetzter `DATABASE_URL` nutzt der Gateway PostgreSQL fuer Sessions, Messages und Rolling Summaries.
+- Das Schema wird dabei automatisch aus `deploy/postgres_schema.sql` initialisiert, sobald der erste PostgreSQL-Zugriff erfolgt.
+- Wenn die Datenbank nicht erreichbar ist, ist das jetzt ein echter Betriebsfehler und kein stilles "wird schon irgendwie im RAM weitergehen".
 
 ## Ein-Modell-Betrieb jetzt, Deep-Modell spaeter
 
@@ -146,6 +152,11 @@ Konfigurierbar per `.env`:
 - `ADMIN_SESSION_TTL_HOURS`
 - `ADMIN_COOKIE_SECURE`
 - `DEVICE_SHARED_TOKEN`
+- `HOME_ASSISTANT_BASE_URL`
+- `HOME_ASSISTANT_TOKEN`
+- `HOME_ASSISTANT_TIMEOUT_SECONDS`
+- `HOME_ASSISTANT_ALLOWED_SERVICES`
+- `HOME_ASSISTANT_ALLOWED_ENTITY_PREFIXES`
 
 ## Session- und Context-Management
 
@@ -162,7 +173,7 @@ Das ist bewusst keine magische Langzeit-KI-Memory-Schicht. Es ist eine kleine, r
 
 ## PostgreSQL-Zielstruktur
 
-Fuer den spaeteren persistenten Memory-Ausbau liegt ein startbarer Schema-Entwurf hier:
+Fuer den persistenten Memory-Betrieb liegt das Schema hier:
 
 - `deploy/postgres_schema.sql`
 
@@ -176,6 +187,12 @@ Enthalten sind:
 Konfigurationsschalter:
 
 - `DATABASE_URL`
+
+Wenn `DATABASE_URL` gesetzt ist:
+
+- wird automatisch auf den PostgreSQL-Store umgeschaltet
+- das Schema wird bei Bedarf automatisch angelegt
+- Sessions und Rolling Summaries bleiben nach Gateway-Neustarts erhalten
 
 ## Authentifizierung
 
@@ -346,9 +363,9 @@ CONTEXT_CHARS_PER_TOKEN=4.0
 DEFAULT_MAX_TOKENS=512
 
 PUBLIC_MODEL_NAME=devstral-q3
-BACKEND_MODEL_NAME=devstral-q3.gguf
+BACKEND_MODEL_NAME=Devstral-Small-2-24B-Instruct-2512-Q3_K_M.gguf
 FAST_MODEL_PUBLIC_NAME=devstral-q3
-FAST_MODEL_BACKEND_NAME=devstral-q3.gguf
+FAST_MODEL_BACKEND_NAME=Devstral-Small-2-24B-Instruct-2512-Q3_K_M.gguf
 FAST_MODEL_BASE_URL=http://192.168.40.111:8080
 DEEP_MODEL_PUBLIC_NAME=
 DEEP_MODEL_BACKEND_NAME=
@@ -357,6 +374,7 @@ ADMIN_DEFAULT_MODE=fast
 ROUTING_DEEP_KEYWORDS=architektur,analyse,refactor,refactoring,debug,design,plan,root cause,komplex
 ROUTING_LENGTH_THRESHOLD=1200
 ROUTING_HISTORY_THRESHOLD=8
+# Beispiel: DATABASE_URL=postgresql://llmgateway:change-me@192.168.40.120:5432/llm_gateway
 DATABASE_URL=
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=
@@ -364,6 +382,11 @@ ADMIN_SESSION_SECRET=
 ADMIN_SESSION_TTL_HOURS=24
 ADMIN_COOKIE_SECURE=false
 DEVICE_SHARED_TOKEN=
+HOME_ASSISTANT_BASE_URL=
+HOME_ASSISTANT_TOKEN=
+HOME_ASSISTANT_TIMEOUT_SECONDS=10.0
+HOME_ASSISTANT_ALLOWED_SERVICES=light.turn_on,light.turn_off,switch.turn_on,switch.turn_off,climate.set_temperature,script.turn_on
+HOME_ASSISTANT_ALLOWED_ENTITY_PREFIXES=light.,switch.,climate.,script.
 ```
 
 ## Entwicklungsstart
@@ -459,6 +482,10 @@ Unter `GET /internal/admin` gibt es jetzt einen Browser-Hub mit Login und Menuel
 - `MI50_RESTART_COMMAND`
 - `MI50_STATUS_COMMAND`
 - `MI50_LOGS_COMMAND`
+- `DATABASE_URL`
+- Datenbankstatus und Schema-Initialisierung
+- Home-Assistant-Verbindung und erlaubte Services
+- Speicher-/Persistenz-Ueberblick
 - Continue-YAML-Vorschau
 
 Wichtig:
@@ -479,14 +506,140 @@ Unter `GET /internal/chat` gibt es jetzt eine getrennte Chatoberflaeche fuer den
 - Sessions anlegen, laden, resetten und loeschen
 - `Auto`, `Fast` oder `Deep` waehlen
 - Antworten direkt streamen
+- Text- und PDF-Dateien direkt im Chat hochladen und sofort als Kontext auswaehlen
 - den aufgeloesten Modellnamen und die Routing-Regel pro Session sehen
+- pro Assistant-Antwort Tokens und `t/s` sehen, wenn `llama.cpp` Nutzungs-/Timingdaten liefert
 
 Im Hub wird diese Seite ueber den Chat-Tab eingebettet, damit du nicht mehr staendig zwischen komplett getrennten Browser-Seiten springen musst.
 
 Wichtige Grenze:
 
-- Die Session-Daten sind in der aktuellen V1 noch prozesslokal im Speicher.
-- Fuer persistenten Betrieb ist der naechste Ausbau die Aktivierung des PostgreSQL-Memory-Layers.
+- Ohne `DATABASE_URL` bleiben die Session-Daten weiter prozesslokal im Speicher.
+- Fuer persistenten Betrieb musst du also wirklich eine PostgreSQL-URL setzen.
+
+## Home-Assistant-Integration
+
+Der Gateway hat jetzt eine erste sichere Home-Assistant-V1:
+
+- `GET /api/admin/home-assistant/status`
+- `GET /api/admin/home-assistant/entities`
+- `POST /api/admin/home-assistant/action`
+- `POST /api/device/home-assistant/action`
+- `GET /api/admin/home-assistant/notes`
+- `POST /api/admin/home-assistant/notes`
+
+Konfigurationsschalter:
+
+- `HOME_ASSISTANT_BASE_URL`
+- `HOME_ASSISTANT_TOKEN`
+- `HOME_ASSISTANT_TIMEOUT_SECONDS`
+- `HOME_ASSISTANT_ALLOWED_SERVICES`
+- `HOME_ASSISTANT_ALLOWED_ENTITY_PREFIXES`
+
+Wichtige Grenze:
+
+- Der Gateway laesst absichtlich nur freigegebene Services und erlaubte Entity-Praefixe zu.
+- Das ist bewusst keine freie "KI darf alles in Home Assistant ausfuehren"-Schicht.
+- Die aktuelle V1 ist bewusst regelbasiert: lesen, Notizen merken und einfache freigegebene Aktionen ja, freie Hausautomations-Magie nein.
+
+Im Admin-Chat gibt es jetzt eine erste Home-Assistant-Chat-V1:
+
+- Der Chat kann Home-Assistant-Entities als Kontext einbeziehen.
+- Das geht automatisch bei klaren HA-/Entity-Anfragen oder explizit ueber `Home Assistant lesen`.
+- Dauerhafte Bedeutungen fuer Entities kannst du im Chat so speichern:
+  - `Merke HA light.schreibtisch: Das ist die LED-Leiste am Gaming-Tisch.`
+- Diese Notizen landen in PostgreSQL und werden bei spaeteren HA-Chats wieder als Kontext verwendet.
+- Nach erfolgreichen HA-Aktionen lernt der Gateway jetzt auch einfache Alias-Begriffe automatisch nach, z. B. kann aus `das Licht im Gamingzimmer` spaeter direkt `gamingzimmer licht` werden.
+- Einfache Schaltbefehle versteht der Chat jetzt direkt, z. B.:
+  - `Schalte gaming licht aus`
+  - `Kannst du bitte alle gaming licht aus machen`
+  - `gaming licht an machen alle bitte`
+  - `Schalte das Wohnzimmer Licht an`
+  - `Aktiviere light.schreibtisch`
+  - `Stelle Schlafzimmer auf 21 Grad`
+  - `Starte script.gute_nacht`
+- Mehrere Zielnamen mit `und` oder Komma gehen jetzt ebenfalls, z. B.:
+  - `mach bjorn und lena licht an`
+  - `schalte björn und lena licht aus`
+- Wenn `alle` im Befehl steckt, schaltet der Gateway jetzt mehrere passende Entities desselben Typs direkt gemeinsam.
+- Einfache Follow-up-Befehle auf die letzte HA-Aktion gehen jetzt ebenfalls, z. B.:
+  - `ok und jetzt wieder aus`
+  - `und jetzt wieder an`
+- Bei Mehrdeutigkeit schaltet der Gateway absichtlich nicht blind, sondern nennt die Kandidaten.
+
+Beispiel:
+
+```bash
+TOKEN=$(sed -n 's/^API_BEARER_TOKEN=//p' /opt/llm-gateway/.env)
+
+curl -s http://127.0.0.1:8000/api/admin/home-assistant/status \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```bash
+curl -s http://127.0.0.1:8000/api/admin/home-assistant/action \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "domain":"light",
+    "service":"turn_on",
+    "entity_id":"light.wohnzimmer",
+    "service_data":{"brightness_pct":50}
+  }'
+```
+
+Fuer den spaeteren Pi-Client:
+
+```bash
+curl -s http://127.0.0.1:8000/api/device/home-assistant/action \
+  -H "Authorization: Bearer DEVICE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "domain":"switch",
+    "service":"turn_off",
+    "entity_id":"switch.kaffeemaschine"
+  }'
+```
+
+## Database- und Storage-Tab
+
+Im Admin-Hub gibt es jetzt zusaetzlich:
+
+- `Dashboard`
+  Zeigt den laufenden Betriebszustand der Plattform:
+  - Gateway-/Backend-Status
+  - Requests und mittlere Request-Dauer
+  - GPU-Temperatur, GPU-Power und VRAM
+  - aktives Modell, Limits, Datenbank- und Storage-Zustand
+- `Settings`
+  Hier liegen die schreibbaren Plattform-Settings:
+  - ganz oben KI-Profile fuer mehrere MI50-Services wie `kai-devstral` und `kai-qwen`
+  - jedes KI-Profil kann eigene Basiswerte fuer `BACKEND_CONTEXT_WINDOW`, `CONTEXT_RESPONSE_RESERVE` und `DEFAULT_MAX_TOKENS` mitbringen
+  - jedes KI-Profil kann optional auch einen eigenen `NGL`-Wert tragen; der Gateway reicht ihn beim Aktivieren als `KAI_NGL` an den Remote-Befehl weiter oder ersetzt `{ngl}` in einem hinterlegten Aktivierungs-Kommando
+  - darunter nur die alltagsrelevanten Basisfelder wie Backend-URL, sichtbarer Modellname, Kontextfenster, Token-Limits und MI50-SSH
+  - Fast/Deep-Kompatibilitaet, Routing-Regeln und rohe MI50-Kommandos nur noch als erweiterte Settings
+  - Continue-YAML weiterhin direkt im selben Tab
+- `Database`
+  Hier setzt du `DATABASE_URL`, testest die Verbindung und kannst das PostgreSQL-Schema manuell initialisieren. Der Gateway zeigt auch an, ob gerade `memory` oder `postgres` aktiv ist.
+  Der Tab speichert und testet bewusst serverseitig, damit das auch in hakeligen Browser-WebViews oder bei kaputtem JS noch funktioniert.
+  Neue Werte aus `.env` werden vom laufenden Gateway sofort wieder bevorzugt, ohne dass dafuer erst ein kompletter Service-Neustart noetig ist.
+  Gespeicherte Datenbank-Profile werden nur noch redaktiert angezeigt, also ohne Passwort im sichtbaren UI. Mehrere Profile koennen lokal hinterlegt und bei Bedarf wieder aktiviert werden.
+- `Memory`
+  Hier siehst du, ob der Gateway gerade wirklich persistenten Memory nutzt, wie viele Sessions/Nachrichten/Summaries schon gespeichert sind und welche Rolling Summaries aktuell aus den aelteren Chats entstanden sind.
+- `Storage`
+  Hier legst du jetzt echte Storage-Ziele an:
+  - `local` fuer einen lokalen Pfad auf dem Gateway-Host oder im LXC
+  - `smb_mount` fuer einen bereits auf dem Host gemounteten SMB-Pfad
+  Dateien wie `.txt`, `.md`, `.pdf`, `.csv`, `.json`, `.log`, `.yaml`, `.yml` koennen dort abgelegt werden. Die Datei selbst bleibt im Storage, waehrend Metadaten und extrahierter Text in PostgreSQL landen.
+  Damit ist die Grundlage gelegt, diese Dokumente als KI-Kontext oder Wissensbasis zu verwenden. Im Admin-Chat koennen gespeicherte Dokumente direkt als Kontext ausgewaehlt werden.
+  Wichtige ehrliche Einschraenkung: Der Gateway macht bewusst keinen nativen SMB-Login. SMB wird als gemountetes Dateisystem behandelt.
+
+Fuer dein geplantes Homelab-Setup ist das die pragmatische Empfehlung:
+
+- eigener PostgreSQL-LXC mit viel Speicher
+- 256 GB SSD fuer die eigentlichen DB-Dateien
+- 1 TB HDD fuer Backups, Dumps, spaetere Dateispeicher oder Nextcloud
+- SMB-/NAS-Shares zuerst sauber auf dem Host mounten und dann als `smb_mount`-Profil im Hub hinterlegen
 
 ## Admin-Login und Hub
 
@@ -538,6 +691,33 @@ Verfuegbar:
 - `kai telemetry`
 
 Das ist bewusst kontrollierter als ein generisches Browser-Terminal. Fuer spaeter kann daraus ein groesseres Panel werden, aber die V1 bleibt absichtlich enger.
+
+## KI-Profile fuer mehrere MI50-Services
+
+Wenn du auf der MI50 mehrere `llama.cpp`-Services vorbereitest, aber immer nur einen davon aktiv fahren willst, ist der neue Weg:
+
+- auf der MI50 z. B. zwei Services anlegen:
+  - `kai-devstral.service`
+  - `kai-qwen.service`
+- im Admin-Hub unter `Settings` zwei KI-Profile speichern
+- beim Aktivieren eines Profils stellt der Gateway um:
+  - `PUBLIC_MODEL_NAME`
+  - `BACKEND_MODEL_NAME`
+  - `FAST_MODEL_*`
+  - `LLAMACPP_BASE_URL`
+  - optional die MI50-Status-/Restart-/Log-Kommandos
+
+Pragmatische Empfehlung:
+
+- wenn dein SSH-User auf der MI50 `sudo systemctl ...` ohne Passwort darf, reicht der reine Service-Name
+- wenn das nicht geht, hinterlegst du im Profil stattdessen ein eigenes Aktivierungs-Kommando
+  - Beispiel: `~/switch-kai.sh qwen`
+  - oder `sudo -n systemctl restart kai-qwen`
+
+Wichtig:
+
+- Das ist bewusst fuer deinen Ein-GPU-Alltag gedacht.
+- Mehrere Profile ja, aber real laeuft auf der MI50 typischerweise immer nur ein Modellprozess aktiv.
 
 Auf dem Dashboard koennen zusaetzlich einfache MI50-Telemetriedaten aus `rocm-smi` erscheinen:
 
@@ -621,9 +801,9 @@ Passend dazu im Gateway:
 LLAMACPP_BASE_URL=http://DEINE_MI50_VM:8080
 LLAMACPP_API_KEY=DEIN_BACKEND_TOKEN
 PUBLIC_MODEL_NAME=devstral-q3
-BACKEND_MODEL_NAME=devstral-q3.gguf
+BACKEND_MODEL_NAME=Devstral-Small-2-24B-Instruct-2512-Q3_K_M.gguf
 FAST_MODEL_PUBLIC_NAME=devstral-q3
-FAST_MODEL_BACKEND_NAME=devstral-q3.gguf
+FAST_MODEL_BACKEND_NAME=Devstral-Small-2-24B-Instruct-2512-Q3_K_M.gguf
 FAST_MODEL_BASE_URL=http://DEINE_MI50_VM:8080
 DEEP_MODEL_PUBLIC_NAME=
 DEEP_MODEL_BACKEND_NAME=
@@ -905,7 +1085,7 @@ Beispiel:
 
 ```env
 MI50_SSH_HOST=192.168.40.111
-MI50_SSH_USER=llmadmin
+MI50_SSH_USER=mi50
 MI50_SSH_PORT=22
 MI50_RESTART_COMMAND=sudo systemctl restart kai
 MI50_STATUS_COMMAND=sudo systemctl status kai --no-pager

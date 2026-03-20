@@ -1,5 +1,6 @@
 import json
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -57,6 +58,18 @@ def _run_remote_command(command: str, timeout_seconds: int = 45) -> str:
     return output or "OK"
 
 
+def _prepare_remote_activation_command(command: str, ngl_layers: str = "") -> str:
+    clean_command = (command or "").strip()
+    clean_ngl = (ngl_layers or "").strip()
+    if not clean_ngl:
+        return clean_command
+
+    if "{ngl}" in clean_command:
+        return clean_command.replace("{ngl}", shlex.quote(clean_ngl))
+
+    return f"KAI_NGL={shlex.quote(clean_ngl)} {clean_command}"
+
+
 def restart_mi50_backend(timeout_seconds: int = 120) -> dict[str, str]:
     if not RESTART_SCRIPT.exists():
         raise RuntimeError(f"Restart-Skript fehlt: {RESTART_SCRIPT}")
@@ -75,6 +88,56 @@ def restart_mi50_backend(timeout_seconds: int = 120) -> dict[str, str]:
     return {
         "status": "ok",
         "output": output or "MI50-Backend erfolgreich neu gestartet.",
+    }
+
+
+def switch_mi50_service(service_name: str, known_service_names: list[str], timeout_seconds: int = 180) -> dict[str, str]:
+    clean_service = (service_name or "").strip()
+    if not clean_service:
+        raise RuntimeError("Kein MI50-Service fuer das Profil gesetzt.")
+
+    others = [item for item in known_service_names if item and item != clean_service]
+    script_parts: list[str] = []
+    if others:
+        quoted_others = " ".join(shlex.quote(item) for item in others)
+        script_parts.append(f"sudo systemctl stop {quoted_others} >/dev/null 2>&1 || true")
+    script_parts.append(f"sudo systemctl restart {shlex.quote(clean_service)}")
+    script_parts.append(f"sudo systemctl status {shlex.quote(clean_service)} --no-pager")
+    script = "; ".join(script_parts)
+    output = _run_remote_command(f"bash -lc {shlex.quote(script)}", timeout_seconds=timeout_seconds)
+    return {
+        "status": "ok",
+        "output": output,
+    }
+
+
+def stop_mi50_service(service_name: str, timeout_seconds: int = 120) -> dict[str, str]:
+    clean_service = (service_name or "").strip()
+    if not clean_service:
+        raise RuntimeError("Kein MI50-Service fuer das Profil gesetzt.")
+
+    script = "; ".join(
+        [
+            f"systemctl --user stop {shlex.quote(clean_service)} >/dev/null 2>&1 || sudo systemctl stop {shlex.quote(clean_service)} >/dev/null 2>&1 || true",
+            f"systemctl --user is-active {shlex.quote(clean_service)} >/dev/null 2>&1 && echo ACTIVE || echo INACTIVE",
+        ]
+    )
+    output = _run_remote_command(f"bash -lc {shlex.quote(script)}", timeout_seconds=timeout_seconds)
+    return {
+        "status": "ok",
+        "output": output,
+    }
+
+
+def run_remote_backend_activation(command: str, ngl_layers: str = "", timeout_seconds: int = 180) -> dict[str, str]:
+    clean_command = (command or "").strip()
+    if not clean_command:
+        raise RuntimeError("Kein Aktivierungsbefehl fuer das Backend-Profil gesetzt.")
+    prepared_command = _prepare_remote_activation_command(clean_command, ngl_layers=ngl_layers)
+    output = _run_remote_command(prepared_command, timeout_seconds=timeout_seconds)
+    return {
+        "status": "ok",
+        "output": output,
     }
 
 

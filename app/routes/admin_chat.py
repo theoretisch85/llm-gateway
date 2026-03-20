@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from textwrap import dedent
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -10,10 +11,25 @@ from app.auth import get_admin_session_username, require_admin_api_auth
 from app.config import get_settings
 from app.context_guard import ContextGuardError, fit_messages_to_budget
 from app.schemas.chat import ChatMessage
-from app.schemas.admin_chat import AdminChatRequest, AdminChatResponse, AdminSessionCreateRequest, AdminSessionResponse
+from app.schemas.admin_chat import (
+    AdminChatRequest,
+    AdminChatResponse,
+    AdminMemoryOverviewResponse,
+    AdminMemorySummaryResponse,
+    AdminSessionCreateRequest,
+    AdminSessionResponse,
+)
 from app.services.llamacpp_client import LlamaCppClient, LlamaCppError, LlamaCppTimeoutError
+from app.services.home_assistant import HomeAssistantClient, HomeAssistantConfigError, HomeAssistantRequestError
+from app.services.home_assistant_memory import (
+    get_home_assistant_alias_store,
+    get_home_assistant_note_store,
+    normalize_home_assistant_alias,
+    parse_home_assistant_note_instruction,
+)
 from app.services.model_router import ModelRouter
 from app.services.session_memory import ChatSession, get_session_store
+from app.services.storage_library import get_document_contexts
 
 
 logger = logging.getLogger(__name__)
@@ -24,7 +40,10 @@ router = APIRouter(tags=["admin-chat"])
 async def admin_chat_page(request: Request) -> HTMLResponse | RedirectResponse:
     if not get_admin_session_username(request):
         return RedirectResponse(url="/admin/login?next=/internal/admin%3Ftab%3Dchat", status_code=303)
-    return HTMLResponse(_admin_chat_html())
+    return HTMLResponse(
+        _admin_chat_html(),
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @router.get("/api/admin/sessions", dependencies=[Depends(require_admin_api_auth)])
@@ -32,6 +51,30 @@ async def list_sessions() -> list[AdminSessionResponse]:
     settings = get_settings()
     store = get_session_store(settings)
     return [_serialize_session(item) for item in await store.list_sessions()]
+
+
+@router.get("/api/admin/memory/overview", dependencies=[Depends(require_admin_api_auth)], response_model=AdminMemoryOverviewResponse)
+async def get_memory_overview(limit_sessions: int = 12, limit_summaries: int = 12, session_id: str | None = None) -> AdminMemoryOverviewResponse:
+    settings = get_settings()
+    store = get_session_store(settings)
+    stats = await store.get_memory_stats()
+    sessions = [_serialize_session(item) for item in await store.list_sessions(limit=max(1, min(limit_sessions, 30)))]
+    summaries = [
+        _serialize_memory_summary(item)
+        for item in await store.list_memory_summaries(
+            session_id=session_id,
+            limit=max(1, min(limit_summaries, 40)),
+        )
+    ]
+    return AdminMemoryOverviewResponse(
+        store_mode=str(stats.get("store_mode") or "memory"),
+        persistent=bool(stats.get("persistent")),
+        sessions_count=int(stats.get("sessions_count") or 0),
+        messages_count=int(stats.get("messages_count") or 0),
+        summaries_count=int(stats.get("summaries_count") or 0),
+        sessions=sessions,
+        summaries=summaries,
+    )
 
 
 @router.post("/api/admin/sessions", dependencies=[Depends(require_admin_api_auth)], response_model=AdminSessionResponse)
@@ -81,17 +124,67 @@ async def admin_chat(payload: AdminChatRequest, session_id: str, request: Reques
     client = LlamaCppClient(settings)
 
     try:
-        decision, backend_payload = _prepare_admin_backend_payload(settings, session, payload)
+        note_instruction = parse_home_assistant_note_instruction(payload.message)
+        if note_instruction:
+            entity_id, note = note_instruction
+            note_store = get_home_assistant_note_store(settings)
+            if note_store is None:
+                return error_response(
+                    request_id=request.state.request_id,
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    message="DATABASE_URL ist nicht gesetzt. Home-Assistant-Notizen brauchen PostgreSQL.",
+                    error_type="invalid_request_error",
+                    code="home_assistant_note_store_unavailable",
+                )
+            await store.add_message(session_id, "user", payload.message)
+            saved_note = await note_store.upsert_note(entity_id, note)
+            assistant_message = await store.add_message(
+                session_id,
+                "assistant",
+                f"Gemerkt: {saved_note.entity_id} -> {saved_note.note}",
+                model_used="system",
+            )
+            return AdminChatResponse(
+                session=_serialize_session(await _require_session(store, session_id)),
+                assistant_message=_serialize_message(assistant_message),
+                resolved_model=session.resolved_model or "system",
+                route_reason="home_assistant_note_saved",
+            )
+
+        ha_action_result = await _try_handle_home_assistant_action(settings, payload.message, session=session)
+        if ha_action_result is not None:
+            await store.add_message(session_id, "user", payload.message)
+            await store.update_route(session_id, "home_assistant", ha_action_result["route_reason"], payload.mode or session.mode)
+            request.state.backend_called = True
+            assistant_message = await store.add_message(
+                session_id,
+                "assistant",
+                ha_action_result["assistant_text"],
+                model_used="home_assistant",
+            )
+            return AdminChatResponse(
+                session=_serialize_session(await _require_session(store, session_id)),
+                assistant_message=_serialize_message(assistant_message),
+                resolved_model="home_assistant",
+                route_reason=ha_action_result["route_reason"],
+            )
+
+        decision, backend_payload = await _prepare_admin_backend_payload(settings, session, payload)
         await store.add_message(session_id, "user", payload.message)
         await store.update_route(session_id, decision.resolved_model, decision.reason, payload.mode or session.mode)
         request.state.backend_called = True
         response_payload = await client.create_chat_completion(backend_payload, base_url=decision.target_base_url)
         assistant_text = _extract_assistant_text(response_payload)
+        response_metrics = _extract_response_metrics(response_payload)
         assistant_message = await store.add_message(
             session_id,
             "assistant",
             assistant_text,
             model_used=decision.resolved_model,
+            prompt_tokens=response_metrics["prompt_tokens"],
+            completion_tokens=response_metrics["completion_tokens"],
+            total_tokens=response_metrics["total_tokens"],
+            tokens_per_second=response_metrics["tokens_per_second"],
         )
         return AdminChatResponse(
             session=_serialize_session(await _require_session(store, session_id)),
@@ -106,6 +199,22 @@ async def admin_chat(payload: AdminChatRequest, session_id: str, request: Reques
             message=exc.message,
             error_type="context_length_error",
             code=exc.code,
+        )
+    except HomeAssistantConfigError as exc:
+        return error_response(
+            request_id=request.state.request_id,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=str(exc),
+            error_type="invalid_request_error",
+            code=_home_assistant_error_code(exc),
+        )
+    except HomeAssistantRequestError as exc:
+        return error_response(
+            request_id=request.state.request_id,
+            status_code=exc.status_code,
+            message=exc.message,
+            error_type="upstream_error",
+            code="home_assistant_request_failed",
         )
     except LlamaCppTimeoutError:
         return error_response(
@@ -137,7 +246,86 @@ async def admin_chat_stream(payload: AdminChatRequest, session_id: str, request:
     client = LlamaCppClient(settings)
 
     try:
-        decision, backend_payload = _prepare_admin_backend_payload(settings, session, payload)
+        note_instruction = parse_home_assistant_note_instruction(payload.message)
+        if note_instruction:
+            entity_id, note = note_instruction
+            note_store = get_home_assistant_note_store(settings)
+            if note_store is None:
+                return error_response(
+                    request_id=request.state.request_id,
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    message="DATABASE_URL ist nicht gesetzt. Home-Assistant-Notizen brauchen PostgreSQL.",
+                    error_type="invalid_request_error",
+                    code="home_assistant_note_store_unavailable",
+                )
+            await store.add_message(session_id, "user", payload.message)
+            await note_store.upsert_note(entity_id, note)
+            confirmation = {
+                "id": f"chatcmpl-ha-note-{session_id}",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "system",
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                "request_id": request.state.request_id,
+            }
+            content = {
+                **confirmation,
+                "choices": [{"index": 0, "delta": {"content": f"Gemerkt: {entity_id} -> {note}"}, "finish_reason": "stop"}],
+            }
+
+            async def note_stream():
+                yield f"data: {json.dumps(confirmation, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield f"data: {json.dumps(content, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+                await store.add_message(
+                    session_id,
+                    "assistant",
+                    f"Gemerkt: {entity_id} -> {note}",
+                    model_used="system",
+                )
+
+            return StreamingResponse(
+                note_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+
+        ha_action_result = await _try_handle_home_assistant_action(settings, payload.message, session=session)
+        if ha_action_result is not None:
+            await store.add_message(session_id, "user", payload.message)
+            await store.update_route(session_id, "home_assistant", ha_action_result["route_reason"], payload.mode or session.mode)
+            request.state.backend_called = True
+
+            async def action_stream():
+                confirmation = {
+                    "id": f"chatcmpl-ha-action-{session_id}",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "home_assistant",
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    "request_id": request.state.request_id,
+                }
+                content = {
+                    **confirmation,
+                    "choices": [{"index": 0, "delta": {"content": ha_action_result["assistant_text"]}, "finish_reason": "stop"}],
+                }
+                yield f"data: {json.dumps(confirmation, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield f"data: {json.dumps(content, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+                await store.add_message(
+                    session_id,
+                    "assistant",
+                    ha_action_result["assistant_text"],
+                    model_used="home_assistant",
+                )
+
+            return StreamingResponse(
+                action_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+
+        decision, backend_payload = await _prepare_admin_backend_payload(settings, session, payload)
         backend_payload["stream"] = True
     except ContextGuardError as exc:
         return error_response(
@@ -147,6 +335,22 @@ async def admin_chat_stream(payload: AdminChatRequest, session_id: str, request:
             error_type="context_length_error",
             code=exc.code,
         )
+    except HomeAssistantConfigError as exc:
+        return error_response(
+            request_id=request.state.request_id,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=str(exc),
+            error_type="invalid_request_error",
+            code=_home_assistant_error_code(exc),
+        )
+    except HomeAssistantRequestError as exc:
+        return error_response(
+            request_id=request.state.request_id,
+            status_code=exc.status_code,
+            message=exc.message,
+            error_type="upstream_error",
+            code="home_assistant_request_failed",
+        )
 
     await store.add_message(session_id, "user", payload.message)
     await store.update_route(session_id, decision.resolved_model, decision.reason, payload.mode or session.mode)
@@ -154,6 +358,12 @@ async def admin_chat_stream(payload: AdminChatRequest, session_id: str, request:
 
     async def event_stream():
         chunks: list[str] = []
+        response_metrics: dict[str, int | float | None] = {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+            "tokens_per_second": None,
+        }
         try:
             async for chunk in client.stream_chat_completion(
                 backend_payload=backend_payload,
@@ -165,6 +375,10 @@ async def admin_chat_stream(payload: AdminChatRequest, session_id: str, request:
                 text_part = _extract_content_from_sse(chunk)
                 if text_part:
                     chunks.append(text_part)
+                stream_metrics = _extract_metrics_from_sse(chunk)
+                for key, value in stream_metrics.items():
+                    if value is not None:
+                        response_metrics[key] = value
                 yield chunk
         except (LlamaCppError, LlamaCppTimeoutError) as exc:
             payload = {
@@ -185,6 +399,10 @@ async def admin_chat_stream(payload: AdminChatRequest, session_id: str, request:
                     "assistant",
                     final_text,
                     model_used=decision.resolved_model,
+                    prompt_tokens=response_metrics["prompt_tokens"],
+                    completion_tokens=response_metrics["completion_tokens"],
+                    total_tokens=response_metrics["total_tokens"],
+                    tokens_per_second=response_metrics["tokens_per_second"],
                 )
 
     return StreamingResponse(
@@ -194,7 +412,7 @@ async def admin_chat_stream(payload: AdminChatRequest, session_id: str, request:
     )
 
 
-def _prepare_admin_backend_payload(settings, session: ChatSession, payload: AdminChatRequest):
+async def _prepare_admin_backend_payload(settings, session: ChatSession, payload: AdminChatRequest):
     model_router = ModelRouter(settings)
     decision = model_router.decide(payload.mode or session.mode, payload.message, len(session.messages))
     history_messages = [
@@ -202,16 +420,26 @@ def _prepare_admin_backend_payload(settings, session: ChatSession, payload: Admi
         for item in session.messages[-12:]
     ]
     prompt_messages: list[ChatMessage] = []
-    prompt_messages.append(
-        ChatMessage(
-            role="system",
-            content="You are the built-in admin assistant for this llm-gateway platform. Be precise and implementation-oriented.",
-        )
-    )
+
+    context_blocks = [
+        "Du bist der eingebaute Admin-Assistent dieser llm-gateway Plattform. Antworte praezise, technisch und umsetzungsorientiert.",
+    ]
+    if payload.document_ids:
+        context_blocks.extend(await _load_document_context_blocks(settings, payload.document_ids))
+    if payload.include_home_assistant or _message_wants_home_assistant_context(payload.message):
+        context_blocks.extend(await _load_home_assistant_context_blocks(settings, payload.message))
     if session.summary:
-        prompt_messages.append(ChatMessage(role="system", content=session.summary))
+        context_blocks.append(f"Bisherige Session-Zusammenfassung:\n{session.summary}")
     prompt_messages.extend(ChatMessage(role=item["role"], content=item["content"]) for item in history_messages)
-    prompt_messages.append(ChatMessage(role="user", content=payload.message))
+    user_message = payload.message.strip()
+    if context_blocks:
+        user_message = (
+            "Arbeitskontext fuer diese Antwort:\n\n"
+            + "\n\n".join(context_blocks)
+            + "\n\nAktuelle Anfrage:\n"
+            + user_message
+        )
+    prompt_messages.append(ChatMessage(role="user", content=user_message))
 
     guard_result = fit_messages_to_budget(
         messages=prompt_messages,
@@ -230,6 +458,858 @@ def _prepare_admin_backend_payload(settings, session: ChatSession, payload: Admi
     return decision, backend_payload
 
 
+async def _load_document_context_blocks(settings, document_ids: list[str]) -> list[str]:
+    contexts = await get_document_contexts(settings, document_ids)
+    blocks: list[str] = []
+    for item in contexts:
+        content = (item.get("extracted_text") or item.get("text_excerpt") or "").strip()
+        if not content:
+            continue
+        if len(content) > 5000:
+            content = content[:5000] + "..."
+        title = item.get("title") or item.get("file_name") or "Dokument"
+        blocks.append(f"Dokument-Kontext: {title}\n{content}")
+    return blocks
+
+
+def _message_wants_home_assistant_context(message: str) -> bool:
+    lowered = (message or "").lower()
+    if "home assistant" in lowered or "entity" in lowered:
+        return True
+    ha_keywords = ("licht", "lampe", "schalter", "klima", "thermostat", "temperatur")
+    if any(keyword in lowered for keyword in ha_keywords):
+        return True
+    return bool(re.search(r"\b(?:light|switch|climate|script)\.[a-z0-9_]+\b", lowered))
+
+
+def _classify_home_assistant_intent(message: str) -> str:
+    text = (message or "").strip()
+    if not text:
+        return "none"
+    if parse_home_assistant_note_instruction(text):
+        return "note"
+    if _parse_home_assistant_action(text) is not None:
+        return "action"
+    lowered = text.lower()
+    question_markers = ("warum", "wieso", "weshalb", "welche", "welcher", "welches", "wie", "status", "ist", "sind")
+    if any(marker in lowered for marker in question_markers):
+        return "query"
+    return "none"
+
+
+async def _load_home_assistant_context_blocks(settings, message: str) -> list[str]:
+    client = HomeAssistantClient(settings)
+    entities = await client.list_entities(limit=120)
+    if not entities:
+        return ["Home Assistant ist erreichbar, liefert aber aktuell keine sichtbaren Entities."]
+
+    explicit_ids = set(re.findall(r"\b(?:light|switch|climate|script)\.[a-z0-9_]+\b", (message or "").lower()))
+    note_store = get_home_assistant_note_store(settings)
+    notes = await note_store.list_notes(limit=200) if note_store is not None else []
+    notes_by_id = {item.entity_id: item.note for item in notes}
+    alias_store = get_home_assistant_alias_store(settings)
+    aliases = await alias_store.list_aliases(limit=50) if alias_store is not None else []
+
+    selected: list[dict] = []
+    if explicit_ids:
+        selected = [item for item in entities if str(item.get("entity_id") or "").lower() in explicit_ids]
+    else:
+        keywords = set(_home_assistant_search_tokens((message or "").lower()))
+        for item in entities:
+            entity_id = str(item.get("entity_id") or "").lower()
+            friendly_name = str(item.get("friendly_name") or "").lower()
+            note = str(notes_by_id.get(entity_id) or "").lower()
+            haystack = f"{entity_id} {friendly_name} {note}"
+            if keywords and any(keyword in haystack for keyword in keywords):
+                selected.append(item)
+        if not selected:
+            noted_ids = set(notes_by_id)
+            selected = [item for item in entities if str(item.get("entity_id") or "").lower() in noted_ids][:20]
+        if not selected:
+            selected = entities[:20]
+
+    entity_lines: list[str] = []
+    for item in selected[:30]:
+        entity_id = str(item.get("entity_id") or "")
+        state = str(item.get("state") or "-")
+        friendly_name = str(item.get("friendly_name") or "-")
+        note = notes_by_id.get(entity_id.lower())
+        line = f"- {entity_id} | state={state} | name={friendly_name}"
+        if note:
+            line += f" | note={note}"
+        entity_lines.append(line)
+
+    blocks = [
+        "Home-Assistant-Entity-Kontext:\n" + "\n".join(entity_lines),
+    ]
+    if notes:
+        note_lines = [f"- {item.entity_id}: {item.note}" for item in notes[:20]]
+        blocks.append("Gemerkte Home-Assistant-Bedeutungen:\n" + "\n".join(note_lines))
+    if aliases:
+        alias_lines = [f"- {item.alias} -> {', '.join(item.entity_ids)}" for item in aliases[:20]]
+        blocks.append("Gelernte Home-Assistant-Aliase:\n" + "\n".join(alias_lines))
+    blocks.append(
+        "Wenn der Nutzer eine Entity-Bedeutung dauerhaft speichern will, soll er schreiben: "
+        "'Merke HA <entity_id>: <Beschreibung>'."
+    )
+    return blocks
+
+
+async def _try_handle_home_assistant_action(settings, message: str, session: ChatSession | None = None) -> dict[str, str] | None:
+    follow_up = _parse_home_assistant_follow_up_action(message)
+    if follow_up is not None and session is not None:
+        last_context = _extract_last_home_assistant_action_context(session)
+        if last_context is not None:
+            client = HomeAssistantClient(settings)
+            domain = str(last_context["domain"])
+            entity_ids = _dedupe_entity_ids(list(last_context["entity_ids"]))
+            if entity_ids:
+                service = str(follow_up["service"])
+                payload = {"entity_id": entity_ids}
+                await client.call_service(domain=domain, service=service, entity_id=None, service_data=payload)
+                return {
+                    "assistant_text": (
+                        f"Home Assistant Follow-up ausgefuehrt: {domain}.{service} fuer {len(entity_ids)} Entities -> "
+                        + ", ".join(entity_ids)
+                        + "."
+                    ),
+                    "route_reason": "home_assistant_follow_up_action",
+                }
+
+    intent = _classify_home_assistant_intent(message)
+    if intent != "action":
+        return None
+
+    parsed = _parse_home_assistant_action(message)
+    if parsed is None:
+        return None
+
+    client = HomeAssistantClient(settings)
+    service = str(parsed["service"])
+    service_data = dict(parsed["service_data"])
+    parsed_domain = str(parsed["domain"])
+    normalized_target = normalize_home_assistant_alias(str(parsed["target"]))
+    alias_store = get_home_assistant_alias_store(settings)
+
+    if alias_store is not None and normalized_target:
+        learned_alias = await alias_store.find_alias(normalized_target, parsed_domain)
+        if learned_alias is not None and learned_alias.entity_ids and (
+            not bool(parsed.get("all_matches")) or len(learned_alias.entity_ids) > 1
+        ):
+            payload = dict(service_data)
+            payload["entity_id"] = learned_alias.entity_ids
+            await client.call_service(domain=learned_alias.domain, service=service, entity_id=None, service_data=payload)
+            assistant_text = (
+                f"Home Assistant ausgefuehrt ueber gelernten Alias '{learned_alias.alias}': "
+                f"{learned_alias.domain}.{service} fuer {len(learned_alias.entity_ids)} Entities -> "
+                + ", ".join(learned_alias.entity_ids)
+                + "."
+            )
+            return {
+                "assistant_text": assistant_text,
+                "route_reason": "home_assistant_alias_action",
+            }
+
+    multi_targets = _expand_home_assistant_target_parts(str(parsed["target"]), parsed_domain)
+    if len(multi_targets) > 1:
+        resolved_items: list[dict[str, str]] = []
+        for target_part in multi_targets:
+            resolved = await _resolve_home_assistant_entity(settings, client, target_part)
+            if resolved is None:
+                raise HomeAssistantConfigError(
+                    f"Keine passende Home-Assistant-Entity fuer '{target_part}' gefunden. Nutze am besten die genaue Entity-ID oder speichere zuerst eine Notiz mit 'Merke HA <entity_id>: ...'."
+                )
+            resolved_items.append(resolved)
+
+        domains = {str(item["entity_id"]).split(".", 1)[0].strip().lower() for item in resolved_items}
+        if len(domains) != 1:
+            raise HomeAssistantConfigError(
+                f"Die Zielauswahl fuer '{parsed['target']}' mischt mehrere Entity-Typen: {', '.join(sorted(domains))}. "
+                "Bitte den Zieltyp klarer nennen, z. B. nur Licht oder nur Schalter."
+            )
+
+        resolved_domain = next(iter(domains))
+        domain = _resolve_effective_home_assistant_domain(
+            parsed_domain=parsed_domain,
+            resolved_domain=resolved_domain,
+            service=service,
+        )
+        entity_ids = _dedupe_entity_ids([str(item["entity_id"]) for item in resolved_items])
+        payload = dict(service_data)
+        payload["entity_id"] = entity_ids
+        await client.call_service(domain=domain, service=service, entity_id=None, service_data=payload)
+        await _maybe_learn_home_assistant_alias(
+            settings,
+            alias=normalized_target,
+            domain=domain,
+            entity_ids=entity_ids,
+            learned_from=message,
+        )
+
+        detail = f"{domain}.{service}"
+        if service_data:
+            detail += f" {json.dumps(service_data, ensure_ascii=False)}"
+        assistant_text = (
+            f"Home Assistant ausgefuehrt: {detail} fuer {len(entity_ids)} Entities -> "
+            + ", ".join(entity_ids)
+            + "."
+        )
+        return {
+            "assistant_text": assistant_text,
+            "route_reason": "home_assistant_action",
+        }
+
+    if bool(parsed.get("all_matches")):
+        resolved_entities = await _resolve_home_assistant_entities(
+            settings,
+            client,
+            parsed["target"],
+            preferred_domain=parsed_domain,
+        )
+        if not resolved_entities:
+            raise HomeAssistantConfigError(
+                f"Keine passenden Home-Assistant-Entities fuer '{parsed['target']}' gefunden. Nutze am besten die genaue Entity-ID oder speichere zuerst eine Notiz mit 'Merke HA <entity_id>: ...'."
+            )
+
+        domains = {str(item["entity_id"]).split(".", 1)[0].strip().lower() for item in resolved_entities}
+        if len(domains) != 1:
+            raise HomeAssistantConfigError(
+                f"Die Mehrfachauswahl fuer '{parsed['target']}' ist nicht eindeutig genug: {', '.join(sorted(domains))}. "
+                "Bitte den Zieltyp klarer nennen, z. B. Licht, Schalter oder die genaue Entity-ID."
+            )
+
+        resolved_domain = next(iter(domains))
+        domain = _resolve_effective_home_assistant_domain(
+            parsed_domain=parsed_domain,
+            resolved_domain=resolved_domain,
+            service=service,
+        )
+        entity_ids = [str(item["entity_id"]) for item in resolved_entities]
+        payload = dict(service_data)
+        payload["entity_id"] = entity_ids
+        await client.call_service(domain=domain, service=service, entity_id=None, service_data=payload)
+        await _maybe_learn_home_assistant_alias(
+            settings,
+            alias=normalized_target,
+            domain=domain,
+            entity_ids=entity_ids,
+            learned_from=message,
+            allow_group_alias=False,
+        )
+
+        detail = f"{domain}.{service}"
+        if service_data:
+            detail += f" {json.dumps(service_data, ensure_ascii=False)}"
+        assistant_text = (
+            f"Home Assistant ausgefuehrt: {detail} fuer {len(entity_ids)} Entities -> "
+            + ", ".join(entity_ids)
+            + "."
+        )
+    else:
+        resolved = await _resolve_home_assistant_entity(settings, client, parsed["target"])
+        if resolved is None:
+            raise HomeAssistantConfigError(
+                f"Keine passende Home-Assistant-Entity fuer '{parsed['target']}' gefunden. Nutze am besten die genaue Entity-ID oder speichere zuerst eine Notiz mit 'Merke HA <entity_id>: ...'."
+            )
+
+        resolved_domain = str(resolved["entity_id"]).split(".", 1)[0].strip().lower()
+        domain = _resolve_effective_home_assistant_domain(
+            parsed_domain=parsed_domain,
+            resolved_domain=resolved_domain,
+            service=service,
+        )
+        entity_id = resolved["entity_id"]
+        await client.call_service(domain=domain, service=service, entity_id=entity_id, service_data=service_data)
+        await _maybe_learn_home_assistant_alias(
+            settings,
+            alias=normalized_target,
+            domain=domain,
+            entity_ids=[entity_id],
+            learned_from=message,
+        )
+
+        detail = f"{domain}.{service}"
+        if service_data:
+            detail += f" {json.dumps(service_data, ensure_ascii=False)}"
+        assistant_text = f"Home Assistant ausgefuehrt: {entity_id} -> {detail}."
+        if resolved.get("friendly_name"):
+            assistant_text += f" Name: {resolved['friendly_name']}."
+        if resolved.get("note"):
+            assistant_text += f" Merker: {resolved['note']}."
+    return {
+        "assistant_text": assistant_text,
+        "route_reason": "home_assistant_action",
+    }
+
+
+def _parse_home_assistant_action(message: str) -> dict[str, object] | None:
+    text = (message or "").strip()
+    if not text:
+        return None
+
+    all_matches = _message_requests_all_matches(text)
+
+    on_off = re.match(
+        r"^\s*(?:ha\s+)?(?:kannst\s+du\s+)?(?:bitte\s+)?(?:schalte|mach|mache)\s+(?P<target>.+?)\s+(?P<state>ein|an|aus)\s*[.!?]?\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if on_off:
+        state = on_off.group("state").lower()
+        target = _normalize_home_assistant_action_target(on_off.group("target"))
+        domain = _guess_home_assistant_domain_from_target(target)
+        service = "turn_on" if state in {"ein", "an"} else "turn_off"
+        return {
+            "domain": domain,
+            "service": service,
+            "target": target,
+            "service_data": {},
+            "all_matches": all_matches,
+        }
+
+    make_on_off = re.match(
+        r"^\s*(?:kannst\s+du\s+)?(?:bitte\s+)?(?P<target>.+?)\s+(?P<state>ein|an|aus)\s+(?:machen|schalten)\s*(?:bitte)?\s*[.!?]?\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if make_on_off:
+        state = make_on_off.group("state").lower()
+        target = _normalize_home_assistant_action_target(make_on_off.group("target"))
+        domain = _guess_home_assistant_domain_from_target(target)
+        service = "turn_on" if state in {"ein", "an"} else "turn_off"
+        return {
+            "domain": domain,
+            "service": service,
+            "target": target,
+            "service_data": {},
+            "all_matches": all_matches,
+        }
+
+    trailing_all = re.match(
+        r"^\s*(?:kannst\s+du\s+)?(?:bitte\s+)?(?P<target>.+?)\s+(?P<state>ein|an|aus)\s+(?:machen|schalten)\s+alle(?:\s+bitte)?\s*[.!?]?\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if trailing_all:
+        state = trailing_all.group("state").lower()
+        target = _normalize_home_assistant_action_target(trailing_all.group("target"))
+        domain = _guess_home_assistant_domain_from_target(target)
+        service = "turn_on" if state in {"ein", "an"} else "turn_off"
+        return {
+            "domain": domain,
+            "service": service,
+            "target": target,
+            "service_data": {},
+            "all_matches": True,
+        }
+
+    activate = re.match(
+        r"^\s*(?:ha\s+)?(?P<verb>aktiviere|deaktiviere|einschalten|ausschalten)\s+(?P<target>.+?)\s*[.!?]?\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if activate:
+        verb = activate.group("verb").lower()
+        target = _normalize_home_assistant_action_target(activate.group("target"))
+        domain = _guess_home_assistant_domain_from_target(target)
+        service = "turn_off" if verb in {"deaktiviere", "ausschalten"} else "turn_on"
+        return {
+            "domain": domain,
+            "service": service,
+            "target": target,
+            "service_data": {},
+            "all_matches": all_matches,
+        }
+
+    climate = re.match(
+        r"^\s*(?:ha\s+)?(?:setze|stelle)\s+(?P<target>.+?)\s+(?:auf\s+)?(?P<temp>\d+(?:[.,]\d+)?)\s*(?:grad|°c|°)?\s*[.!?]?\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if climate:
+        raw_temp = climate.group("temp").replace(",", ".")
+        return {
+            "domain": "climate",
+            "service": "set_temperature",
+            "target": _normalize_home_assistant_action_target(climate.group("target")),
+            "service_data": {"temperature": float(raw_temp)},
+            "all_matches": False,
+        }
+
+    script_match = re.match(
+        r"^\s*(?:ha\s+)?(?:starte|fuehre)\s+(?P<target>.+?)(?:\s+aus)?\s*[.!?]?\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if script_match:
+        return {
+            "domain": "script",
+            "service": "turn_on",
+            "target": _normalize_home_assistant_action_target(script_match.group("target")),
+            "service_data": {},
+            "all_matches": False,
+        }
+    return None
+
+
+def _parse_home_assistant_follow_up_action(message: str) -> dict[str, str] | None:
+    text = (message or "").strip().lower()
+    if not text:
+        return None
+
+    patterns = [
+        re.compile(
+            r"^\s*(?:ok(?:ay)?\s+)?(?:und\s+)?(?:jetzt\s+)?(?:bitte\s+)?(?:wieder\s+)?(?P<state>an|ein|aus)(?:\s+bitte)?\s*[.!?]?\s*$"
+        ),
+        re.compile(
+            r"^\s*(?:ok(?:ay)?\s+)?(?:und\s+)?(?:jetzt\s+)?(?:bitte\s+)?(?:mach|mache|schalte)\s+(?:sie|es|die|den)\s+(?:wieder\s+)?(?P<state>an|ein|aus)(?:\s+bitte)?\s*[.!?]?\s*$"
+        ),
+    ]
+    for pattern in patterns:
+        match = pattern.match(text)
+        if not match:
+            continue
+        state = match.group("state").lower()
+        return {"service": "turn_on" if state in {"an", "ein"} else "turn_off"}
+    return None
+
+
+def _extract_last_home_assistant_action_context(session: ChatSession | None) -> dict[str, object] | None:
+    if session is None:
+        return None
+
+    # Follow-up phrases like "ok und jetzt wieder aus" should reuse the
+    # last successful HA action from the same chat session.
+    for message in reversed(session.messages):
+        if message.role != "assistant":
+            continue
+        if (message.model_used or "").strip().lower() != "home_assistant":
+            continue
+        parsed = _parse_home_assistant_action_context_from_text(message.content)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_home_assistant_action_context_from_text(text: str) -> dict[str, object] | None:
+    content = (text or "").strip()
+    if not content:
+        return None
+
+    multi_match = re.search(
+        r"Home Assistant (?:Follow-up )?ausgefuehrt(?: ueber gelernten Alias '[^']+')?: "
+        r"(?P<domain>light|switch|climate|script)\.(?P<service>[a-z_]+)"
+        r"(?:\s+\{.*?\})?\s+fuer\s+\d+\s+Entities\s+->",
+        content,
+        flags=re.IGNORECASE,
+    )
+    if multi_match:
+        tail = content.split("->", 1)[1] if "->" in content else ""
+        entity_ids = _dedupe_entity_ids(
+            re.findall(
+                r"(?:light|switch|climate|script)\.[a-z0-9_]+",
+                tail.lower(),
+            )
+        )
+        if entity_ids:
+            return {
+                "domain": multi_match.group("domain").lower(),
+                "service": multi_match.group("service").lower(),
+                "entity_ids": entity_ids,
+            }
+
+    single_match = re.search(
+        r"Home Assistant ausgefuehrt:\s+"
+        r"(?P<entity_id>(?:light|switch|climate|script)\.[a-z0-9_]+)\s+->\s+"
+        r"(?P<domain>light|switch|climate|script)\.(?P<service>[a-z_]+)"
+        r"(?:\s+\{.*?\})?\.",
+        content,
+        flags=re.IGNORECASE,
+    )
+    if single_match:
+        entity_id = single_match.group("entity_id").lower()
+        return {
+            "domain": single_match.group("domain").lower(),
+            "service": single_match.group("service").lower(),
+            "entity_ids": [entity_id],
+        }
+
+    return None
+
+
+def _message_requests_all_matches(text: str) -> bool:
+    lowered = f" {(text or '').lower()} "
+    return any(
+        needle in lowered
+        for needle in (" alle ", " dalle ", " alles ", " sämtliche ", " saemtliche ", " lichter ", " lcihter ", " lampen ")
+    )
+
+
+def _expand_home_assistant_target_parts(target: str, domain: str) -> list[str]:
+    normalized = (target or "").strip()
+    if not normalized:
+        return []
+
+    if "," in normalized:
+        raw_parts = [part.strip() for part in normalized.split(",") if part.strip()]
+    elif re.search(r"\s+und\s+", normalized, flags=re.IGNORECASE):
+        raw_parts = [part.strip() for part in re.split(r"\s+und\s+", normalized, flags=re.IGNORECASE) if part.strip()]
+    else:
+        return [normalized]
+
+    if len(raw_parts) <= 1:
+        return [normalized]
+
+    suffix = _infer_home_assistant_shared_suffix(normalized, domain)
+    expanded: list[str] = []
+    for index, part in enumerate(raw_parts):
+        lowered = part.lower()
+        if index < len(raw_parts) - 1 and suffix and suffix not in lowered:
+            expanded.append(f"{part} {suffix}".strip())
+        else:
+            expanded.append(part)
+    return expanded
+
+
+def _infer_home_assistant_shared_suffix(target: str, domain: str) -> str:
+    lowered = (target or "").lower()
+    candidates_by_domain = {
+        "light": ("licht", "lampe"),
+        "switch": ("schalter", "steckdose", "switch"),
+        "climate": ("thermostat", "klima", "heizung"),
+        "script": ("script", "szene"),
+    }
+    for candidate in candidates_by_domain.get(domain, ()):
+        if candidate in lowered:
+            return candidate
+    return ""
+
+
+def _normalize_home_assistant_action_target(raw_target: str) -> str:
+    target = (raw_target or "").strip()
+    target = re.sub(r"^\s*naja\s+", "", target, flags=re.IGNORECASE)
+    target = re.sub(r"^\s*du\s+sollst\s+", "", target, flags=re.IGNORECASE)
+    target = re.sub(r"^\s*sollst\s+du\s+", "", target, flags=re.IGNORECASE)
+    target = re.sub(r"^(?:(?:kannst|kanns|kanns)\s+du\s+)", "", target, flags=re.IGNORECASE)
+    target = re.sub(r"^(?:(?:koenntest|könntest|koennten|könnten)\s+du\s+)", "", target, flags=re.IGNORECASE)
+    target = re.sub(r"^(?:bitte\s+)?", "", target, flags=re.IGNORECASE)
+    target = re.sub(r"^(?:alle\s+|alles\s+)", "", target, flags=re.IGNORECASE)
+    target = re.sub(r"^(?:das|den|die|dem|der)\s+", "", target, flags=re.IGNORECASE)
+    target = re.sub(r"\bim\s+", "", target, flags=re.IGNORECASE)
+    target = re.sub(r"\bin\s+dem\s+", "", target, flags=re.IGNORECASE)
+    target = re.sub(r"\bgaming\s+zimmer\b", "gamingzimmer", target, flags=re.IGNORECASE)
+    target = re.sub(r"\blcihter\b", "licht", target, flags=re.IGNORECASE)
+    target = re.sub(r"\blichter\b", "licht", target, flags=re.IGNORECASE)
+    target = re.sub(r"\blampen\b", "lampe", target, flags=re.IGNORECASE)
+    target = re.sub(r"\blch\b", "licht", target, flags=re.IGNORECASE)
+    target = re.sub(r"\bimmer\s+noch\b", "", target, flags=re.IGNORECASE)
+    target = re.sub(r"\bdoch\b", "", target, flags=re.IGNORECASE)
+    target = re.sub(r"\s+(?:alle|alles)$", "", target, flags=re.IGNORECASE)
+    target = re.sub(r"\s+", " ", target).strip()
+    return target
+
+
+def _guess_home_assistant_domain_from_target(target: str) -> str:
+    lowered = (target or "").lower()
+    if lowered.startswith("switch.") or "schalter" in lowered or "steckdose" in lowered:
+        return "switch"
+    if lowered.startswith("script."):
+        return "script"
+    if lowered.startswith("climate.") or "thermostat" in lowered or "heizung" in lowered or "klima" in lowered:
+        return "climate"
+    return "light"
+
+
+def _resolve_effective_home_assistant_domain(*, parsed_domain: str, resolved_domain: str, service: str) -> str:
+    normalized_service = (service or "").strip().lower()
+    if normalized_service == "set_temperature":
+        if resolved_domain != "climate":
+            raise HomeAssistantConfigError(
+                f"Die erkannte Entity ist vom Typ '{resolved_domain}', aber fuer set_temperature wird eine climate-Entity gebraucht."
+            )
+        return "climate"
+    if normalized_service == "turn_on" and parsed_domain == "script":
+        if resolved_domain != "script":
+            raise HomeAssistantConfigError(
+                f"Die erkannte Entity ist vom Typ '{resolved_domain}', aber der Befehl wurde als Script-Aufruf erkannt."
+            )
+        return "script"
+    if normalized_service in {"turn_on", "turn_off"} and resolved_domain in {"light", "switch", "script"}:
+        return resolved_domain
+    return parsed_domain
+
+
+async def _resolve_home_assistant_entity(settings, client: HomeAssistantClient, target_text: str) -> dict[str, str] | None:
+    target = (target_text or "").strip()
+    if not target:
+        return None
+
+    explicit_match = re.search(r"\b(?:light|switch|climate|script)\.[a-z0-9_]+\b", target.lower())
+    entities = await client.list_entities(limit=200)
+    note_store = get_home_assistant_note_store(settings)
+    notes = await note_store.list_notes(limit=200) if note_store is not None else []
+    notes_by_id = {item.entity_id: item.note for item in notes}
+
+    if explicit_match:
+        explicit_id = explicit_match.group(0)
+        for item in entities:
+            entity_id = str(item.get("entity_id") or "").lower()
+            if entity_id == explicit_id:
+                return {
+                    "entity_id": entity_id,
+                    "friendly_name": str(item.get("friendly_name") or ""),
+                    "note": str(notes_by_id.get(entity_id) or ""),
+                }
+
+    normalized_target = target.lower()
+    tokens = _home_assistant_search_tokens(normalized_target)
+    scored_matches: list[tuple[int, dict[str, str]]] = []
+
+    for item in entities:
+        entity_id = str(item.get("entity_id") or "").lower()
+        entity_domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
+        preferred_domain = _guess_home_assistant_domain_from_target(target)
+        if preferred_domain and entity_domain != preferred_domain:
+            continue
+        friendly_name = str(item.get("friendly_name") or "").strip()
+        note = str(notes_by_id.get(entity_id) or "")
+        friendly_lower = friendly_name.lower().strip()
+        note_lower = note.lower()
+        haystack = f"{entity_id} {friendly_lower} {note_lower}"
+        score = 0
+        if normalized_target == entity_id or normalized_target == friendly_lower:
+            score += 100
+        if normalized_target and normalized_target in haystack:
+            score += 40
+        for token in tokens:
+            if token in haystack:
+                score += 10
+        if tokens:
+            entity_words = {
+                token
+                for token in re.findall(r"[0-9A-Za-z_ÄÖÜäöüß]{2,}", f"{entity_id.replace('.', ' ').replace('_', ' ')} {friendly_lower}")
+                if token.lower() not in {"light", "switch", "climate", "script"}
+            }
+            extra_words = [word for word in entity_words if word.lower() not in tokens]
+            score -= len(extra_words)
+        if score > 0:
+            scored_matches.append(
+                (
+                    score,
+                    {
+                        "entity_id": entity_id,
+                        "friendly_name": friendly_name,
+                        "note": note,
+                    },
+                )
+            )
+
+    if not scored_matches:
+        return None
+
+    scored_matches.sort(key=lambda item: item[0], reverse=True)
+    best_score = scored_matches[0][0]
+    best_match = scored_matches[0][1]
+
+    ambiguous = [
+        item
+        for score, item in scored_matches[1:6]
+        if score == best_score
+    ]
+    if ambiguous:
+        candidates = [best_match, *ambiguous]
+        candidate_text = ", ".join(
+            f"{item['entity_id']}" + (f" ({item['friendly_name']})" if item.get("friendly_name") else "")
+            for item in candidates
+        )
+        raise HomeAssistantConfigError(
+            f"Mehrdeutige Home-Assistant-Entity fuer '{target}': {candidate_text}. "
+            "Bitte nutze die genaue Entity-ID oder speichere eine Notiz mit 'Merke HA <entity_id>: ...'."
+        )
+
+    return best_match
+
+
+async def _resolve_home_assistant_entities(
+    settings,
+    client: HomeAssistantClient,
+    target_text: str,
+    *,
+    preferred_domain: str | None = None,
+) -> list[dict[str, str]]:
+    target = (target_text or "").strip()
+    if not target:
+        return []
+
+    entities = await client.list_entities(limit=300)
+    note_store = get_home_assistant_note_store(settings)
+    notes = await note_store.list_notes(limit=300) if note_store is not None else []
+    notes_by_id = {item.entity_id: item.note for item in notes}
+    normalized_target = target.lower()
+    tokens = _home_assistant_search_tokens(normalized_target)
+    domain_generic_tokens = {
+        "light": {"licht", "lampe"},
+        "switch": {"schalter", "steckdose", "switch"},
+        "climate": {"klima", "thermostat", "heizung", "temperatur"},
+        "script": {"script", "szene"},
+    }
+    generic_tokens = domain_generic_tokens.get((preferred_domain or "").lower(), set())
+    meaning_tokens = [token for token in tokens if token not in generic_tokens]
+
+    scored: list[tuple[int, dict[str, str]]] = []
+    for item in entities:
+        entity_id = str(item.get("entity_id") or "").lower()
+        entity_domain = entity_id.split(".", 1)[0] if "." in entity_id else ""
+        if preferred_domain and entity_domain != preferred_domain:
+            continue
+
+        friendly_name = str(item.get("friendly_name") or "").strip()
+        note = str(notes_by_id.get(entity_id) or "")
+        haystack = f"{entity_id} {friendly_name.lower()} {note.lower()}"
+        score = 0
+        if normalized_target and normalized_target in haystack:
+            score += 60
+        matching_tokens = [token for token in tokens if token in haystack]
+        meaning_matches = [token for token in meaning_tokens if token in haystack]
+        score += len(matching_tokens) * 8
+        score += len(meaning_matches) * 12
+        if meaning_tokens and not meaning_matches:
+            continue
+        if not meaning_tokens and not matching_tokens:
+            continue
+        if score <= 0:
+            continue
+        scored.append(
+            (
+                score,
+                {
+                    "entity_id": entity_id,
+                    "friendly_name": friendly_name,
+                    "note": note,
+                },
+            )
+        )
+
+    deduped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    scored.sort(key=lambda item: item[0], reverse=True)
+    for _, item in scored:
+        entity_id = item["entity_id"]
+        if entity_id not in seen:
+            deduped.append(item)
+            seen.add(entity_id)
+    return deduped
+
+
+def _home_assistant_search_tokens(text: str) -> list[str]:
+    stopwords = {
+        "ha",
+        "home",
+        "assistant",
+        "ein",
+        "an",
+        "aus",
+        "auf",
+        "grad",
+        "bitte",
+        "alle",
+        "alles",
+        "mach",
+        "schalte",
+        "setze",
+        "stelle",
+        "aktiviere",
+        "deaktiviere",
+        "einschalten",
+        "ausschalten",
+        "starte",
+        "fuehre",
+        "das",
+        "den",
+        "die",
+        "der",
+        "dem",
+        "des",
+        "im",
+        "in",
+        "am",
+        "und",
+        "von",
+        "zu",
+        "mit",
+    }
+    tokens = re.findall(r"[0-9A-Za-z_ÄÖÜäöüß]{2,}", text or "")
+    result: list[str] = []
+    for token in tokens:
+        lowered = token.lower()
+        if lowered not in stopwords:
+            result.append(lowered)
+            if lowered.endswith("zimmer") and len(lowered) > 6:
+                stem = lowered[:-6]
+                if stem and stem not in stopwords:
+                    result.append(stem)
+    return result
+
+
+def _home_assistant_error_code(exc: Exception) -> str:
+    message = str(exc).lower()
+    if "mehrdeutig" in message:
+        return "home_assistant_entity_ambiguous"
+    if "keine passende" in message:
+        return "home_assistant_entity_not_found"
+    return "home_assistant_not_configured"
+
+
+def _dedupe_entity_ids(entity_ids: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in entity_ids:
+        normalized = (item or "").strip().lower()
+        if normalized and normalized not in seen:
+            result.append(normalized)
+            seen.add(normalized)
+    return result
+
+
+async def _maybe_learn_home_assistant_alias(
+    settings,
+    *,
+    alias: str,
+    domain: str,
+    entity_ids: list[str],
+    learned_from: str,
+    allow_group_alias: bool = True,
+) -> None:
+    alias_store = get_home_assistant_alias_store(settings)
+    if alias_store is None:
+        return
+
+    clean_alias = normalize_home_assistant_alias(alias)
+    clean_entity_ids = _dedupe_entity_ids(entity_ids)
+    if not clean_alias or not clean_entity_ids:
+        return
+    if re.search(r"\b(?:light|switch|climate|script)\.[a-z0-9_]+\b", clean_alias):
+        return
+    if len(clean_alias) < 4:
+        return
+    if len(clean_entity_ids) == 1 and _looks_like_home_assistant_group_alias(clean_alias):
+        return
+    if len(clean_entity_ids) > 1 and not allow_group_alias:
+        return
+
+    await alias_store.upsert_alias(
+        alias=clean_alias,
+        domain=domain,
+        entity_ids=clean_entity_ids,
+        learned_from=learned_from,
+    )
+
+
+def _looks_like_home_assistant_group_alias(alias: str) -> bool:
+    lowered = (alias or "").lower()
+    return any(marker in lowered for marker in ("zimmer", "lichter", "lampen", "gruppe", "alle "))
+
+
 async def _require_session(store, session_id: str) -> ChatSession:
     session = await store.get_session(session_id)
     if session is None:
@@ -245,11 +1325,29 @@ def _serialize_message(message):
         role=message.role,
         content=message.content,
         model_used=message.model_used,
+        prompt_tokens=message.prompt_tokens,
+        completion_tokens=message.completion_tokens,
+        total_tokens=message.total_tokens,
+        tokens_per_second=message.tokens_per_second,
         created_at=message.created_at,
     )
 
 
+def _serialize_memory_summary(summary) -> AdminMemorySummaryResponse:
+    return AdminMemorySummaryResponse(
+        id=summary.id,
+        session_id=summary.session_id,
+        session_title=summary.session_title,
+        summary_kind=summary.summary_kind,
+        content=summary.content,
+        source_message_count=summary.source_message_count,
+        resolved_model=summary.resolved_model,
+        created_at=summary.created_at,
+    )
+
+
 def _serialize_session(session: ChatSession) -> AdminSessionResponse:
+    settings = get_settings()
     return AdminSessionResponse(
         id=session.id,
         title=session.title,
@@ -257,6 +1355,8 @@ def _serialize_session(session: ChatSession) -> AdminSessionResponse:
         resolved_model=session.resolved_model,
         route_reason=session.route_reason,
         summary=session.summary,
+        token_estimate=_estimate_session_tokens(session, settings.context_chars_per_token),
+        message_count=len(session.messages),
         created_at=session.created_at,
         updated_at=session.updated_at,
         messages=[_serialize_message(item) for item in session.messages],
@@ -270,6 +1370,32 @@ def _extract_assistant_text(response_payload: dict) -> str:
     message = choices[0].get("message") or {}
     content = message.get("content")
     return content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+
+
+def _extract_response_metrics(response_payload: dict) -> dict[str, int | float | None]:
+    usage = response_payload.get("usage") or {}
+    timings = response_payload.get("timings") or {}
+    prompt_tokens = usage.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens")
+    total_tokens = usage.get("total_tokens")
+    tokens_per_second = timings.get("predicted_per_second")
+
+    return {
+        "prompt_tokens": int(prompt_tokens) if isinstance(prompt_tokens, int) else None,
+        "completion_tokens": int(completion_tokens) if isinstance(completion_tokens, int) else None,
+        "total_tokens": int(total_tokens) if isinstance(total_tokens, int) else None,
+        "tokens_per_second": round(float(tokens_per_second), 2) if isinstance(tokens_per_second, (int, float)) else None,
+    }
+
+
+def _estimate_session_tokens(session: ChatSession, chars_per_token: float) -> int:
+    total_chars = sum(len(item.content) for item in session.messages)
+    if session.summary:
+        total_chars += len(session.summary)
+    if total_chars <= 0:
+        return 0
+    divisor = chars_per_token if chars_per_token > 0 else 4.0
+    return max(1, int(total_chars / divisor))
 
 
 def _extract_content_from_sse(chunk: bytes) -> str:
@@ -288,6 +1414,31 @@ def _extract_content_from_sse(chunk: bytes) -> str:
     delta = choices[0].get("delta") or {}
     content = delta.get("content")
     return content if isinstance(content, str) else ""
+
+
+def _extract_metrics_from_sse(chunk: bytes) -> dict[str, int | float | None]:
+    empty = {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "tokens_per_second": None,
+    }
+    if not chunk.startswith(b"data: "):
+        return empty
+
+    payload = chunk[6:].strip()
+    if payload == b"[DONE]":
+        return empty
+
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return empty
+
+    if not isinstance(data, dict):
+        return empty
+
+    return _extract_response_metrics(data)
 
 
 def _admin_chat_html() -> str:
@@ -343,7 +1494,7 @@ def _admin_chat_html() -> str:
                 linear-gradient(180deg, #1a222b, #161d26);
             }
             .muted { color:var(--muted); }
-            button, select, textarea { font:inherit; }
+            button, select, textarea, input { font:inherit; }
             button {
               border:1px solid var(--line);
               border-radius:8px;
@@ -356,7 +1507,7 @@ def _admin_chat_html() -> str:
               letter-spacing:.05em;
             }
             button.secondary { background:#1a222b; color:var(--ink); }
-            select, textarea {
+            select, textarea, input[type="text"], input[type="file"] {
               width:100%;
               border:1px solid var(--line);
               border-radius:8px;
@@ -364,13 +1515,30 @@ def _admin_chat_html() -> str:
               background:#0a0f14;
               color:var(--ink);
             }
-            select:focus, textarea:focus {
+            input[type="file"] {
+              padding:8px 10px;
+            }
+            select[multiple] {
+              min-height:140px;
+            }
+            select:focus, textarea:focus, input[type="text"]:focus, input[type="file"]:focus {
               outline:none;
               border-color:#4b8d4b;
               box-shadow:0 0 0 2px rgba(139,226,139,.10);
             }
             textarea { min-height:110px; resize:vertical; }
             .actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
+            .session-summary {
+              margin-top:14px;
+              padding:12px;
+              border:1px solid var(--line);
+              border-radius:8px;
+              background:#0c1117;
+            }
+            .session-summary h2 {
+              margin:0 0 8px;
+              font-size:1.05rem;
+            }
             .session-list { display:flex; flex-direction:column; gap:10px; margin-top:16px; }
             .session-item {
               padding:12px;
@@ -394,8 +1562,104 @@ def _admin_chat_html() -> str:
             }
             .message.user { border-left:5px solid var(--accent); }
             .message.assistant { border-left:5px solid var(--warn); }
+            .message-header {
+              display:flex;
+              align-items:center;
+              justify-content:space-between;
+              gap:12px;
+              margin-bottom:10px;
+            }
+            .message-role {
+              color:var(--ink);
+              font-size:.82rem;
+              font-weight:700;
+              text-transform:uppercase;
+              letter-spacing:.08em;
+            }
+            .message-meta {
+              color:var(--muted);
+              font-size:.76rem;
+              text-align:right;
+            }
+            .message-body p {
+              margin:0 0 10px;
+              line-height:1.45;
+            }
+            .message-body p:last-child {
+              margin-bottom:0;
+            }
+            .message-body ul,
+            .message-body ol {
+              margin:0 0 10px 18px;
+              padding:0;
+              line-height:1.45;
+            }
+            .inline-code {
+              display:inline-block;
+              padding:1px 6px;
+              border-radius:6px;
+              border:1px solid var(--line);
+              background:#101820;
+              color:var(--accent-2);
+            }
+            .code-block {
+              margin:12px 0;
+              border:1px solid var(--line);
+              border-radius:8px;
+              overflow:hidden;
+              background:#090d12;
+            }
+            .code-shell {
+              box-shadow:inset 3px 0 0 var(--accent);
+            }
+            .code-generic {
+              box-shadow:inset 3px 0 0 var(--accent-2);
+            }
+            .code-header {
+              padding:8px 12px;
+              background:#141b23;
+              color:var(--muted);
+              font-size:.75rem;
+              font-weight:700;
+              text-transform:uppercase;
+              letter-spacing:.08em;
+            }
+            .code-shell .code-header {
+              background:#122018;
+              color:#9de69d;
+            }
+            .code-body {
+              margin:0;
+              padding:12px;
+              max-height:360px;
+              overflow:auto;
+              background:#0a0f14;
+              color:#d7e3ef;
+            }
             .row { display:grid; grid-template-columns:1fr 180px; gap:12px; }
-            .topbar { display:flex; justify-content:space-between; gap:16px; align-items:flex-start; }
+            .composer-side {
+              display:flex;
+              flex-direction:column;
+              gap:12px;
+            }
+            .upload-box {
+              border:1px solid var(--line);
+              border-radius:8px;
+              padding:12px;
+              background:#0c1117;
+            }
+            .upload-grid {
+              display:grid;
+              gap:10px;
+              margin-top:10px;
+            }
+            .hint {
+              margin-top:8px;
+              color:var(--muted);
+              font-size:.78rem;
+              line-height:1.4;
+            }
+            .topbar { display:flex; justify-content:flex-end; gap:16px; align-items:flex-start; }
             .status {
               margin-top:10px;
               padding:10px 12px;
@@ -403,19 +1667,58 @@ def _admin_chat_html() -> str:
               background:rgba(139,226,139,.10);
               border:1px solid #284131;
             }
+            .stats {
+              display:grid;
+              grid-template-columns:repeat(3, minmax(120px, 1fr));
+              gap:10px;
+              margin:0;
+              min-width:420px;
+              max-width:520px;
+            }
+            .stat {
+              border:1px solid var(--line);
+              border-radius:8px;
+              padding:10px;
+              background:#0c1117;
+            }
+            .stat-label {
+              color:var(--muted);
+              font-size:.76rem;
+              text-transform:uppercase;
+              letter-spacing:.05em;
+            }
+            .stat-value {
+              margin-top:6px;
+              color:var(--accent);
+              font-size:1.15rem;
+              font-weight:700;
+              line-height:1.2;
+            }
+            .stat-meta {
+              margin-top:4px;
+              color:var(--muted);
+              font-size:.78rem;
+            }
             h1, h2 {
               letter-spacing:.10em;
               text-transform:uppercase;
             }
             pre { white-space:pre-wrap; word-break:break-word; margin:0; }
-            @media (max-width: 980px) { main { grid-template-columns:1fr; } .row { grid-template-columns:1fr; } }
+            @media (max-width: 980px) {
+              main { grid-template-columns:1fr; }
+              .row { grid-template-columns:1fr; }
+              .stats { grid-template-columns:1fr; }
+            }
           </style>
         </head>
         <body>
           <main>
             <section class="panel">
               <h1>Admin Chat</h1>
-              <p class="muted">Direkter Chat gegen Fast oder Deep Model mit Session-Verlauf, Streaming und Auto-Routing.</p>
+              <div class="session-summary">
+                <h2 id="sessionTitle">Keine Session</h2>
+                <div class="muted" id="sessionMeta">Lege links eine Session an oder lade eine bestehende.</div>
+              </div>
               <div class="actions">
                 <button type="button" onclick="createSession()">Neue Session</button>
                 <button type="button" class="secondary" onclick="loadSessions()">Sessions laden</button>
@@ -424,12 +1727,25 @@ def _admin_chat_html() -> str:
             </section>
             <section class="panel">
               <div class="topbar">
-                <div>
-                  <h2 id="sessionTitle">Keine Session</h2>
-                  <div class="muted" id="sessionMeta">Lege links eine Session an oder lade eine bestehende.</div>
-                </div>
-                <div style="min-width:220px;">
-                  <label>
+                <div style="display:flex; flex-direction:column; gap:10px; align-items:flex-end;">
+                  <div class="stats">
+                    <div class="stat">
+                      <div class="stat-label">GPU Temp</div>
+                      <div id="gpuTempValue" class="stat-value">n/a</div>
+                      <div class="stat-meta">MI50 edge temp</div>
+                    </div>
+                    <div class="stat">
+                      <div class="stat-label">GPU Power</div>
+                      <div id="gpuPowerValue" class="stat-value">n/a</div>
+                      <div class="stat-meta">rocm-smi watt</div>
+                    </div>
+                    <div class="stat">
+                      <div class="stat-label">VRAM</div>
+                      <div id="gpuVramValue" class="stat-value">n/a</div>
+                      <div class="stat-meta">belegt / Prozent</div>
+                    </div>
+                  </div>
+                  <label style="min-width:220px; width:220px;">
                     <span>Modus</span>
                     <select id="mode">
                       <option value="auto">Auto-Routing</option>
@@ -445,12 +1761,32 @@ def _admin_chat_html() -> str:
                   <span>Nachricht</span>
                   <textarea id="prompt" placeholder="Schreibe hier direkt an die AI-Plattform..."></textarea>
                 </label>
-                <div>
+                <div class="composer-side">
+                  <div class="upload-box">
+                    <div class="stat-label">Datei direkt in den Chat laden</div>
+                    <div class="upload-grid">
+                      <input id="uploadTitle" type="text" placeholder="optional Titel fuer Text/PDF" />
+                      <input id="uploadFile" type="file" accept=".txt,.md,.markdown,.log,.csv,.json,.yaml,.yml,.pdf" />
+                      <button id="uploadButton" type="button" class="secondary" onclick="uploadDocument()">Upload</button>
+                    </div>
+                    <div id="uploadHint" class="hint">Der Upload nutzt das aktive Storage-Profil.</div>
+                  </div>
+                  <label>
+                    <span>Dokumente als Kontext</span>
+                    <select id="documentIds" multiple></select>
+                  </label>
                   <label>
                     <span>Streaming</span>
                     <select id="streaming">
                       <option value="false">Nein</option>
                       <option value="true">Ja</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Home Assistant lesen</span>
+                    <select id="includeHomeAssistant">
+                      <option value="false">Nur wenn im Text erkannt</option>
+                      <option value="true">Immer einbeziehen</option>
                     </select>
                   </label>
                   <div class="actions">
@@ -472,6 +1808,15 @@ def _admin_chat_html() -> str:
             const modeInput = document.getElementById("mode");
             const statusNode = document.getElementById("status");
             const streamingInput = document.getElementById("streaming");
+            const includeHomeAssistantInput = document.getElementById("includeHomeAssistant");
+            const documentIdsInput = document.getElementById("documentIds");
+            const uploadTitleInput = document.getElementById("uploadTitle");
+            const uploadFileInput = document.getElementById("uploadFile");
+            const uploadButton = document.getElementById("uploadButton");
+            const uploadHint = document.getElementById("uploadHint");
+            const gpuTempValue = document.getElementById("gpuTempValue");
+            const gpuPowerValue = document.getElementById("gpuPowerValue");
+            const gpuVramValue = document.getElementById("gpuVramValue");
             let currentSessionId = null;
 
             function setStatus(text, error = false) {
@@ -484,12 +1829,106 @@ def _admin_chat_html() -> str:
               return { "Content-Type": "application/json" };
             }
 
+            function errorMessageFrom(data, fallback) {
+              if (data && typeof data === "object") {
+                if (data.detail) return data.detail;
+                if (data.error && typeof data.error === "object" && data.error.message) {
+                  return data.error.message;
+                }
+              }
+              return fallback;
+            }
+
+            function selectedDocumentIds() {
+              return Array.from(documentIdsInput.selectedOptions || []).map((item) => item.value).filter(Boolean);
+            }
+
+            function escapeHtml(value) {
+              return String(value || "")
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#39;");
+            }
+
+            function renderTextSegment(segment) {
+              const escaped = escapeHtml(segment || "").trim();
+              if (!escaped) return "";
+              return escaped
+                .split(/\\n{2,}/)
+                .map((part) => renderTextBlock(part))
+                .join("");
+            }
+
+            function renderInlineMarkup(text) {
+              return String(text || "")
+                .replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>')
+                .replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+            }
+
+            function renderTextBlock(part) {
+              const lines = String(part || "").split("\\n").filter((line) => line.trim());
+              if (!lines.length) return "";
+
+              const bulletLines = lines.every((line) => /^[-*]\\s+/.test(line.trim()));
+              if (bulletLines) {
+                return `<ul>${lines.map((line) => `<li>${renderInlineMarkup(line.trim().replace(/^[-*]\\s+/, ""))}</li>`).join("")}</ul>`;
+              }
+
+              const numberedLines = lines.every((line) => /^\\d+\\.\\s+/.test(line.trim()));
+              if (numberedLines) {
+                return `<ol>${lines.map((line) => `<li>${renderInlineMarkup(line.trim().replace(/^\\d+\\.\\s+/, ""))}</li>`).join("")}</ol>`;
+              }
+
+              return `<p>${renderInlineMarkup(lines.join("<br>"))}</p>`;
+            }
+
+            function renderCodeBlock(language, code) {
+              const lang = (language || "text").trim().toLowerCase();
+              const label = lang || "code";
+              const shellLike = ["bash", "sh", "zsh", "shell", "console", "cmd", "powershell"].includes(lang);
+              const themeClass = shellLike ? "code-shell" : "code-generic";
+              return `<div class="code-block ${themeClass}"><div class="code-header">${escapeHtml(label)}</div><pre class="code-body"><code>${escapeHtml(code || "")}</code></pre></div>`;
+            }
+
+            function renderMessageContent(text) {
+              const source = String(text || "");
+              const pattern = /```([a-zA-Z0-9_+-]*)\\n([\\s\\S]*?)```/g;
+              let result = "";
+              let lastIndex = 0;
+              let match;
+
+              while ((match = pattern.exec(source)) !== null) {
+                result += renderTextSegment(source.slice(lastIndex, match.index));
+                result += renderCodeBlock(match[1], match[2]);
+                lastIndex = pattern.lastIndex;
+              }
+
+              result += renderTextSegment(source.slice(lastIndex));
+              return result || "<p></p>";
+            }
+
             function renderMessages(items) {
               messagesNode.innerHTML = "";
               for (const item of items) {
                 const node = document.createElement("div");
                 node.className = `message ${item.role}`;
-                node.innerHTML = `<strong>${item.role}</strong><pre>${item.content}</pre>`;
+                const metaParts = [];
+                if (item.model_used) metaParts.push(`Modell: ${item.model_used}`);
+                if (typeof item.completion_tokens === "number") metaParts.push(`Out: ${item.completion_tokens} tok`);
+                if (typeof item.total_tokens === "number") metaParts.push(`Gesamt: ${item.total_tokens} tok`);
+                if (typeof item.tokens_per_second === "number") metaParts.push(`${item.tokens_per_second.toFixed(2)} t/s`);
+                const metaHtml = metaParts.length
+                  ? `<div class="message-meta">${metaParts.join(" | ")}</div>`
+                  : "";
+                node.innerHTML = `
+                  <div class="message-header">
+                    <div class="message-role">${escapeHtml(item.role)}</div>
+                    ${metaHtml}
+                  </div>
+                  <div class="message-body">${renderMessageContent(item.content)}</div>
+                `;
                 messagesNode.appendChild(node);
               }
               messagesNode.scrollTop = messagesNode.scrollHeight;
@@ -499,8 +1938,104 @@ def _admin_chat_html() -> str:
               currentSessionId = session.id;
               sessionTitle.textContent = session.title;
               modeInput.value = session.mode || "auto";
-              sessionMeta.textContent = `Modus: ${session.mode} | Modell: ${session.resolved_model || "-"} | Regel: ${session.route_reason || "-"}`;
+              sessionMeta.textContent = `Modus: ${session.mode} | Modell: ${session.resolved_model || "-"} | Regel: ${session.route_reason || "-"} | Nachrichten: ${session.message_count || 0} | ca. Tokens: ${session.token_estimate || 0}`;
               renderMessages(session.messages || []);
+            }
+
+            function updateTelemetryView(data) {
+              gpuTempValue.textContent = typeof data.temperature_c === "number"
+                ? `${data.temperature_c.toFixed(1)} C`
+                : "n/a";
+              gpuPowerValue.textContent = typeof data.power_w === "number"
+                ? `${data.power_w.toFixed(1)} W`
+                : "n/a";
+
+              if (typeof data.vram_used_gib === "number" && typeof data.vram_total_gib === "number") {
+                const percent = typeof data.vram_percent === "number" ? ` (${data.vram_percent.toFixed(1)}%)` : "";
+                gpuVramValue.textContent = `${data.vram_used_gib.toFixed(1)} / ${data.vram_total_gib.toFixed(1)} GiB${percent}`;
+                return;
+              }
+              if (typeof data.vram_percent === "number") {
+                gpuVramValue.textContent = `${data.vram_percent.toFixed(1)}%`;
+                return;
+              }
+              gpuVramValue.textContent = "n/a";
+            }
+
+            async function loadTelemetry() {
+              try {
+                const res = await fetch("/api/admin/ops/kai/run/telemetry", { headers: headers() });
+                if (!res.ok) throw new Error(`Telemetry fehlgeschlagen: ${res.status}`);
+                const data = await res.json();
+                updateTelemetryView(data);
+              } catch (_error) {
+                gpuTempValue.textContent = "n/a";
+                gpuPowerValue.textContent = "n/a";
+                gpuVramValue.textContent = "n/a";
+              }
+            }
+
+            async function loadAvailableDocuments(selectedDocumentId = null) {
+              try {
+                const res = await fetch("/api/admin/storage/overview", { headers: headers() });
+                if (!res.ok) throw new Error(`Dokumente fehlgeschlagen: ${res.status}`);
+                const data = await res.json();
+                const documents = data.documents || [];
+                const activeProfile = data.active_profile || null;
+                documentIdsInput.innerHTML = "";
+                for (const item of documents) {
+                  const option = document.createElement("option");
+                  option.value = item.id;
+                  option.textContent = `${item.title || item.file_name} | ${item.storage_location_name || "-"}`;
+                  if (selectedDocumentId && item.id === selectedDocumentId) {
+                    option.selected = true;
+                  }
+                  documentIdsInput.appendChild(option);
+                }
+                if (activeProfile) {
+                  uploadHint.textContent = `Ablage: ${activeProfile.name} (${activeProfile.backend_type})`;
+                  uploadButton.disabled = false;
+                } else {
+                  uploadHint.textContent = "Kein aktives Storage-Profil. Bitte zuerst im Storage-Tab eines anlegen.";
+                  uploadButton.disabled = true;
+                }
+              } catch (_error) {
+                documentIdsInput.innerHTML = "";
+                uploadHint.textContent = "Storage-Status konnte nicht geladen werden.";
+                uploadButton.disabled = true;
+              }
+            }
+
+            async function uploadDocument() {
+              const file = uploadFileInput.files && uploadFileInput.files[0];
+              if (!file) {
+                setStatus("Bitte zuerst eine Datei auswaehlen.", true);
+                return;
+              }
+
+              try {
+                setStatus("Upload laeuft...");
+                const formData = new FormData();
+                formData.append("DOCUMENT_FILE", file);
+                if (uploadTitleInput.value.trim()) {
+                  formData.append("DOCUMENT_TITLE", uploadTitleInput.value.trim());
+                }
+                const res = await fetch("/api/admin/storage/upload", {
+                  method: "POST",
+                  body: formData,
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                  throw new Error(errorMessageFrom(data, `Upload fehlgeschlagen: ${res.status}`));
+                }
+                const document = data.document || {};
+                await loadAvailableDocuments(document.id || null);
+                uploadTitleInput.value = "";
+                uploadFileInput.value = "";
+                setStatus(`Dokument '${document.title || document.file_name || "Upload"}' hochgeladen und als Kontext verfuegbar.`);
+              } catch (error) {
+                setStatus(error.message, true);
+              }
             }
 
             async function loadSessions() {
@@ -513,13 +2048,14 @@ def _admin_chat_html() -> str:
                   const button = document.createElement("button");
                   button.type = "button";
                   button.className = `session-item ${session.id === currentSessionId ? "active" : ""}`;
-                  button.innerHTML = `<strong>${session.title}</strong><div class="muted">${session.mode} | ${session.resolved_model || "noch kein Modell"}</div>`;
+                  button.innerHTML = `<strong>${session.title}</strong><div class="muted">${session.mode} | ${session.resolved_model || "noch kein Modell"}</div><div class="muted">ca. ${session.token_estimate || 0} Tokens | ${session.message_count || 0} Msg</div>`;
                   button.onclick = () => openSession(session.id);
                   sessionList.appendChild(button);
                 }
                 if (!currentSessionId && sessions.length) {
                   renderSession(sessions[0]);
                 }
+                await loadTelemetry();
                 setStatus("Sessions geladen.");
               } catch (error) {
                 setStatus(error.message, true);
@@ -537,6 +2073,7 @@ def _admin_chat_html() -> str:
                 const session = await res.json();
                 renderSession(session);
                 await loadSessions();
+                await loadTelemetry();
                 setStatus("Neue Session angelegt.");
               } catch (error) {
                 setStatus(error.message, true);
@@ -550,6 +2087,7 @@ def _admin_chat_html() -> str:
                 const session = await res.json();
                 renderSession(session);
                 await loadSessions();
+                await loadTelemetry();
               } catch (error) {
                 setStatus(error.message, true);
               }
@@ -566,6 +2104,7 @@ def _admin_chat_html() -> str:
                 const session = await res.json();
                 renderSession(session);
                 await loadSessions();
+                await loadTelemetry();
                 setStatus("Session zurueckgesetzt.");
               } catch (error) {
                 setStatus(error.message, true);
@@ -585,6 +2124,7 @@ def _admin_chat_html() -> str:
                 sessionMeta.textContent = "Lege links eine Session an oder lade eine bestehende.";
                 renderMessages([]);
                 await loadSessions();
+                await loadTelemetry();
                 setStatus("Session geloescht.");
               } catch (error) {
                 setStatus(error.message, true);
@@ -611,13 +2151,22 @@ def _admin_chat_html() -> str:
                 const res = await fetch(`/api/admin/sessions/${currentSessionId}/chat`, {
                   method: "POST",
                   headers: headers(),
-                  body: JSON.stringify({ message, mode }),
+                  body: JSON.stringify({
+                    message,
+                    mode,
+                    document_ids: selectedDocumentIds(),
+                    include_home_assistant: includeHomeAssistantInput.value === "true",
+                  }),
                 });
                 const data = await res.json();
-                if (!res.ok) throw new Error(data?.error?.message || `Chat fehlgeschlagen: ${res.status}`);
+                if (!res.ok) throw new Error(errorMessageFrom(data, `Chat fehlgeschlagen: ${res.status}`));
                 renderSession(data.session);
                 await loadSessions();
-                setStatus(`Antwort erhalten via ${data.resolved_model} (${data.route_reason}).`);
+                await loadTelemetry();
+                const tps = data.assistant_message && typeof data.assistant_message.tokens_per_second === "number"
+                  ? ` | ${data.assistant_message.tokens_per_second.toFixed(2)} t/s`
+                  : "";
+                setStatus(`Antwort erhalten via ${data.resolved_model} (${data.route_reason})${tps}.`);
               } catch (error) {
                 setStatus(error.message, true);
               }
@@ -626,14 +2175,21 @@ def _admin_chat_html() -> str:
             async function streamMessage(message, mode) {
               const userNode = document.createElement("div");
               userNode.className = "message user";
-              userNode.innerHTML = `<strong>user</strong><pre>${message}</pre>`;
+              userNode.innerHTML = `
+                <div class="message-header">
+                  <div class="message-role">user</div>
+                </div>
+                <div class="message-body">${renderMessageContent(message)}</div>
+              `;
               messagesNode.appendChild(userNode);
 
               const assistantNode = document.createElement("div");
               assistantNode.className = "message assistant";
-              const assistantPre = document.createElement("pre");
-              assistantNode.innerHTML = "<strong>assistant</strong>";
-              assistantNode.appendChild(assistantPre);
+              const assistantBody = document.createElement("div");
+              assistantBody.className = "message-body";
+              let assistantText = "";
+              assistantNode.innerHTML = '<div class="message-header"><div class="message-role">assistant</div></div>';
+              assistantNode.appendChild(assistantBody);
               messagesNode.appendChild(assistantNode);
               messagesNode.scrollTop = messagesNode.scrollHeight;
 
@@ -642,16 +2198,22 @@ def _admin_chat_html() -> str:
                 const res = await fetch(`/api/admin/sessions/${currentSessionId}/chat/stream`, {
                   method: "POST",
                   headers: headers(),
-                  body: JSON.stringify({ message, mode }),
+                  body: JSON.stringify({
+                    message,
+                    mode,
+                    document_ids: selectedDocumentIds(),
+                    include_home_assistant: includeHomeAssistantInput.value === "true",
+                  }),
                 });
                 if (!res.ok) {
                   const data = await res.json();
-                  throw new Error(data?.error?.message || `Streaming fehlgeschlagen: ${res.status}`);
+                  throw new Error(errorMessageFrom(data, `Streaming fehlgeschlagen: ${res.status}`));
                 }
 
                 const reader = res.body.getReader();
                 const decoder = new TextDecoder();
                 let buffer = "";
+                let streamTps = null;
 
                 while (true) {
                   const { value, done } = await reader.read();
@@ -664,20 +2226,38 @@ def _admin_chat_html() -> str:
                     const payload = part.slice(6);
                     if (payload === "[DONE]") continue;
                     const data = JSON.parse(payload);
-                    const delta = data.choices?.[0]?.delta?.content || "";
-                    if (delta) assistantPre.textContent += delta;
+                    if (data.error && data.error.message) {
+                      assistantText = data.error.message;
+                      assistantBody.innerHTML = renderMessageContent(assistantText);
+                      throw new Error(data.error.message);
+                    }
+                    if (data.timings && typeof data.timings.predicted_per_second === "number") {
+                      streamTps = data.timings.predicted_per_second;
+                    }
+                    let delta = "";
+                    if (data.choices && data.choices[0] && data.choices[0].delta && typeof data.choices[0].delta.content === "string") {
+                      delta = data.choices[0].delta.content;
+                    }
+                    if (delta) {
+                      assistantText += delta;
+                      assistantBody.innerHTML = renderMessageContent(assistantText);
+                    }
                   }
                 }
 
                 await openSession(currentSessionId);
                 await loadSessions();
-                setStatus("Streaming abgeschlossen.");
+                await loadTelemetry();
+                const tps = typeof streamTps === "number" ? ` | ${streamTps.toFixed(2)} t/s` : "";
+                setStatus(`Streaming abgeschlossen${tps}.`);
               } catch (error) {
                 setStatus(error.message, true);
               }
             }
 
             loadSessions();
+            loadTelemetry();
+            loadAvailableDocuments();
           </script>
         </body>
         </html>

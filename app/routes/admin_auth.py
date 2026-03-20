@@ -15,7 +15,10 @@ router = APIRouter(tags=["admin-auth"])
 async def admin_login_page(request: Request, next: str = "/internal/admin") -> HTMLResponse | RedirectResponse:
     if get_admin_session_username(request):
         return RedirectResponse(url=next, status_code=303)
-    return HTMLResponse(_login_html(next_path=next, error=None))
+    return HTMLResponse(
+        _login_html(next_path=next, error=None),
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @router.post("/admin/login", response_class=HTMLResponse, response_model=None)
@@ -27,7 +30,11 @@ async def admin_login_submit(
 ) -> HTMLResponse | RedirectResponse:
     settings = get_settings()
     if not validate_admin_credentials(username=username, password=password, settings=settings):
-        return HTMLResponse(_login_html(next_path=next, error="Login fehlgeschlagen."), status_code=401)
+        return HTMLResponse(
+            _login_html(next_path=next, error="Login fehlgeschlagen."),
+            status_code=401,
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
 
     response = RedirectResponse(url=next or "/internal/admin", status_code=303)
     attach_admin_session_cookie(response, settings, username)
