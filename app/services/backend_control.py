@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -10,6 +11,10 @@ from app.config import get_settings
 
 RESTART_SCRIPT = Path("/opt/llm-gateway/scripts/restart_mi50_backend.sh")
 _LAST_CPU_SAMPLE: tuple[float, float] | None = None
+
+
+class OpsActionError(RuntimeError):
+    """Raised when a controlled gateway or MI50 ops task fails."""
 
 
 def _run_local_command(command: list[str], timeout_seconds: int = 30) -> str:
@@ -23,6 +28,43 @@ def _run_local_command(command: list[str], timeout_seconds: int = 30) -> str:
     output = "\n".join(part for part in [completed.stdout.strip(), completed.stderr.strip()] if part).strip()
     if completed.returncode != 0:
         raise RuntimeError(output or f"Befehl fehlgeschlagen: {' '.join(command)}")
+    return output or "OK"
+
+
+def _run_local_shell(command: str, timeout_seconds: int = 120, require_root: bool = False) -> str:
+    settings = get_settings()
+    clean_command = (command or "").strip()
+    if not clean_command:
+        raise OpsActionError("Lokaler Shell-Befehl ist leer.")
+
+    # Root-capable gateway tasks still go through a fixed prefix such as
+    # "sudo -n" so the web/admin layer never exposes a free local root shell.
+    if require_root and os.geteuid() == 0:
+        wrapped_command = clean_command
+    elif require_root:
+        root_prefix = (settings.gateway_local_root_prefix or "").strip()
+        if not root_prefix:
+            raise OpsActionError("GATEWAY_LOCAL_ROOT_PREFIX ist nicht gesetzt.")
+        prefix_binary = shlex.split(root_prefix)[0] if shlex.split(root_prefix) else ""
+        if prefix_binary and shutil.which(prefix_binary) is None:
+            raise OpsActionError(
+                f"Root-Task braucht '{root_prefix}', aber '{prefix_binary}' ist auf diesem Host nicht installiert. "
+                "Entweder den Prefix anpassen, sudo/doas installieren oder den Dienst mit passenden Rechten starten."
+            )
+        wrapped_command = f"{root_prefix} bash -lc {shlex.quote(clean_command)}"
+    else:
+        wrapped_command = clean_command
+
+    completed = subprocess.run(
+        ["bash", "-lc", wrapped_command],
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=False,
+    )
+    output = "\n".join(part for part in [completed.stdout.strip(), completed.stderr.strip()] if part).strip()
+    if completed.returncode != 0:
+        raise OpsActionError(output or f"Gateway-Task fehlgeschlagen: {clean_command}")
     return output or "OK"
 
 
@@ -164,6 +206,53 @@ def gateway_logs() -> dict[str, str]:
 def restart_gateway() -> dict[str, str]:
     _run_local_command(["systemctl", "restart", "llm-gateway"], timeout_seconds=60)
     return gateway_status()
+
+
+def gateway_tools() -> dict[str, str]:
+    command = dedent_command(
+        """
+        for tool in bash python3 git curl gh rg htop tmux; do
+          if command -v "$tool" >/dev/null 2>&1; then
+            printf "%-10s %s\n" "$tool" "$("$tool" --version 2>/dev/null | head -n 1 || echo vorhanden)"
+          else
+            printf "%-10s %s\n" "$tool" "nicht installiert"
+          fi
+        done
+        """
+    )
+    return {"status": "ok", "output": _run_local_shell(command)}
+
+
+def gateway_skills() -> dict[str, str]:
+    command = dedent_command(
+        """
+        if [ -d /root/.codex/skills ]; then
+          find /root/.codex/skills -mindepth 1 -maxdepth 3 -name SKILL.md -printf '%h\n' | sort -u
+        else
+          echo "Kein /root/.codex/skills Verzeichnis gefunden."
+        fi
+        """
+    )
+    return {"status": "ok", "output": _run_local_shell(command, require_root=True)}
+
+
+def gateway_apt_update() -> dict[str, str]:
+    return {
+        "status": "ok",
+        "output": _run_local_shell("DEBIAN_FRONTEND=noninteractive apt-get update", require_root=True, timeout_seconds=300),
+    }
+
+
+def gateway_install_package(package_name: str) -> dict[str, str]:
+    clean_package = (package_name or "").strip()
+    if not clean_package:
+        raise OpsActionError("Kein Paketname fuer die Installation gesetzt.")
+    command = f"DEBIAN_FRONTEND=noninteractive apt-get install -y {shlex.quote(clean_package)}"
+    return {"status": "ok", "output": _run_local_shell(command, require_root=True, timeout_seconds=600)}
+
+
+def dedent_command(command: str) -> str:
+    return "\n".join(line.strip() for line in command.strip().splitlines() if line.strip())
 
 
 def kai_status() -> dict[str, str]:
@@ -444,6 +533,15 @@ def run_ops_command(target: str, command_name: str) -> dict[str, str]:
             "restart": restart_gateway,
             "uptime": lambda: {"status": "ok", "output": _run_local_command(["uptime"])},
             "health": lambda: {"status": "ok", "output": _run_local_command(["curl", "-sS", "http://127.0.0.1:8000/health"])},
+            "tools": gateway_tools,
+            "skills": gateway_skills,
+            "apt_update": gateway_apt_update,
+            "install_git": lambda: gateway_install_package("git"),
+            "install_curl": lambda: gateway_install_package("curl"),
+            "install_gh": lambda: gateway_install_package("gh"),
+            "install_ripgrep": lambda: gateway_install_package("ripgrep"),
+            "install_htop": lambda: gateway_install_package("htop"),
+            "install_tmux": lambda: gateway_install_package("tmux"),
         }
     elif normalized_target == "kai":
         handlers = {

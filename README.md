@@ -707,6 +707,15 @@ Verfuegbar:
 - `gateway restart`
 - `gateway health`
 - `gateway uptime`
+- `gateway tools`
+- `gateway skills`
+- `gateway apt_update`
+- `gateway install_git`
+- `gateway install_curl`
+- `gateway install_gh`
+- `gateway install_ripgrep`
+- `gateway install_htop`
+- `gateway install_tmux`
 - `kai status`
 - `kai logs`
 - `kai restart`
@@ -715,6 +724,24 @@ Verfuegbar:
 - `kai telemetry`
 
 Das ist bewusst kontrollierter als ein generisches Browser-Terminal. Fuer spaeter kann daraus ein groesseres Panel werden, aber die V1 bleibt absichtlich enger.
+
+Neu dazu:
+
+- der Gateway kann jetzt auch lokale, kuratierte Tool-Tasks ausfuehren
+- Root-Rechte laufen dabei bewusst nicht als freie Shell, sondern ueber `GATEWAY_LOCAL_ROOT_PREFIX`
+- Standard ist `sudo -n`, also nur nichtinteraktive `sudo`-Kommandos
+- dieselben freigegebenen Gateway-Tasks koennen auch direkt aus dem Admin-Chat angestossen werden, z. B.:
+  - `installiere git`
+  - `installiere ripgrep`
+  - `zeige gateway tools`
+  - `zeige skills`
+  - `aktualisiere die paketlisten`
+
+Wichtiger Sicherheitspunkt:
+
+- Auch im rein lokalen Betrieb ist das absichtlich keine offene Root-Konsole fuer das Modell.
+- Der Chat darf nur die explizit erlaubten Gateway-Tasks ausloesen.
+- Wenn `sudo -n` fuer den Service-User nicht freigeschaltet ist, schlagen Root-Tasks mit einer klaren Fehlermeldung fehl.
 
 ## KI-Profile fuer mehrere MI50-Services
 

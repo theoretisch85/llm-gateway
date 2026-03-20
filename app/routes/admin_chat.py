@@ -30,6 +30,7 @@ from app.services.home_assistant_memory import (
     parse_home_assistant_note_instruction,
 )
 from app.services.model_router import ModelRouter
+from app.services.backend_control import OpsActionError, run_ops_command
 from app.services.session_memory import ChatSession, get_session_store
 from app.services.storage_library import get_document_contexts
 
@@ -250,6 +251,23 @@ async def admin_chat(payload: AdminChatRequest, session_id: str, request: Reques
                 route_reason=ha_query_result["route_reason"],
             )
 
+        gateway_ops_result = await _try_handle_gateway_ops_action(payload.message)
+        if gateway_ops_result is not None:
+            await store.add_message(session_id, "user", payload.message)
+            await store.update_route(session_id, "gateway_ops", gateway_ops_result["route_reason"], payload.mode or session.mode)
+            assistant_message = await store.add_message(
+                session_id,
+                "assistant",
+                gateway_ops_result["assistant_text"],
+                model_used="gateway_ops",
+            )
+            return AdminChatResponse(
+                session=_serialize_session(await _require_session(store, session_id)),
+                assistant_message=_serialize_message(assistant_message),
+                resolved_model="gateway_ops",
+                route_reason=gateway_ops_result["route_reason"],
+            )
+
         decision, backend_payload = await _prepare_admin_backend_payload(settings, session, payload)
         await store.add_message(session_id, "user", payload.message)
         await store.update_route(session_id, decision.resolved_model, decision.reason, payload.mode or session.mode)
@@ -296,6 +314,14 @@ async def admin_chat(payload: AdminChatRequest, session_id: str, request: Reques
             message=exc.message,
             error_type="upstream_error",
             code="home_assistant_request_failed",
+        )
+    except OpsActionError as exc:
+        return error_response(
+            request_id=request.state.request_id,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=str(exc),
+            error_type="invalid_request_error",
+            code="gateway_ops_failed",
         )
     except LlamaCppTimeoutError:
         return error_response(
@@ -536,6 +562,40 @@ async def admin_chat_stream(payload: AdminChatRequest, session_id: str, request:
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
 
+        gateway_ops_result = await _try_handle_gateway_ops_action(payload.message)
+        if gateway_ops_result is not None:
+            await store.add_message(session_id, "user", payload.message)
+            await store.update_route(session_id, "gateway_ops", gateway_ops_result["route_reason"], payload.mode or session.mode)
+
+            async def gateway_ops_stream():
+                confirmation = {
+                    "id": f"chatcmpl-gateway-ops-{session_id}",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "gateway_ops",
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    "request_id": request.state.request_id,
+                }
+                content = {
+                    **confirmation,
+                    "choices": [{"index": 0, "delta": {"content": gateway_ops_result["assistant_text"]}, "finish_reason": "stop"}],
+                }
+                yield f"data: {json.dumps(confirmation, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield f"data: {json.dumps(content, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+                await store.add_message(
+                    session_id,
+                    "assistant",
+                    gateway_ops_result["assistant_text"],
+                    model_used="gateway_ops",
+                )
+
+            return StreamingResponse(
+                gateway_ops_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+
         decision, backend_payload = await _prepare_admin_backend_payload(settings, session, payload)
         backend_payload["stream"] = True
     except ContextGuardError as exc:
@@ -561,6 +621,14 @@ async def admin_chat_stream(payload: AdminChatRequest, session_id: str, request:
             message=exc.message,
             error_type="upstream_error",
             code="home_assistant_request_failed",
+        )
+    except OpsActionError as exc:
+        return error_response(
+            request_id=request.state.request_id,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message=str(exc),
+            error_type="invalid_request_error",
+            code="gateway_ops_failed",
         )
 
     await store.add_message(session_id, "user", payload.message)
@@ -691,6 +759,90 @@ def _message_wants_home_assistant_context(message: str) -> bool:
     if any(keyword in lowered for keyword in ha_keywords):
         return True
     return bool(re.search(r"\b(?:light|switch|climate|script)\.[a-z0-9_]+\b", lowered))
+
+
+_GATEWAY_INSTALL_COMMANDS = {
+    "git": "install_git",
+    "curl": "install_curl",
+    "gh": "install_gh",
+    "github cli": "install_gh",
+    "ripgrep": "install_ripgrep",
+    "rg": "install_ripgrep",
+    "htop": "install_htop",
+    "tmux": "install_tmux",
+}
+
+
+def _normalize_gateway_ops_text(message: str) -> str:
+    normalized = (message or "").strip().lower()
+    normalized = normalized.replace("github-cli", "github cli")
+    normalized = re.sub(r"[^a-z0-9äöüß.\- ]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _parse_gateway_ops_action(message: str) -> dict[str, str] | None:
+    # Keep gateway host access explicit and narrow: only a handful of
+    # allowlisted maintenance tasks may be triggered from chat.
+    normalized = _normalize_gateway_ops_text(message)
+    if not normalized:
+        return None
+
+    if normalized.startswith("wie ") or "wie installiere ich" in normalized:
+        return None
+
+    request_like = any(
+        phrase in normalized
+        for phrase in (
+            "installiere",
+            "installier",
+            " apt install",
+            "apt-get install",
+            "kannst du",
+            "kannstd",
+            "mach ",
+            "mache ",
+            "bitte",
+            "zeige ",
+            "liste ",
+            "list ",
+            "aktualisiere",
+            "update",
+        )
+    )
+    if not request_like:
+        return None
+
+    if "apt update" in normalized or "apt-get update" in normalized or "paketlisten" in normalized or "paketliste" in normalized:
+        return {"command_name": "apt_update", "label": "apt update"}
+
+    if ("skills" in normalized or "skill" in normalized) and any(term in normalized for term in ("zeige", "liste", "list", "welche")):
+        return {"command_name": "skills", "label": "skills anzeigen"}
+
+    if any(term in normalized for term in ("tools", "werkzeuge")) and any(term in normalized for term in ("zeige", "liste", "list", "welche")):
+        return {"command_name": "tools", "label": "tools anzeigen"}
+
+    install_requested = any(term in normalized for term in ("installiere", "installier", " apt install", "apt-get install"))
+    if not install_requested:
+        return None
+
+    for alias, command_name in _GATEWAY_INSTALL_COMMANDS.items():
+        if alias in normalized:
+            return {"command_name": command_name, "label": f"{alias} installieren"}
+    return None
+
+
+async def _try_handle_gateway_ops_action(message: str) -> dict[str, str] | None:
+    parsed = _parse_gateway_ops_action(message)
+    if parsed is None:
+        return None
+
+    result = run_ops_command("gateway", parsed["command_name"])
+    assistant_text = f"Gateway-Ops ausgefuehrt: {parsed['label']}.\n\n{result.get('output') or 'OK'}"
+    return {
+        "assistant_text": assistant_text,
+        "route_reason": "gateway_ops_action",
+    }
 
 
 def _classify_home_assistant_intent(message: str) -> str:

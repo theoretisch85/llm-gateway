@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     admin_session_ttl_hours: int = Field(default=24, alias="ADMIN_SESSION_TTL_HOURS")
     admin_cookie_secure: bool = Field(default=False, alias="ADMIN_COOKIE_SECURE")
     device_shared_token: str | None = Field(default=None, alias="DEVICE_SHARED_TOKEN")
+    gateway_local_root_prefix: str = Field(default="sudo -n", alias="GATEWAY_LOCAL_ROOT_PREFIX")
     home_assistant_base_url: str | None = Field(default=None, alias="HOME_ASSISTANT_BASE_URL")
     home_assistant_token: str | None = Field(default=None, alias="HOME_ASSISTANT_TOKEN")
     home_assistant_timeout_seconds: float = Field(default=10.0, alias="HOME_ASSISTANT_TIMEOUT_SECONDS")

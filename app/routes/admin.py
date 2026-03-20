@@ -115,6 +115,7 @@ def _build_admin_config_values(settings) -> dict[str, str]:
     current = read_runtime_config()
     current.setdefault("LLAMACPP_BASE_URL", settings.llamacpp_base_url)
     current.setdefault("LLAMACPP_TIMEOUT_SECONDS", str(settings.llamacpp_timeout_seconds))
+    current.setdefault("GATEWAY_LOCAL_ROOT_PREFIX", settings.gateway_local_root_prefix or "sudo -n")
     current.setdefault("PUBLIC_MODEL_NAME", settings.public_model_name)
     current.setdefault("BACKEND_MODEL_NAME", settings.backend_model_name)
     current.setdefault("FAST_MODEL_PUBLIC_NAME", settings.fast_model_public_name or settings.public_model_name)
@@ -1486,6 +1487,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                       <label><span>MI50_SSH_HOST</span><input id="MI50_SSH_HOST" value="__CFG_MI50_SSH_HOST__"></label>
                       <label><span>MI50_SSH_USER</span><input id="MI50_SSH_USER" value="__CFG_MI50_SSH_USER__"></label>
                       <label><span>MI50_SSH_PORT</span><input id="MI50_SSH_PORT" value="__CFG_MI50_SSH_PORT__"></label>
+                      <label><span>GATEWAY_LOCAL_ROOT_PREFIX</span><input id="GATEWAY_LOCAL_ROOT_PREFIX" value="__CFG_GATEWAY_LOCAL_ROOT_PREFIX__"></label>
                     </div>
                     <details style="margin-top:18px;">
                       <summary style="cursor:pointer;font-weight:700;">Erweiterte Modell- und Routing-Settings</summary>
@@ -1819,7 +1821,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
             <section id="ops" class="panel __PANEL_OPS__">
               <div class="hero">
                 <h1>Ops Konsole</h1>
-                <p>Kein freies Root-Webterminal. Stattdessen eine sichere Terminal-V1 mit Status, Logs, Restart und freigegebenen Preset-Befehlen fuer Gateway und Kai.</p>
+                <p>Kein freies Root-Webterminal. Stattdessen eine sichere Terminal-V1 mit Status, Logs, Restart und freigegebenen Preset-Befehlen fuer Gateway, Kai und kuratierte lokale Tool-Installationen.</p>
               </div>
               <div class="card">
                 <div class="actions">
@@ -1833,6 +1835,15 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                     <option value="restart">restart</option>
                     <option value="health">health</option>
                     <option value="uptime">uptime (gateway)</option>
+                    <option value="tools">tools (gateway)</option>
+                    <option value="skills">skills (gateway)</option>
+                    <option value="apt_update">apt update (gateway)</option>
+                    <option value="install_git">install git (gateway)</option>
+                    <option value="install_curl">install curl (gateway)</option>
+                    <option value="install_gh">install gh (gateway)</option>
+                    <option value="install_ripgrep">install ripgrep (gateway)</option>
+                    <option value="install_htop">install htop (gateway)</option>
+                    <option value="install_tmux">install tmux (gateway)</option>
                     <option value="models">models (kai)</option>
                     <option value="telemetry">telemetry (kai)</option>
                   </select>
@@ -1905,6 +1916,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               "MI50_SSH_HOST",
               "MI50_SSH_USER",
               "MI50_SSH_PORT",
+              "GATEWAY_LOCAL_ROOT_PREFIX",
               "MI50_RESTART_COMMAND",
               "MI50_STATUS_COMMAND",
               "MI50_LOGS_COMMAND",
