@@ -12,6 +12,16 @@ NOTE_PATTERNS = [
         re.IGNORECASE | re.DOTALL,
     ),
 ]
+ALIAS_PATTERNS = [
+    re.compile(
+        r"^\s*merke(?:\s+ha)?\s+alias\s+(?P<alias>.+?)\s*:\s*(?P<entity_ids>(?:[a-z0-9_]+\.[a-z0-9_]+(?:\s*,\s*)?)+)\s*$",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"^\s*wenn\s+ich\s+(?P<alias>.+?)\s+sage\s*,?\s*(?:dann\s+)?meine\s+ich\s+(?P<entity_ids>(?:[a-z0-9_]+\.[a-z0-9_]+(?:\s*,\s*)?)+)\s*$",
+        re.IGNORECASE | re.DOTALL,
+    ),
+]
 
 
 @dataclass
@@ -264,6 +274,25 @@ def parse_home_assistant_note_instruction(message: str) -> tuple[str, str] | Non
         match = pattern.match(text)
         if match:
             return match.group("entity_id").strip().lower(), match.group("note").strip()
+    return None
+
+
+def parse_home_assistant_alias_instruction(message: str) -> tuple[str, list[str]] | None:
+    # Alias learning stays explicit and reviewable: the user teaches a phrase,
+    # we normalize it, and store the mapping in PostgreSQL for later reuse.
+    text = (message or "").strip()
+    for pattern in ALIAS_PATTERNS:
+        match = pattern.match(text)
+        if not match:
+            continue
+        alias = match.group("alias").strip()
+        entity_ids = [
+            item.strip().lower()
+            for item in re.findall(r"[a-z0-9_]+\.[a-z0-9_]+", match.group("entity_ids").lower())
+            if item.strip()
+        ]
+        if alias and entity_ids:
+            return alias, entity_ids
     return None
 
 

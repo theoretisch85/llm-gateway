@@ -573,7 +573,22 @@ Im Admin-Chat gibt es jetzt eine erste Home-Assistant-Chat-V1:
 - Einfache Follow-up-Befehle auf die letzte HA-Aktion gehen jetzt ebenfalls, z. B.:
   - `ok und jetzt wieder aus`
   - `und jetzt wieder an`
+- Fenster-/Schalter-Formulierungen koennen jetzt natuerlicher sein, z. B.:
+  - `mach wohnzimmer fenster auf`
+  - `schliesse das fenster im wohnzimmer`
+- Der Chat kann HA-Entities jetzt auch direkt ueber die HA-Engine auflisten, z. B.:
+  - `suche mal nach fenstern`
+  - `welche fenster gibt es`
+- Du kannst dem Gateway Ausdruecke dauerhaft beibringen, z. B.:
+  - `Merke HA Alias wohnzimmer fenster: switch.fenster_wohnzimmer`
+  - `Wenn ich wohnzimmer fenster sage, meine ich switch.fenster_wohnzimmer`
 - Bei Mehrdeutigkeit schaltet der Gateway absichtlich nicht blind, sondern nennt die Kandidaten.
+- Das aktuelle "Dazulernen" passiert bewusst ueber PostgreSQL-Notizen und HA-Aliase, nicht ueber automatische LoRA-/Modell-Neutrainings.
+- Vor einer HA-Aktion laeuft jetzt zusaetzlich eine kleine Intent-Stufe ueber das Modell:
+  - `chat`
+  - `ha_query`
+  - `ha_action`
+  Erst danach fuehrt der Gateway die HA-Logik validiert aus. Das macht Folge-Saetze wie `mach es bitte doch wieder auf` robuster, ohne dem Modell freie API-Kontrolle zu geben.
 
 Beispiel:
 
@@ -618,6 +633,7 @@ Im Admin-Hub gibt es jetzt zusaetzlich:
   - Gateway-/Backend-Status
   - Requests und mittlere Request-Dauer
   - GPU-Temperatur, GPU-Power und VRAM
+  - kleine Live-Telemetrie im sticky Header fuer CPU-Last, CPU-Temp, GPU-Auslastung, GPU-Temp, GPU-Power und VRAM
   - aktives Modell, Limits, Datenbank- und Storage-Zustand
 - `Settings`
   Hier liegen die schreibbaren Plattform-Settings:

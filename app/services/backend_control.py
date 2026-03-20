@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -8,6 +9,7 @@ from app.config import get_settings
 
 
 RESTART_SCRIPT = Path("/opt/llm-gateway/scripts/restart_mi50_backend.sh")
+_LAST_CPU_SAMPLE: tuple[float, float] | None = None
 
 
 def _run_local_command(command: list[str], timeout_seconds: int = 30) -> str:
@@ -68,6 +70,16 @@ def _prepare_remote_activation_command(command: str, ngl_layers: str = "") -> st
         return clean_command.replace("{ngl}", shlex.quote(clean_ngl))
 
     return f"KAI_NGL={shlex.quote(clean_ngl)} {clean_command}"
+
+
+def _normalize_rocm_smi_command(command: str) -> str:
+    clean_command = (command or "").strip()
+    lowered = clean_command.lower()
+    if not lowered.startswith("rocm-smi"):
+        return clean_command
+    if "--showuse" in lowered or "--show-use" in lowered:
+        return clean_command
+    return f"{clean_command} --showuse"
 
 
 def restart_mi50_backend(timeout_seconds: int = 120) -> dict[str, str]:
@@ -252,11 +264,113 @@ def _bytes_to_gib(value: float | None) -> float | None:
     return round(value / (1024**3), 2)
 
 
+def _read_cpu_times() -> tuple[float, float] | None:
+    try:
+        first_line = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0]
+    except (OSError, IndexError):
+        return None
+
+    parts = first_line.split()
+    if not parts or parts[0] != "cpu" or len(parts) < 5:
+        return None
+
+    values = [float(item) for item in parts[1:]]
+    idle = values[3] + (values[4] if len(values) > 4 else 0.0)
+    total = sum(values)
+    return total, idle
+
+
+def gateway_cpu_usage_percent() -> float | None:
+    global _LAST_CPU_SAMPLE
+
+    current = _read_cpu_times()
+    if current is None:
+        return None
+
+    previous = _LAST_CPU_SAMPLE
+    _LAST_CPU_SAMPLE = current
+    if previous is None:
+        return None
+
+    total_delta = current[0] - previous[0]
+    idle_delta = current[1] - previous[1]
+    if total_delta <= 0:
+        return None
+
+    usage = 100.0 * (1.0 - (idle_delta / total_delta))
+    return round(max(0.0, min(usage, 100.0)), 1)
+
+
+def gateway_cpu_temp_c() -> float | None:
+    thermal_candidates = sorted(Path("/sys/class/thermal").glob("thermal_zone*/temp"))
+    for temp_file in thermal_candidates:
+        try:
+            raw_value = temp_file.read_text(encoding="utf-8").strip()
+            temperature = float(raw_value)
+        except (OSError, ValueError):
+            continue
+
+        if temperature > 1000:
+            temperature /= 1000.0
+        if 0.0 < temperature < 150.0:
+            return round(temperature, 1)
+
+    hwmon_candidates = sorted(Path("/sys/class/hwmon").glob("hwmon*/temp*_input"))
+    for temp_file in hwmon_candidates:
+        try:
+            raw_value = temp_file.read_text(encoding="utf-8").strip()
+            temperature = float(raw_value)
+        except (OSError, ValueError):
+            continue
+
+        if temperature > 1000:
+            temperature /= 1000.0
+        if 0.0 < temperature < 150.0:
+            return round(temperature, 1)
+    return None
+
+
+def gateway_system_telemetry() -> dict[str, object]:
+    # Compact header telemetry combines local gateway signals and MI50
+    # telemetry so the admin UI can refresh the top status line in one request.
+    telemetry = {
+        "status": "ok",
+        "cpu_usage_percent": gateway_cpu_usage_percent(),
+        "cpu_temp_c": gateway_cpu_temp_c(),
+        "process_loadavg_1m": None,
+        "gpu_status": "n/a",
+        "gpu_usage_percent": None,
+        "temperature_c": None,
+        "power_w": None,
+        "vram_used_gib": None,
+        "vram_total_gib": None,
+        "vram_percent": None,
+    }
+
+    try:
+        load1, _load5, _load15 = os.getloadavg()
+        telemetry["process_loadavg_1m"] = round(load1, 2)
+    except OSError:
+        telemetry["process_loadavg_1m"] = None
+
+    try:
+        gpu = kai_telemetry()
+        telemetry.update(gpu)
+        telemetry["gpu_status"] = str(gpu.get("status") or "ok")
+    except RuntimeError as exc:
+        telemetry["gpu_status"] = "error"
+        telemetry["gpu_message"] = str(exc)
+
+    return telemetry
+
+
 def kai_telemetry() -> dict[str, object]:
     settings = get_settings()
-    command = (
+    command = _normalize_rocm_smi_command(
+        (
         getattr(settings, "mi50_rocm_smi_command", None)
         or "rocm-smi --showtemp --showpower --showmemuse --json"
+        )
     )
     output = _run_remote_command(command, timeout_seconds=30)
 
@@ -273,6 +387,10 @@ def kai_telemetry() -> dict[str, object]:
     temperature_c = _find_metric_value(gpu_payload, ["temp"], ["junction", "mem"])
     if temperature_c is None:
         temperature_c = _find_metric_value(gpu_payload, ["temperature"], ["junction", "mem"])
+
+    gpu_usage_percent = _find_metric_value(gpu_payload, ["gpu", "use"], ["vram"])
+    if gpu_usage_percent is None:
+        gpu_usage_percent = _find_metric_value(gpu_payload, ["gpu", "percent"], ["vram"])
 
     power_w = _find_metric_value(gpu_payload, ["power"], ["cap", "max"])
     vram_used = _find_metric_value(gpu_payload, ["vram", "used"])
@@ -294,8 +412,10 @@ def kai_telemetry() -> dict[str, object]:
 
     if vram_percent is None:
         vram_percent = _extract_percent_from_text(output, "VRAM%")
+    if gpu_usage_percent is None:
+        gpu_usage_percent = _extract_percent_from_text(output, "GPU%")
 
-    if all(metric is None for metric in [temperature_c, power_w, vram_used_gib, vram_total_gib, vram_percent]):
+    if all(metric is None for metric in [temperature_c, gpu_usage_percent, power_w, vram_used_gib, vram_total_gib, vram_percent]):
         return {
             "status": "degraded",
             "message": "rocm-smi JSON erkannt, aber keine bekannten Kennzahlen gefunden.",
@@ -304,6 +424,7 @@ def kai_telemetry() -> dict[str, object]:
 
     return {
         "status": "ok",
+        "gpu_usage_percent": round(gpu_usage_percent, 1) if gpu_usage_percent is not None else None,
         "temperature_c": round(temperature_c, 1) if temperature_c is not None else None,
         "power_w": round(power_w, 1) if power_w is not None else None,
         "vram_used_gib": vram_used_gib,

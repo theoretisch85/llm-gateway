@@ -12,6 +12,7 @@ from app.metrics import metrics
 from app.services.home_assistant import HomeAssistantClient, HomeAssistantConfigError, HomeAssistantRequestError
 from app.services.backend_control import (
     gateway_logs,
+    gateway_system_telemetry,
     gateway_status,
     kai_logs,
     kai_status,
@@ -103,6 +104,11 @@ async def admin_page(request: Request, tab: str = "dashboard") -> HTMLResponse |
 async def get_admin_config() -> dict[str, str]:
     settings = get_settings()
     return _build_admin_config_values(settings)
+
+
+@router.get("/api/admin/system/summary", dependencies=[Depends(require_admin_api_auth)])
+async def get_admin_system_summary() -> JSONResponse:
+    return JSONResponse(gateway_system_telemetry(), headers={"Cache-Control": "no-store, max-age=0"})
 
 
 def _build_admin_config_values(settings) -> dict[str, str]:
@@ -574,6 +580,12 @@ async def _build_initial_admin_data() -> dict[str, str]:
         "gpu_temp_value": "-",
         "gpu_power_value": "-",
         "gpu_vram_value": "-",
+        "header_cpu_usage_value": "-",
+        "header_cpu_temp_value": "-",
+        "header_gpu_usage_value": "-",
+        "header_gpu_temp_value": "-",
+        "header_gpu_power_value": "-",
+        "header_gpu_vram_value": "-",
         "dashboard_public_model": settings.public_model_name,
         "dashboard_backend_model": settings.backend_model_name,
         "dashboard_backend_profile": "-",
@@ -670,15 +682,22 @@ async def _build_initial_admin_data() -> dict[str, str]:
         data["dashboard_status"] = "Backend-Check fehlgeschlagen."
 
     try:
-        telemetry = run_ops_command("kai", "telemetry")
-        data["gpu_temp_value"] = _format_number(telemetry.get("temperature_c"), " C")
-        data["gpu_power_value"] = _format_number(telemetry.get("power_w"), " W")
+        telemetry = gateway_system_telemetry()
+        data["header_cpu_usage_value"] = _format_number(telemetry.get("cpu_usage_percent"), "%")
+        data["header_cpu_temp_value"] = _format_number(telemetry.get("cpu_temp_c"), " C")
+        data["header_gpu_usage_value"] = _format_number(telemetry.get("gpu_usage_percent"), "%")
+        data["header_gpu_temp_value"] = _format_number(telemetry.get("temperature_c"), " C")
+        data["header_gpu_power_value"] = _format_number(telemetry.get("power_w"), " W")
+        data["gpu_temp_value"] = data["header_gpu_temp_value"]
+        data["gpu_power_value"] = data["header_gpu_power_value"]
         if telemetry.get("vram_used_gib") is not None and telemetry.get("vram_total_gib") is not None:
             percent = telemetry.get("vram_percent")
             percent_text = f" ({percent}%)" if percent is not None else ""
             data["gpu_vram_value"] = f"{telemetry['vram_used_gib']} / {telemetry['vram_total_gib']} GiB{percent_text}"
+            data["header_gpu_vram_value"] = f"{percent}%" if percent is not None else "-"
         elif telemetry.get("vram_percent") is not None:
             data["gpu_vram_value"] = f"{telemetry['vram_percent']}%"
+            data["header_gpu_vram_value"] = data["gpu_vram_value"]
     except RuntimeError:
         pass
 
@@ -1061,10 +1080,21 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               max-width:1320px;
               margin:0 auto;
               padding:14px 20px;
+              display:grid;
+              gap:12px;
+            }
+            .nav-main {
               display:flex;
               gap:14px;
               align-items:center;
               justify-content:space-between;
+              flex-wrap:wrap;
+            }
+            .brand-stack {
+              display:flex;
+              flex-direction:column;
+              gap:8px;
+              min-width:260px;
             }
             .brand {
               font-size:1.05rem;
@@ -1072,6 +1102,34 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               letter-spacing:.14em;
               text-transform:uppercase;
               color:var(--accent);
+            }
+            .header-telemetry {
+              display:flex;
+              gap:8px;
+              flex-wrap:wrap;
+            }
+            .telemetry-chip {
+              min-width:72px;
+              padding:5px 8px 6px;
+              border:1px solid var(--line);
+              border-radius:8px;
+              background:#10161f;
+            }
+            .chip-label {
+              display:block;
+              color:var(--muted);
+              font-size:.58rem;
+              letter-spacing:.10em;
+              text-transform:uppercase;
+              line-height:1.1;
+            }
+            .chip-value {
+              display:block;
+              margin-top:3px;
+              color:var(--accent);
+              font-size:.86rem;
+              font-weight:700;
+              line-height:1.05;
             }
             .nav-buttons { display:flex; gap:10px; flex-wrap:wrap; }
             .nav-buttons a, .nav-buttons button, .nav form button, button, select, input, textarea {
@@ -1233,28 +1291,40 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
             }
             @media (max-width:1000px) {
               .two-col { grid-template-columns:1fr; }
-              .nav { flex-direction:column; align-items:flex-start; }
+              .nav-main { flex-direction:column; align-items:flex-start; }
             }
           </style>
         </head>
         <body>
           <header>
             <div class="nav">
-              <div class="brand">llm-gateway Admin Hub</div>
-              <div class="nav-buttons">
-                <a class="__NAV_DASHBOARD__" href="/internal/admin?tab=dashboard">Dashboard</a>
-                <a class="__NAV_SETTINGS__" href="/internal/admin?tab=settings">Settings</a>
-                <a class="__NAV_CHAT__" href="/internal/admin?tab=chat">Chat</a>
-                <a class="__NAV_MEMORY__" href="/internal/admin?tab=memory">Memory</a>
-                <a class="__NAV_DATABASE__" href="/internal/admin?tab=database">Database</a>
-                <a class="__NAV_HOME_ASSISTANT__" href="/internal/admin?tab=home-assistant">Home Assistant</a>
-                <a class="__NAV_STORAGE__" href="/internal/admin?tab=storage">Storage</a>
-                <a class="__NAV_OPS__" href="/internal/admin?tab=ops">Ops</a>
-                <a class="__NAV_DEVICES__" href="/internal/admin?tab=devices">Pi / Devices</a>
-              </div>
-              <div class="userbox">
-                <span>eingeloggt als __USERNAME__</span>
-                <form method="post" action="/admin/logout"><button type="submit">Logout</button></form>
+              <div class="nav-main">
+                <div class="brand-stack">
+                  <div class="brand">llm-gateway Admin Hub</div>
+                  <div class="header-telemetry">
+                    <div class="telemetry-chip"><span class="chip-label">CPU</span><span id="headerCpuUsageValue" class="chip-value">__HEADER_CPU_USAGE_VALUE__</span></div>
+                    <div class="telemetry-chip"><span class="chip-label">CPU Temp</span><span id="headerCpuTempValue" class="chip-value">__HEADER_CPU_TEMP_VALUE__</span></div>
+                    <div class="telemetry-chip"><span class="chip-label">GPU Use</span><span id="headerGpuUsageValue" class="chip-value">__HEADER_GPU_USAGE_VALUE__</span></div>
+                    <div class="telemetry-chip"><span class="chip-label">GPU Temp</span><span id="headerGpuTempValue" class="chip-value">__HEADER_GPU_TEMP_VALUE__</span></div>
+                    <div class="telemetry-chip"><span class="chip-label">GPU Pwr</span><span id="headerGpuPowerValue" class="chip-value">__HEADER_GPU_POWER_VALUE__</span></div>
+                    <div class="telemetry-chip"><span class="chip-label">VRAM</span><span id="headerGpuVramValue" class="chip-value">__HEADER_GPU_VRAM_VALUE__</span></div>
+                  </div>
+                </div>
+                <div class="nav-buttons">
+                  <a class="__NAV_DASHBOARD__" href="/internal/admin?tab=dashboard">Dashboard</a>
+                  <a class="__NAV_SETTINGS__" href="/internal/admin?tab=settings">Settings</a>
+                  <a class="__NAV_CHAT__" href="/internal/admin?tab=chat">Chat</a>
+                  <a class="__NAV_MEMORY__" href="/internal/admin?tab=memory">Memory</a>
+                  <a class="__NAV_DATABASE__" href="/internal/admin?tab=database">Database</a>
+                  <a class="__NAV_HOME_ASSISTANT__" href="/internal/admin?tab=home-assistant">Home Assistant</a>
+                  <a class="__NAV_STORAGE__" href="/internal/admin?tab=storage">Storage</a>
+                  <a class="__NAV_OPS__" href="/internal/admin?tab=ops">Ops</a>
+                  <a class="__NAV_DEVICES__" href="/internal/admin?tab=devices">Pi / Devices</a>
+                </div>
+                <div class="userbox">
+                  <span>eingeloggt als __USERNAME__</span>
+                  <form method="post" action="/admin/logout"><button type="submit">Logout</button></form>
+                </div>
               </div>
             </div>
           </header>
@@ -1932,6 +2002,51 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               );
             }
 
+            let headerTelemetryLoading = false;
+
+            function updateHeaderTelemetryView(data) {
+              setText("headerCpuUsageValue", data && data.cpu_usage_percent != null ? `${Number(data.cpu_usage_percent).toFixed(1)}%` : "n/a");
+              setText("headerCpuTempValue", data && data.cpu_temp_c != null ? `${Number(data.cpu_temp_c).toFixed(1)} C` : "n/a");
+              setText("headerGpuUsageValue", data && data.gpu_usage_percent != null ? `${Number(data.gpu_usage_percent).toFixed(1)}%` : "n/a");
+              setText("headerGpuTempValue", data && data.temperature_c != null ? `${Number(data.temperature_c).toFixed(1)} C` : "n/a");
+              setText("headerGpuPowerValue", data && data.power_w != null ? `${Number(data.power_w).toFixed(1)} W` : "n/a");
+
+              let vramText = "n/a";
+              if (data && data.vram_used_gib != null && data.vram_total_gib != null) {
+                const percentText = data.vram_percent != null ? `${Number(data.vram_percent).toFixed(1)}%` : "?";
+                vramText = percentText;
+                setText("gpuVramValue", `${Number(data.vram_used_gib).toFixed(1)} / ${Number(data.vram_total_gib).toFixed(1)} GiB (${percentText})`);
+              } else if (data && data.vram_percent != null) {
+                vramText = `${Number(data.vram_percent).toFixed(1)}%`;
+                setText("gpuVramValue", vramText);
+              } else {
+                setText("gpuVramValue", "n/a");
+              }
+              setText("headerGpuVramValue", vramText);
+              setText("gpuTempValue", data && data.temperature_c != null ? `${Number(data.temperature_c).toFixed(1)} C` : "n/a");
+              setText("gpuPowerValue", data && data.power_w != null ? `${Number(data.power_w).toFixed(1)} W` : "n/a");
+            }
+
+            async function loadHeaderTelemetry() {
+              if (headerTelemetryLoading) return;
+              headerTelemetryLoading = true;
+              try {
+                const res = await fetch("/api/admin/system/summary");
+                if (!res.ok) throw new Error(`Systemstatus ${res.status}`);
+                const data = await res.json();
+                updateHeaderTelemetryView(data);
+              } catch (_error) {
+                setText("headerCpuUsageValue", "n/a");
+                setText("headerCpuTempValue", "n/a");
+                setText("headerGpuUsageValue", "n/a");
+                setText("headerGpuTempValue", "n/a");
+                setText("headerGpuPowerValue", "n/a");
+                setText("headerGpuVramValue", "n/a");
+              } finally {
+                headerTelemetryLoading = false;
+              }
+            }
+
             async function loadDashboard() {
               const issues = [];
               try {
@@ -1939,18 +2054,6 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                   fetch("/internal/health"),
                   fetch("/internal/metrics"),
                 ]);
-                let telemetry = null;
-                try {
-                  const telemetryRes = await fetch("/api/admin/ops/kai/run/telemetry");
-                  if (telemetryRes.ok) {
-                    telemetry = await telemetryRes.json();
-                  } else {
-                    issues.push(`Telemetry ${telemetryRes.status}`);
-                  }
-                } catch (_error) {
-                  telemetry = null;
-                  issues.push("Telemetry nicht erreichbar");
-                }
 
                 if (healthResult.status === "fulfilled") {
                   const healthRes = healthResult.value;
@@ -1986,16 +2089,6 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                   }
                 } else {
                   issues.push("Metrics nicht erreichbar");
-                }
-
-                setText("gpuTempValue", telemetry && telemetry.temperature_c != null ? `${telemetry.temperature_c} C` : "n/a");
-                setText("gpuPowerValue", telemetry && telemetry.power_w != null ? `${telemetry.power_w} W` : "n/a");
-                if (telemetry && telemetry.vram_used_gib != null && telemetry.vram_total_gib != null) {
-                  setText("gpuVramValue", `${telemetry.vram_used_gib} / ${telemetry.vram_total_gib} GiB (${valueOr(telemetry.vram_percent, "?")}%)`);
-                } else if (telemetry && telemetry.vram_percent != null) {
-                  setText("gpuVramValue", `${telemetry.vram_percent}%`);
-                } else {
-                  setText("gpuVramValue", "n/a");
                 }
 
                 updateDashboardConfigFacts(window.currentConfig || {});
@@ -2463,6 +2556,8 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
             }
 
             loadDashboard();
+            loadHeaderTelemetry();
+            window.setInterval(loadHeaderTelemetry, 500);
             loadSettings();
             loadMemoryOverview();
             loadDatabaseStatus();
@@ -2507,6 +2602,12 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__GPU_TEMP_VALUE__": escape(initial_data.get("gpu_temp_value", "-")),
         "__GPU_POWER_VALUE__": escape(initial_data.get("gpu_power_value", "-")),
         "__GPU_VRAM_VALUE__": escape(initial_data.get("gpu_vram_value", "-")),
+        "__HEADER_CPU_USAGE_VALUE__": escape(initial_data.get("header_cpu_usage_value", "-")),
+        "__HEADER_CPU_TEMP_VALUE__": escape(initial_data.get("header_cpu_temp_value", "-")),
+        "__HEADER_GPU_USAGE_VALUE__": escape(initial_data.get("header_gpu_usage_value", "-")),
+        "__HEADER_GPU_TEMP_VALUE__": escape(initial_data.get("header_gpu_temp_value", "-")),
+        "__HEADER_GPU_POWER_VALUE__": escape(initial_data.get("header_gpu_power_value", "-")),
+        "__HEADER_GPU_VRAM_VALUE__": escape(initial_data.get("header_gpu_vram_value", "-")),
         "__DASHBOARD_PUBLIC_MODEL__": escape(initial_data.get("dashboard_public_model", "-")),
         "__DASHBOARD_BACKEND_MODEL__": escape(initial_data.get("dashboard_backend_model", "-")),
         "__DASHBOARD_BACKEND_PROFILE__": escape(initial_data.get("dashboard_backend_profile", "-")),
