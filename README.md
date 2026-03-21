@@ -824,6 +824,24 @@ curl -s http://127.0.0.1:8000/api/device/ask \
   }'
 ```
 
+Neu im Admin-Hub unter `Pi / Devices`:
+
+- gespeicherte Pi-/Device-Profile
+- eigener Device-Token pro Profil
+- SSH-Ziel fuer den Pi
+- serverseitig generiertes Bootstrap-Skript
+- SSH-Bootstrap-V1 direkt aus dem Admin-Hub
+
+Wichtige praktische Entscheidung:
+
+- V1 setzt auf SSH-Key-Auth statt gespeicherter SSH-Passwoerter
+- beim Aktivieren eines Device-Profils wird dessen Token als `DEVICE_SHARED_TOKEN` in den Gateway uebernommen
+- der Bootstrap legt auf dem Pi eine kleine Python-Basis an:
+  - `.env`
+  - `requirements.txt`
+  - `pi_gateway_client.py`
+- damit ist der Pi noch nicht der volle Sprach-/Avatar-Stack, aber sauber fuer die naechste Ausbaustufe vorbereitet
+
 ## llama.cpp Startbefehl
 
 Fuer dein aktuelles Ein-Modell-Setup ist der pragmatische Weg:

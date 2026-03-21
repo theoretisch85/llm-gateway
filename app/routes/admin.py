@@ -42,6 +42,15 @@ from app.services.database_profiles import (
     list_database_profiles,
     save_database_profile,
 )
+from app.services.device_bootstrap import build_device_bootstrap_script, run_device_bootstrap_over_ssh
+from app.services.device_profiles import (
+    activate_device_profile,
+    delete_device_profile,
+    get_active_device_profile,
+    get_device_profile,
+    list_device_profiles,
+    save_device_profile,
+)
 from app.services.llamacpp_client import LlamaCppClient, LlamaCppError, LlamaCppTimeoutError
 from app.services.session_memory import get_session_store
 from app.services.storage_library import (
@@ -63,7 +72,7 @@ async def admin_page(request: Request, tab: str = "dashboard") -> HTMLResponse |
     if not username:
         return RedirectResponse(url="/admin/login?next=/internal/admin", status_code=303)
     active_tab = tab if tab in {"dashboard", "settings", "chat", "memory", "database", "home-assistant", "storage", "ops", "devices"} else "dashboard"
-    initial_data = await _build_initial_admin_data()
+    initial_data = await _build_initial_admin_data(base_url=str(request.base_url).rstrip("/"))
     db_message = request.query_params.get("db_message")
     if db_message:
         initial_data["database_status"] = db_message
@@ -94,6 +103,27 @@ async def admin_page(request: Request, tab: str = "dashboard") -> HTMLResponse |
     storage_message = request.query_params.get("storage_message")
     if storage_message:
         initial_data["storage_status"] = storage_message
+    device_message = request.query_params.get("device_message")
+    if device_message:
+        initial_data["device_status"] = device_message
+    edit_device_id = request.query_params.get("edit_device")
+    if active_tab == "devices" and edit_device_id:
+        try:
+            profile = get_device_profile(edit_device_id)
+            initial_data["device_profile_form_id"] = str(profile.get("id") or "")
+            initial_data["device_profile_form_name"] = str(profile.get("name") or "")
+            initial_data["device_profile_form_gateway_base_url"] = str(profile.get("gateway_base_url") or "")
+            initial_data["device_profile_form_device_token"] = str(profile.get("device_token") or "")
+            initial_data["device_profile_form_ssh_host"] = str(profile.get("ssh_host") or "")
+            initial_data["device_profile_form_ssh_user"] = str(profile.get("ssh_user") or "")
+            initial_data["device_profile_form_ssh_port"] = str(profile.get("ssh_port") or "22")
+            initial_data["device_profile_form_remote_dir"] = str(profile.get("remote_dir") or "~/kai-pi")
+            initial_data["device_profile_form_ssh_root_prefix"] = str(profile.get("ssh_root_prefix") or "sudo -n")
+            initial_data["device_profile_form_notes"] = str(profile.get("notes") or "")
+            initial_data["device_bootstrap_preview"] = build_device_bootstrap_script(profile)
+            initial_data["device_status"] = f"Device-Profil '{profile.get('name')}' zum Bearbeiten geladen."
+        except Exception as exc:
+            initial_data["device_status"] = str(exc)
     return HTMLResponse(
         _admin_html(username=username, active_tab=active_tab, initial_data=initial_data),
         headers={"Cache-Control": "no-store, max-age=0"},
@@ -497,6 +527,81 @@ async def upload_storage_document_form(
         return _storage_redirect(str(exc), error=True)
 
 
+@router.post("/internal/admin/device/save-form")
+async def save_device_form(
+    request: Request,
+    DEVICE_PROFILE_ID: str = Form(default=""),
+    DEVICE_PROFILE_NAME: str = Form(default=""),
+    DEVICE_GATEWAY_BASE_URL: str = Form(default=""),
+    DEVICE_TOKEN: str = Form(default=""),
+    PI_SSH_HOST: str = Form(default=""),
+    PI_SSH_USER: str = Form(default=""),
+    PI_SSH_PORT: str = Form(default="22"),
+    PI_REMOTE_DIR: str = Form(default="~/kai-pi"),
+    PI_SSH_ROOT_PREFIX: str = Form(default="sudo -n"),
+    DEVICE_NOTES: str = Form(default=""),
+) -> RedirectResponse:
+    if not get_admin_session_username(request):
+        return RedirectResponse(url="/admin/login?next=/internal/admin%3Ftab%3Ddevices", status_code=303)
+    try:
+        profile = save_device_profile(
+            profile_id=DEVICE_PROFILE_ID or None,
+            name=DEVICE_PROFILE_NAME,
+            gateway_base_url=DEVICE_GATEWAY_BASE_URL,
+            device_token=DEVICE_TOKEN,
+            ssh_host=PI_SSH_HOST,
+            ssh_user=PI_SSH_USER,
+            ssh_port=PI_SSH_PORT,
+            remote_dir=PI_REMOTE_DIR,
+            ssh_root_prefix=PI_SSH_ROOT_PREFIX,
+            notes=DEVICE_NOTES,
+            make_active=False,
+        )
+        return _device_redirect(f"Device-Profil '{profile['name']}' gespeichert.", error=False)
+    except Exception as exc:
+        return _device_redirect(str(exc), error=True)
+
+
+@router.post("/internal/admin/device/activate-form")
+async def activate_device_form(request: Request, profile_id: str = Form(...)) -> RedirectResponse:
+    if not get_admin_session_username(request):
+        return RedirectResponse(url="/admin/login?next=/internal/admin%3Ftab%3Ddevices", status_code=303)
+    try:
+        profile = activate_device_profile(profile_id)
+        write_runtime_config({"DEVICE_SHARED_TOKEN": str(profile.get("device_token") or "")})
+        return _device_redirect(f"Device-Profil '{profile['name']}' aktiviert und Device-Token uebernommen.", error=False)
+    except Exception as exc:
+        return _device_redirect(str(exc), error=True)
+
+
+@router.post("/internal/admin/device/bootstrap-form")
+async def bootstrap_device_form(request: Request, profile_id: str = Form(...)) -> RedirectResponse:
+    if not get_admin_session_username(request):
+        return RedirectResponse(url="/admin/login?next=/internal/admin%3Ftab%3Ddevices", status_code=303)
+    try:
+        profile = get_device_profile(profile_id)
+        write_runtime_config({"DEVICE_SHARED_TOKEN": str(profile.get("device_token") or "")})
+        run_device_bootstrap_over_ssh(profile)
+        activate_device_profile(profile_id)
+        return _device_redirect(f"Pi-Bootstrap fuer '{profile['name']}' erfolgreich ueber SSH ausgefuehrt.", error=False)
+    except Exception as exc:
+        return _device_redirect(str(exc), error=True)
+
+
+@router.post("/internal/admin/device/delete-form")
+async def delete_device_form(request: Request, profile_id: str = Form(...)) -> RedirectResponse:
+    if not get_admin_session_username(request):
+        return RedirectResponse(url="/admin/login?next=/internal/admin%3Ftab%3Ddevices", status_code=303)
+    try:
+        result = delete_device_profile(profile_id)
+        if result.get("deleted_was_active"):
+            write_runtime_config({"DEVICE_SHARED_TOKEN": ""})
+            return _device_redirect("Aktives Device-Profil geloescht. Device-Token im Gateway wurde geleert.", error=False)
+        return _device_redirect("Device-Profil geloescht.", error=False)
+    except Exception as exc:
+        return _device_redirect(str(exc), error=True)
+
+
 def _database_redirect(message: str, error: bool) -> RedirectResponse:
     query = {"tab": "database", "db_message": message}
     if error:
@@ -515,6 +620,13 @@ def _storage_redirect(message: str, error: bool) -> RedirectResponse:
     query = {"tab": "storage", "storage_message": message}
     if error:
         query["storage_error"] = "1"
+    return RedirectResponse(url=f"/internal/admin?{urlencode(query)}", status_code=303)
+
+
+def _device_redirect(message: str, error: bool) -> RedirectResponse:
+    query = {"tab": "devices", "device_message": message}
+    if error:
+        query["device_error"] = "1"
     return RedirectResponse(url=f"/internal/admin?{urlencode(query)}", status_code=303)
 
 
@@ -564,7 +676,7 @@ async def ops_run(request: Request, target: str, command_name: str) -> JSONRespo
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-async def _build_initial_admin_data() -> dict[str, str]:
+async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
     settings = get_settings()
     config_values = _build_admin_config_values(settings)
     data = {
@@ -628,6 +740,20 @@ async def _build_initial_admin_data() -> dict[str, str]:
         "ha_configured": "-",
         "ha_connected": "-",
         "ha_location": "-",
+        "device_status": "Pi-/Device-Profilverwaltung ist bereit.",
+        "device_profiles_html": '<div class="muted">Noch keine Device-Profile gespeichert.</div>',
+        "device_profile_form_id": "",
+        "device_profile_form_name": "",
+        "device_profile_form_gateway_base_url": base_url or "http://127.0.0.1:8000",
+        "device_profile_form_device_token": settings.device_shared_token or "",
+        "device_profile_form_ssh_host": "",
+        "device_profile_form_ssh_user": "pi",
+        "device_profile_form_ssh_port": "22",
+        "device_profile_form_remote_dir": "~/kai-pi",
+        "device_profile_form_ssh_root_prefix": "sudo -n",
+        "device_profile_form_notes": "",
+        "device_active_token_redacted": _redact_device_token(settings.device_shared_token or ""),
+        "device_bootstrap_preview": "Noch kein Device-Profil ausgewaehlt.",
         "backend_profiles_html": '<div class="muted">Noch keine KI-Profile gespeichert.</div>',
         "backend_profile_form_id": "",
         "backend_profile_form_name": "",
@@ -664,6 +790,22 @@ async def _build_initial_admin_data() -> dict[str, str]:
         data["backend_profile_form_logs_command"] = str(active_backend_profile.get("logs_command") or "")
         data["backend_profile_preview"] = _render_backend_profile_preview(active_backend_profile)
     data["backend_profiles_html"] = _render_backend_profiles_html(list_backend_profiles())
+
+    active_device_profile = get_active_device_profile()
+    if active_device_profile:
+        data["device_profile_form_id"] = str(active_device_profile.get("id") or "")
+        data["device_profile_form_name"] = str(active_device_profile.get("name") or "")
+        data["device_profile_form_gateway_base_url"] = str(active_device_profile.get("gateway_base_url") or data["device_profile_form_gateway_base_url"])
+        data["device_profile_form_device_token"] = str(active_device_profile.get("device_token") or "")
+        data["device_profile_form_ssh_host"] = str(active_device_profile.get("ssh_host") or "")
+        data["device_profile_form_ssh_user"] = str(active_device_profile.get("ssh_user") or "pi")
+        data["device_profile_form_ssh_port"] = str(active_device_profile.get("ssh_port") or "22")
+        data["device_profile_form_remote_dir"] = str(active_device_profile.get("remote_dir") or "~/kai-pi")
+        data["device_profile_form_ssh_root_prefix"] = str(active_device_profile.get("ssh_root_prefix") or "sudo -n")
+        data["device_profile_form_notes"] = str(active_device_profile.get("notes") or "")
+        data["device_active_token_redacted"] = _redact_device_token(str(active_device_profile.get("device_token") or settings.device_shared_token or ""))
+        data["device_bootstrap_preview"] = build_device_bootstrap_script(active_device_profile)
+    data["device_profiles_html"] = _render_device_profiles_html(list_device_profiles())
 
     client = LlamaCppClient(settings)
     try:
@@ -1022,6 +1164,70 @@ def _render_storage_profile_options_html(profiles: list[dict[str, object]]) -> s
             label = f"{label} (aktiv)"
         options.append(f'<option value="{profile_id}">{label}</option>')
     return "".join(options)
+
+
+def _redact_device_token(token: str) -> str:
+    clean_token = (token or "").strip()
+    if not clean_token:
+        return "-"
+    if len(clean_token) <= 8:
+        return "*" * len(clean_token)
+    return f"{clean_token[:4]}***{clean_token[-4:]}"
+
+
+def _render_device_profiles_html(profiles: list[dict[str, object]]) -> str:
+    if not profiles:
+        return '<div class="muted">Noch keine Device-Profile gespeichert.</div>'
+
+    items: list[str] = []
+    for profile in profiles:
+        profile_id = escape(str(profile.get("id") or ""))
+        name = escape(str(profile.get("name") or "Pi Device"))
+        gateway_base_url = escape(str(profile.get("gateway_base_url") or "-"))
+        ssh_host = escape(str(profile.get("ssh_host") or "-"))
+        ssh_user = escape(str(profile.get("ssh_user") or "-"))
+        ssh_port = escape(str(profile.get("ssh_port") or "22"))
+        remote_dir = escape(str(profile.get("remote_dir") or "~/kai-pi"))
+        token_redacted = escape(str(profile.get("device_token_redacted") or "-"))
+        badge = '<span class="status" style="display:inline-block;padding:4px 8px;margin:0 0 0 8px;">aktiv</span>' if profile.get("is_active") else ""
+        actions = []
+        if not profile.get("is_active"):
+            actions.append(
+                f"""
+                <form method="post" action="/internal/admin/device/activate-form">
+                  <input type="hidden" name="profile_id" value="{profile_id}">
+                  <button class="secondary" type="submit">Aktivieren</button>
+                </form>
+                """
+            )
+        actions.append(f'<a class="secondary" href="/internal/admin?tab=devices&edit_device={profile_id}">Bearbeiten</a>')
+        actions.append(
+            f"""
+            <form method="post" action="/internal/admin/device/bootstrap-form" onsubmit="return confirm('Pi-Bootstrap fuer dieses Profil jetzt ueber SSH starten?');">
+              <input type="hidden" name="profile_id" value="{profile_id}">
+              <button class="secondary" type="submit">Bootstrap</button>
+            </form>
+            """
+        )
+        actions.append(
+            f"""
+            <form method="post" action="/internal/admin/device/delete-form" onsubmit="return confirm('Device-Profil wirklich loeschen?');">
+              <input type="hidden" name="profile_id" value="{profile_id}">
+              <button class="secondary" type="submit">Loeschen</button>
+            </form>
+            """
+        )
+        items.append(
+            f"""
+            <div class="list-card">
+              <h3>{name}{badge}</h3>
+              <div class="list-meta">Gateway: <code>{gateway_base_url}</code> | Token: <code>{token_redacted}</code></div>
+              <div class="list-meta">SSH: <code>{ssh_user}@{ssh_host}:{ssh_port}</code> | Ziel: <code>{remote_dir}</code></div>
+              <div class="actions">{''.join(actions)}</div>
+            </div>
+            """
+        )
+    return "".join(items)
 
 
 def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) -> str:
@@ -1861,13 +2067,40 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
 
             <section id="devices" class="panel __PANEL_DEVICES__">
               <div class="hero">
-                <h1>Pi / Device Vorbereitung</h1>
-                <p>Der Raspberry Pi soll spaeter lokal TTS/STT machen und den Gateway nur fuer Chat, Routing und Session-Memory ansprechen.</p>
+                <h1>Pi / Devices</h1>
+                <p>Hier verwaltest du Pi-Profile, Device-Tokens und eine erste SSH-Bootstrap-Strecke. V1 ist bewusst keybasiert und setzt nicht auf gespeicherte SSH-Passwoerter.</p>
+                <div id="deviceStatus" class="status">__DEVICE_STATUS__</div>
               </div>
               <div class="two-col">
                 <div class="card">
-                  <h2>Device API</h2>
-                  <p class="muted">Der vorbereitete Pfad ist <code>/api/device/ask</code>. Das ist die Grundlage fuer einen Pi-Client mit Mikrofon, Lautsprecher und lokalem TTS.</p>
+                  <h2>Pi-Profil und Bootstrap</h2>
+                  <form method="post" action="/internal/admin/device/save-form">
+                    <input type="hidden" name="DEVICE_PROFILE_ID" value="__DEVICE_PROFILE_FORM_ID__">
+                    <div class="grid">
+                      <label><span>DEVICE_PROFILE_NAME</span><input name="DEVICE_PROFILE_NAME" value="__DEVICE_PROFILE_FORM_NAME__" placeholder="z. B. kai-pi-wohnzimmer"></label>
+                      <label><span>DEVICE_GATEWAY_BASE_URL</span><input name="DEVICE_GATEWAY_BASE_URL" value="__DEVICE_PROFILE_FORM_GATEWAY_BASE_URL__" placeholder="http://gateway:8000"></label>
+                      <label><span>DEVICE_TOKEN</span><input name="DEVICE_TOKEN" value="__DEVICE_PROFILE_FORM_DEVICE_TOKEN__" placeholder="eigener Pi-Token"></label>
+                      <label><span>PI_SSH_HOST</span><input name="PI_SSH_HOST" value="__DEVICE_PROFILE_FORM_SSH_HOST__" placeholder="192.168.x.x"></label>
+                      <label><span>PI_SSH_USER</span><input name="PI_SSH_USER" value="__DEVICE_PROFILE_FORM_SSH_USER__" placeholder="pi"></label>
+                      <label><span>PI_SSH_PORT</span><input name="PI_SSH_PORT" value="__DEVICE_PROFILE_FORM_SSH_PORT__" placeholder="22"></label>
+                      <label><span>PI_REMOTE_DIR</span><input name="PI_REMOTE_DIR" value="__DEVICE_PROFILE_FORM_REMOTE_DIR__" placeholder="~/kai-pi"></label>
+                      <label><span>PI_SSH_ROOT_PREFIX</span><input name="PI_SSH_ROOT_PREFIX" value="__DEVICE_PROFILE_FORM_SSH_ROOT_PREFIX__" placeholder="sudo -n"></label>
+                      <label style="grid-column:1/-1;"><span>DEVICE_NOTES</span><input name="DEVICE_NOTES" value="__DEVICE_PROFILE_FORM_NOTES__" placeholder="z. B. Pi 5 mit 800x640 Display im Wohnzimmer"></label>
+                    </div>
+                    <div class="actions">
+                      <button class="primary" type="submit">Device-Profil speichern</button>
+                    </div>
+                  </form>
+                  <div class="list-stack" style="margin-top:16px;">
+                    <div class="list-card">
+                      <h3>Aktiver Device-Token</h3>
+                      <div class="list-meta"><code>__DEVICE_ACTIVE_TOKEN_REDACTED__</code></div>
+                    </div>
+                    <div class="list-card">
+                      <h3>Device API</h3>
+                      <div class="list-meta">Der vorbereitete Pfad ist <code>/api/device/ask</code>. Ein aktiviertes Device-Profil uebernimmt den Device-Token direkt in den Gateway.</div>
+                    </div>
+                  </div>
                   <label style="margin-top:12px;">
                     <span>Beispiel-Request</span>
                     <textarea readonly>curl -s http://GATEWAY:8000/api/device/ask \
@@ -1877,14 +2110,10 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                   </label>
                 </div>
                 <div class="card">
-                  <h2>Naechste sinnvolle Schritte</h2>
-                  <ul>
-                    <li>echtes Browser-Login statt Token-Eingabefeld</li>
-                    <li>Pi mit eigenem Device-Token</li>
-                    <li>Upload fuer Text und PDF</li>
-                    <li>spaeter ein kleines Voice-Frontend auf dem Pi</li>
-                    <li>persistentes Memory ueber PostgreSQL</li>
-                  </ul>
+                  <h2>Gespeicherte Pi-Profile</h2>
+                  <div class="list-stack">__DEVICE_PROFILES_HTML__</div>
+                  <label style="margin-top:14px;"><span>Bootstrap-Skript</span><textarea readonly>__DEVICE_BOOTSTRAP_PREVIEW__</textarea></label>
+                  <p class="muted" style="margin-top:12px;">Die Bootstrap-V1 nutzt bewusst SSH-Key-Auth. Sie installiert eine kleine Python-Basis auf dem Pi, legt `.env`, `requirements.txt` und einen ersten `pi_gateway_client.py` an und bereitet damit den Weg fuer den spaeteren Voice-/Avatar-Stack.</p>
                 </div>
               </div>
             </section>
@@ -2657,6 +2886,20 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__STORAGE_PROFILES_HTML__": initial_data.get("storage_profiles_html", ""),
         "__STORAGE_DOCUMENTS_HTML__": initial_data.get("storage_documents_html", ""),
         "__STORAGE_UPLOAD_OPTIONS_HTML__": initial_data.get("storage_upload_options_html", '<option value="">aktives Profil verwenden</option>'),
+        "__DEVICE_STATUS__": escape(initial_data.get("device_status", "-")),
+        "__DEVICE_PROFILES_HTML__": initial_data.get("device_profiles_html", ""),
+        "__DEVICE_PROFILE_FORM_ID__": escape(initial_data.get("device_profile_form_id", "")),
+        "__DEVICE_PROFILE_FORM_NAME__": escape(initial_data.get("device_profile_form_name", "")),
+        "__DEVICE_PROFILE_FORM_GATEWAY_BASE_URL__": escape(initial_data.get("device_profile_form_gateway_base_url", "")),
+        "__DEVICE_PROFILE_FORM_DEVICE_TOKEN__": escape(initial_data.get("device_profile_form_device_token", "")),
+        "__DEVICE_PROFILE_FORM_SSH_HOST__": escape(initial_data.get("device_profile_form_ssh_host", "")),
+        "__DEVICE_PROFILE_FORM_SSH_USER__": escape(initial_data.get("device_profile_form_ssh_user", "")),
+        "__DEVICE_PROFILE_FORM_SSH_PORT__": escape(initial_data.get("device_profile_form_ssh_port", "22")),
+        "__DEVICE_PROFILE_FORM_REMOTE_DIR__": escape(initial_data.get("device_profile_form_remote_dir", "~/kai-pi")),
+        "__DEVICE_PROFILE_FORM_SSH_ROOT_PREFIX__": escape(initial_data.get("device_profile_form_ssh_root_prefix", "sudo -n")),
+        "__DEVICE_PROFILE_FORM_NOTES__": escape(initial_data.get("device_profile_form_notes", "")),
+        "__DEVICE_ACTIVE_TOKEN_REDACTED__": escape(initial_data.get("device_active_token_redacted", "-")),
+        "__DEVICE_BOOTSTRAP_PREVIEW__": escape(initial_data.get("device_bootstrap_preview", "Noch kein Device-Profil ausgewaehlt.")),
         "__HA_STATUS__": escape(initial_data.get("ha_status", "-")),
         "__HA_CONFIGURED__": escape(initial_data.get("ha_configured", "-")),
         "__HA_CONNECTED__": escape(initial_data.get("ha_connected", "-")),
