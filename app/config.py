@@ -82,6 +82,13 @@ class Settings(BaseSettings):
         default="light.,switch.,climate.,script.",
         alias="HOME_ASSISTANT_ALLOWED_ENTITY_PREFIXES",
     )
+    vision_base_url: str | None = Field(default=None, alias="VISION_BASE_URL")
+    vision_model_name: str | None = Field(default=None, alias="VISION_MODEL_NAME")
+    vision_prompt: str = Field(
+        default="Beschreibe das Bild knapp und technisch brauchbar auf Deutsch. Nenne sichtbare Personen, Objekte, Text im Bild und auffaellige Ereignisse.",
+        alias="VISION_PROMPT",
+    )
+    vision_max_tokens: int = Field(default=256, alias="VISION_MAX_TOKENS")
     mi50_ssh_host: str | None = Field(default=None, alias="MI50_SSH_HOST")
     mi50_ssh_user: str | None = Field(default=None, alias="MI50_SSH_USER")
     mi50_ssh_port: int = Field(default=22, alias="MI50_SSH_PORT")
@@ -141,6 +148,10 @@ class Settings(BaseSettings):
 
     def chat_completions_url_for(self, base_url: str) -> str:
         return f"{base_url.rstrip('/')}/v1/chat/completions"
+
+    @property
+    def effective_vision_base_url(self) -> str:
+        return (self.vision_base_url or self.llamacpp_base_url).rstrip("/")
 
     def resolve_target_for_public_model(self, model_name: str) -> ModelTarget:
         for target in self.listed_models:

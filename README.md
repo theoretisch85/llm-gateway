@@ -831,16 +831,51 @@ Neu im Admin-Hub unter `Pi / Devices`:
 - SSH-Ziel fuer den Pi
 - serverseitig generiertes Bootstrap-Skript
 - SSH-Bootstrap-V1 direkt aus dem Admin-Hub
+- expliziter Button `PI installieren` pro Profil (fuer rohe Pi-Installationen)
+- direkter Connect-Flow `Verbinden / .env sync` fuer bestehende Kai-Pis
+- neue zentrale `Kai Face`-Steuerung (Style + State + Layer) direkt aus dem Gateway
+- in der Face-Steuerung jetzt auch `Render Mode` (`vector` oder `sprite_pack`) plus Pack-Name
+- `F1..F17`-Varianten direkt im Gateway waehlbar (nahe am Referenz-Set)
+- fuer fertige Kai-Pis reicht auch ein einfaches Profil mit Host, User, Port und optional Passwort
+- wenn `DEVICE_TOKEN` leer bleibt, wird beim Speichern automatisch ein neuer Token erzeugt
 
 Wichtige praktische Entscheidung:
 
-- V1 setzt auf SSH-Key-Auth statt gespeicherter SSH-Passwoerter
+- V1 bevorzugt SSH-Key-Auth, kann fuer einfache Pi-Setups aber auch SSH-Passwoerter nutzen
 - beim Aktivieren eines Device-Profils wird dessen Token als `DEVICE_SHARED_TOKEN` in den Gateway uebernommen
+- `PI installieren` startet denselben SSH-Install-Flow direkt pro Profil und ist fuer frische Pi-Basisimages gedacht
+- der Connect-Flow schreibt `GATEWAY_BASE_URL` und `DEVICE_TOKEN` direkt in die Pi-`.env` und startet `kai.service` neu
+- Face-Styles koennen jetzt via Gateway ueber SSH direkt auf dem Pi angewendet werden (kein Pi-Menue notwendig)
+- eigene Sprite-Packs koennen auf dem Pi unter `/home/pi/kai/styles/packs/<name>` abgelegt und danach im Gateway aktiviert werden
+- bei der Pi-Probe erkennt der Gateway jetzt sowohl `kai.service` als User-Service als auch als System-Service
 - der Bootstrap legt auf dem Pi eine kleine Python-Basis an:
   - `.env`
   - `requirements.txt`
   - `pi_gateway_client.py`
 - damit ist der Pi noch nicht der volle Sprach-/Avatar-Stack, aber sauber fuer die naechste Ausbaustufe vorbereitet
+
+Fuer spaetere Kamera-/Snapshot-Events gibt es jetzt zusaetzlich:
+
+- `POST /api/device/vision/event`
+
+Gedacht fuer:
+
+- Pi-Webcam oder externe Kamera-Node
+- Snapshot bei Trigger wie `person_detected`
+- Bild landet im Storage
+- wenn `VISION_MODEL_NAME` gesetzt ist, wird direkt eine Bildanalyse erzeugt
+- optional kann zusammen mit dem Bild auch gleich eine Sprach-/Chat-Anfrage an Kai geschickt werden
+
+Beispiel:
+
+```bash
+curl -s http://127.0.0.1:8000/api/device/vision/event \
+  -H "Authorization: Bearer DEVICE_TOKEN" \
+  -F "CAMERA_NAME=pi-cam" \
+  -F "TRIGGER_TYPE=person_detected" \
+  -F "MESSAGE=Wer oder was ist auf diesem Bild und wie soll ich darauf reagieren?" \
+  -F "IMAGE_FILE=@/pfad/zum/snapshot.jpg"
+```
 
 ## MCP (Tool-Broker)
 
@@ -878,6 +913,23 @@ Hinweis:
 
 - Die MCP-V1 ist absichtlich klein gehalten.
 - Schreiben/Schalten laeuft nur ueber freigegebene HA-Services.
+
+## Vision / Bildanalyse
+
+Fuer Bild-Uploads im Chat, Snapshot-Events vom Pi und spaetere Kamera-Nodes kann der Gateway optional ein eigenes Vision-Modell benutzen.
+
+Relevante Settings:
+
+- `VISION_BASE_URL`
+- `VISION_MODEL_NAME`
+- `VISION_PROMPT`
+- `VISION_MAX_TOKENS`
+
+Wichtige praktische Entscheidung:
+
+- Devstral bleibt dein Text-/Steuerungsmodell.
+- Bildverstehen sollte ueber ein separates Vision-Modell laufen.
+- Wenn kein Vision-Modell gesetzt ist, werden Bilddateien trotzdem gespeichert, aber nur ohne echte Bildbeschreibung.
 
 ## llama.cpp Startbefehl
 

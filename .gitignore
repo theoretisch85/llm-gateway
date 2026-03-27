@@ -10,3 +10,4 @@ deploy/continue.config.local.yaml
 .vscode/
 .idea/
 .runtime/
+.tmp/

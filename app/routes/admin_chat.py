@@ -747,7 +747,9 @@ async def _load_document_context_blocks(settings, document_ids: list[str]) -> li
         if len(content) > 5000:
             content = content[:5000] + "..."
         title = item.get("title") or item.get("file_name") or "Dokument"
-        blocks.append(f"Dokument-Kontext: {title}\n{content}")
+        asset_kind = str(item.get("asset_kind") or "document")
+        label = "Bild-Kontext" if asset_kind == "image" else "Dokument-Kontext"
+        blocks.append(f"{label}: {title}\n{content}")
     return blocks
 
 
@@ -2494,8 +2496,8 @@ def _admin_chat_html() -> str:
                   <div class="upload-box">
                     <div class="stat-label">Datei direkt in den Chat laden</div>
                     <div class="upload-grid">
-                      <input id="uploadTitle" type="text" placeholder="optional Titel fuer Text/PDF" />
-                      <input id="uploadFile" type="file" accept=".txt,.md,.markdown,.log,.csv,.json,.yaml,.yml,.pdf" />
+                      <input id="uploadTitle" type="text" placeholder="optional Titel fuer Text/PDF/Bild" />
+                      <input id="uploadFile" type="file" accept=".txt,.md,.markdown,.log,.csv,.json,.yaml,.yml,.pdf,.jpg,.jpeg,.png,.webp,.gif,image/*" />
                       <button id="uploadButton" type="button" class="secondary" onclick="uploadDocument()">Upload</button>
                     </div>
                     <div id="uploadHint" class="hint">Der Upload nutzt das aktive Storage-Profil.</div>

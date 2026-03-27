@@ -42,7 +42,14 @@ from app.services.database_profiles import (
     list_database_profiles,
     save_database_profile,
 )
-from app.services.device_bootstrap import build_device_bootstrap_script, run_device_bootstrap_over_ssh
+from app.services.device_bootstrap import (
+    build_device_install_script,
+    run_device_bootstrap_over_ssh,
+    run_device_env_sync_over_ssh,
+    run_device_face_apply_over_ssh,
+    run_device_install_over_ssh,
+    run_device_probe_over_ssh,
+)
 from app.services.device_profiles import (
     activate_device_profile,
     delete_device_profile,
@@ -117,10 +124,11 @@ async def admin_page(request: Request, tab: str = "dashboard") -> HTMLResponse |
             initial_data["device_profile_form_ssh_host"] = str(profile.get("ssh_host") or "")
             initial_data["device_profile_form_ssh_user"] = str(profile.get("ssh_user") or "")
             initial_data["device_profile_form_ssh_port"] = str(profile.get("ssh_port") or "22")
+            initial_data["device_profile_form_ssh_password"] = ""
             initial_data["device_profile_form_remote_dir"] = str(profile.get("remote_dir") or "~/kai-pi")
             initial_data["device_profile_form_ssh_root_prefix"] = str(profile.get("ssh_root_prefix") or "sudo -n")
             initial_data["device_profile_form_notes"] = str(profile.get("notes") or "")
-            initial_data["device_bootstrap_preview"] = build_device_bootstrap_script(profile)
+            initial_data["device_bootstrap_preview"] = build_device_install_script(profile)
             initial_data["device_status"] = f"Device-Profil '{profile.get('name')}' zum Bearbeiten geladen."
         except Exception as exc:
             initial_data["device_status"] = str(exc)
@@ -168,6 +176,10 @@ def _build_admin_config_values(settings) -> dict[str, str]:
     current.setdefault("HOME_ASSISTANT_TIMEOUT_SECONDS", str(settings.home_assistant_timeout_seconds))
     current.setdefault("HOME_ASSISTANT_ALLOWED_SERVICES", settings.home_assistant_allowed_services)
     current.setdefault("HOME_ASSISTANT_ALLOWED_ENTITY_PREFIXES", settings.home_assistant_allowed_entity_prefixes)
+    current.setdefault("VISION_BASE_URL", settings.vision_base_url or "")
+    current.setdefault("VISION_MODEL_NAME", settings.vision_model_name or "")
+    current.setdefault("VISION_PROMPT", settings.vision_prompt)
+    current.setdefault("VISION_MAX_TOKENS", str(settings.vision_max_tokens))
     current.setdefault("MI50_SSH_HOST", settings.mi50_ssh_host or "")
     current.setdefault("MI50_SSH_USER", settings.mi50_ssh_user or "")
     current.setdefault("MI50_SSH_PORT", str(settings.mi50_ssh_port))
@@ -537,6 +549,7 @@ async def save_device_form(
     PI_SSH_HOST: str = Form(default=""),
     PI_SSH_USER: str = Form(default=""),
     PI_SSH_PORT: str = Form(default="22"),
+    PI_SSH_PASSWORD: str = Form(default=""),
     PI_REMOTE_DIR: str = Form(default="~/kai-pi"),
     PI_SSH_ROOT_PREFIX: str = Form(default="sudo -n"),
     DEVICE_NOTES: str = Form(default=""),
@@ -552,6 +565,7 @@ async def save_device_form(
             ssh_host=PI_SSH_HOST,
             ssh_user=PI_SSH_USER,
             ssh_port=PI_SSH_PORT,
+            ssh_password=PI_SSH_PASSWORD,
             remote_dir=PI_REMOTE_DIR,
             ssh_root_prefix=PI_SSH_ROOT_PREFIX,
             notes=DEVICE_NOTES,
@@ -584,6 +598,136 @@ async def bootstrap_device_form(request: Request, profile_id: str = Form(...)) -
         run_device_bootstrap_over_ssh(profile)
         activate_device_profile(profile_id)
         return _device_redirect(f"Pi-Bootstrap fuer '{profile['name']}' erfolgreich ueber SSH ausgefuehrt.", error=False)
+    except Exception as exc:
+        return _device_redirect(str(exc), error=True)
+
+
+@router.post("/internal/admin/device/install-form")
+async def install_device_form(request: Request, profile_id: str = Form(...)) -> RedirectResponse:
+    if not get_admin_session_username(request):
+        return RedirectResponse(url="/admin/login?next=/internal/admin%3Ftab%3Ddevices", status_code=303)
+    try:
+        profile = get_device_profile(profile_id)
+        write_runtime_config({"DEVICE_SHARED_TOKEN": str(profile.get("device_token") or "")})
+        result = run_device_install_over_ssh(profile)
+        activate_device_profile(profile_id)
+        output = str(result.get("output") or "").strip()
+        compact = " | ".join(line.strip() for line in output.splitlines() if line.strip())
+        return _device_redirect(f"Pi-Installation fuer '{profile['name']}' erfolgreich: {compact or 'ok'}", error=False)
+    except Exception as exc:
+        return _device_redirect(str(exc), error=True)
+
+
+@router.post("/internal/admin/device/connect-form")
+async def connect_device_form(request: Request, profile_id: str = Form(...)) -> RedirectResponse:
+    if not get_admin_session_username(request):
+        return RedirectResponse(url="/admin/login?next=/internal/admin%3Ftab%3Ddevices", status_code=303)
+    try:
+        profile = get_device_profile(profile_id)
+        write_runtime_config({"DEVICE_SHARED_TOKEN": str(profile.get("device_token") or "")})
+        result = run_device_env_sync_over_ssh(profile)
+        activate_device_profile(profile_id)
+        output = str(result.get("output") or "").strip()
+        compact = " | ".join(line.strip() for line in output.splitlines() if line.strip())
+        return _device_redirect(f"Kai-Pi '{profile['name']}' verbunden: {compact or 'ok'}", error=False)
+    except Exception as exc:
+        return _device_redirect(str(exc), error=True)
+
+
+@router.post("/internal/admin/device/probe-form")
+async def probe_device_form(request: Request, profile_id: str = Form(...)) -> RedirectResponse:
+    if not get_admin_session_username(request):
+        return RedirectResponse(url="/admin/login?next=/internal/admin%3Ftab%3Ddevices", status_code=303)
+    try:
+        profile = get_device_profile(profile_id)
+        result = run_device_probe_over_ssh(profile)
+        output = str(result.get("output") or "").strip()
+        compact = " | ".join(line.strip() for line in output.splitlines() if line.strip())
+        return _device_redirect(f"Pi-Probe fuer '{profile['name']}': {compact or 'ok'}", error=False)
+    except Exception as exc:
+        return _device_redirect(str(exc), error=True)
+
+
+@router.post("/internal/admin/device/face-apply-form")
+async def apply_device_face_form(
+    request: Request,
+    profile_id: str = Form(...),
+    FACE_STYLE_NAME: str = Form(default=""),
+    FACE_STATE: str = Form(default="idle"),
+    FACE_RENDER_MODE: str = Form(default="vector"),
+    FACE_SPRITE_PACK: str = Form(default=""),
+    FACE_VARIANT: str = Form(default="custom"),
+    FACE_FACE_COLOR: str = Form(default="black"),
+    FACE_EYE_SHAPE: str = Form(default="round"),
+    FACE_EYE_SPACING: str = Form(default="normal"),
+    FACE_IRIS_COLOR: str = Form(default="#59c7ff"),
+    FACE_PUPILS: str = Form(default=""),
+    FACE_IRIS: str = Form(default=""),
+    FACE_MOUTH: str = Form(default=""),
+    FACE_NOSE: str = Form(default=""),
+    FACE_CHEEKS: str = Form(default=""),
+    FACE_EARS: str = Form(default=""),
+    FACE_EYEBROWS: str = Form(default=""),
+    FACE_EYELIDS: str = Form(default=""),
+    FACE_HAIR: str = Form(default=""),
+    FACE_CLOSE_EYES: str = Form(default=""),
+) -> RedirectResponse:
+    if not get_admin_session_username(request):
+        return RedirectResponse(url="/admin/login?next=/internal/admin%3Ftab%3Ddevices", status_code=303)
+    try:
+        profile = get_device_profile(profile_id)
+        write_runtime_config({"DEVICE_SHARED_TOKEN": str(profile.get("device_token") or "")})
+        activate_device_profile(profile_id)
+
+        state_value = (FACE_STATE or "idle").strip().lower()
+        if state_value not in {"idle", "listening", "thinking", "speaking", "happy", "sleepy", "error"}:
+            state_value = "idle"
+        render_mode = (FACE_RENDER_MODE or "vector").strip().lower()
+        if render_mode not in {"vector", "sprite_pack"}:
+            render_mode = "vector"
+        sprite_pack = (FACE_SPRITE_PACK or "").strip()
+        variant = (FACE_VARIANT or "custom").strip().upper()
+        if variant not in {"CUSTOM", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13", "F14", "F15", "F16", "F17"}:
+            variant = "CUSTOM"
+        face_color = (FACE_FACE_COLOR or "black").strip().lower()
+        if face_color not in {"black", "white"}:
+            face_color = "black"
+        eye_shape = (FACE_EYE_SHAPE or "round").strip().lower()
+        if eye_shape not in {"round", "oval", "small"}:
+            eye_shape = "round"
+        eye_spacing = (FACE_EYE_SPACING or "normal").strip().lower()
+        if eye_spacing not in {"normal", "far", "raised"}:
+            eye_spacing = "normal"
+
+        face_config = {
+            "renderMode": render_mode,
+            "spritePack": sprite_pack,
+            "variant": variant,
+            "faceColor": face_color,
+            "eyeShape": eye_shape,
+            "eyeSpacing": eye_spacing,
+            "irisColor": (FACE_IRIS_COLOR or "#59c7ff").strip() or "#59c7ff",
+            "pupils": _form_bool(FACE_PUPILS),
+            "iris": _form_bool(FACE_IRIS),
+            "mouth": _form_bool(FACE_MOUTH),
+            "nose": _form_bool(FACE_NOSE),
+            "cheeks": _form_bool(FACE_CHEEKS),
+            "ears": _form_bool(FACE_EARS),
+            "eyebrows": _form_bool(FACE_EYEBROWS),
+            "eyelids": _form_bool(FACE_EYELIDS),
+            "hair": _form_bool(FACE_HAIR),
+            "closeEyes": _form_bool(FACE_CLOSE_EYES),
+        }
+        style_name = (FACE_STYLE_NAME or "").strip() or f"gateway_{state_value}"
+        result = run_device_face_apply_over_ssh(
+            profile,
+            style_name=style_name,
+            state=state_value,
+            face_config=face_config,
+        )
+        output = str(result.get("output") or "").strip()
+        compact = " | ".join(line.strip() for line in output.splitlines() if line.strip())
+        return _device_redirect(f"Kai-Face auf '{profile['name']}' gesetzt: {compact or style_name}", error=False)
     except Exception as exc:
         return _device_redirect(str(exc), error=True)
 
@@ -628,6 +772,10 @@ def _device_redirect(message: str, error: bool) -> RedirectResponse:
     if error:
         query["device_error"] = "1"
     return RedirectResponse(url=f"/internal/admin?{urlencode(query)}", status_code=303)
+
+
+def _form_bool(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @router.get("/api/admin/ops/{target}/status", dependencies=[Depends(require_admin_api_auth)])
@@ -749,11 +897,22 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
         "device_profile_form_ssh_host": "",
         "device_profile_form_ssh_user": "pi",
         "device_profile_form_ssh_port": "22",
+        "device_profile_form_ssh_password": "",
         "device_profile_form_remote_dir": "~/kai-pi",
         "device_profile_form_ssh_root_prefix": "sudo -n",
         "device_profile_form_notes": "",
         "device_active_token_redacted": _redact_device_token(settings.device_shared_token or ""),
         "device_bootstrap_preview": "Noch kein Device-Profil ausgewaehlt.",
+        "device_face_profile_options_html": '<option value="">zuerst Device-Profil speichern</option>',
+        "device_face_style_name": "gateway_idle",
+        "device_face_state": "idle",
+        "device_face_render_mode": "vector",
+        "device_face_sprite_pack": "robot_v1",
+        "device_face_variant": "custom",
+        "device_face_face_color": "black",
+        "device_face_eye_shape": "round",
+        "device_face_eye_spacing": "normal",
+        "device_face_iris_color": "#59c7ff",
         "backend_profiles_html": '<div class="muted">Noch keine KI-Profile gespeichert.</div>',
         "backend_profile_form_id": "",
         "backend_profile_form_name": "",
@@ -800,12 +959,15 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
         data["device_profile_form_ssh_host"] = str(active_device_profile.get("ssh_host") or "")
         data["device_profile_form_ssh_user"] = str(active_device_profile.get("ssh_user") or "pi")
         data["device_profile_form_ssh_port"] = str(active_device_profile.get("ssh_port") or "22")
+        data["device_profile_form_ssh_password"] = ""
         data["device_profile_form_remote_dir"] = str(active_device_profile.get("remote_dir") or "~/kai-pi")
         data["device_profile_form_ssh_root_prefix"] = str(active_device_profile.get("ssh_root_prefix") or "sudo -n")
         data["device_profile_form_notes"] = str(active_device_profile.get("notes") or "")
         data["device_active_token_redacted"] = _redact_device_token(str(active_device_profile.get("device_token") or settings.device_shared_token or ""))
-        data["device_bootstrap_preview"] = build_device_bootstrap_script(active_device_profile)
+        data["device_bootstrap_preview"] = build_device_install_script(active_device_profile)
+        data["device_face_style_name"] = f"gateway_{str(active_device_profile.get('name') or 'kai')}"
     data["device_profiles_html"] = _render_device_profiles_html(list_device_profiles())
+    data["device_face_profile_options_html"] = _render_device_profile_options_html(list_device_profiles(), str(active_device_profile.get("id") or "") if active_device_profile else "")
 
     client = LlamaCppClient(settings)
     try:
@@ -1184,11 +1346,15 @@ def _render_device_profiles_html(profiles: list[dict[str, object]]) -> str:
         profile_id = escape(str(profile.get("id") or ""))
         name = escape(str(profile.get("name") or "Pi Device"))
         gateway_base_url = escape(str(profile.get("gateway_base_url") or "-"))
-        ssh_host = escape(str(profile.get("ssh_host") or "-"))
-        ssh_user = escape(str(profile.get("ssh_user") or "-"))
+        raw_ssh_host = str(profile.get("ssh_host") or "").strip()
+        raw_ssh_user = str(profile.get("ssh_user") or "").strip()
+        ssh_host = escape(raw_ssh_host or "-")
+        ssh_user = escape(raw_ssh_user or "-")
         ssh_port = escape(str(profile.get("ssh_port") or "22"))
         remote_dir = escape(str(profile.get("remote_dir") or "~/kai-pi"))
         token_redacted = escape(str(profile.get("device_token_redacted") or "-"))
+        ssh_auth_mode = escape(str(profile.get("ssh_auth_mode") or "key"))
+        bootstrap_ready = bool(raw_ssh_host and raw_ssh_user)
         badge = '<span class="status" style="display:inline-block;padding:4px 8px;margin:0 0 0 8px;">aktiv</span>' if profile.get("is_active") else ""
         actions = []
         if not profile.get("is_active"):
@@ -1201,14 +1367,33 @@ def _render_device_profiles_html(profiles: list[dict[str, object]]) -> str:
                 """
             )
         actions.append(f'<a class="secondary" href="/internal/admin?tab=devices&edit_device={profile_id}">Bearbeiten</a>')
-        actions.append(
-            f"""
-            <form method="post" action="/internal/admin/device/bootstrap-form" onsubmit="return confirm('Pi-Bootstrap fuer dieses Profil jetzt ueber SSH starten?');">
-              <input type="hidden" name="profile_id" value="{profile_id}">
-              <button class="secondary" type="submit">Bootstrap</button>
-            </form>
-            """
-        )
+        if bootstrap_ready:
+            actions.append(
+                f"""
+                <form method="post" action="/internal/admin/device/connect-form" onsubmit="return confirm('Gateway-URL und Device-Token jetzt per SSH auf den Kai-Pi schreiben und kai.service neu starten?');">
+                  <input type="hidden" name="profile_id" value="{profile_id}">
+                  <button class="primary" type="submit">Verbinden / .env sync</button>
+                </form>
+                """
+            )
+        if bootstrap_ready:
+            actions.append(
+                f"""
+                <form method="post" action="/internal/admin/device/probe-form">
+                  <input type="hidden" name="profile_id" value="{profile_id}">
+                  <button class="secondary" type="submit">Pruefen</button>
+                </form>
+                """
+            )
+        if bootstrap_ready:
+            actions.append(
+                f"""
+                <form method="post" action="/internal/admin/device/install-form" onsubmit="return confirm('Roher Pi fuer dieses Profil jetzt ueber SSH installieren?');">
+                  <input type="hidden" name="profile_id" value="{profile_id}">
+                  <button class="primary" type="submit">PI installieren</button>
+                </form>
+                """
+            )
         actions.append(
             f"""
             <form method="post" action="/internal/admin/device/delete-form" onsubmit="return confirm('Device-Profil wirklich loeschen?');">
@@ -1222,12 +1407,25 @@ def _render_device_profiles_html(profiles: list[dict[str, object]]) -> str:
             <div class="list-card">
               <h3>{name}{badge}</h3>
               <div class="list-meta">Gateway: <code>{gateway_base_url}</code> | Token: <code>{token_redacted}</code></div>
-              <div class="list-meta">SSH: <code>{ssh_user}@{ssh_host}:{ssh_port}</code> | Ziel: <code>{remote_dir}</code></div>
+              <div class="list-meta">SSH: <code>{ssh_user}@{ssh_host}:{ssh_port}</code> | Auth: <code>{ssh_auth_mode}</code> | Ziel: <code>{remote_dir}</code>{'' if bootstrap_ready else ' | nur Direktverbindung, kein Bootstrap'}</div>
               <div class="actions">{''.join(actions)}</div>
             </div>
             """
         )
     return "".join(items)
+
+
+def _render_device_profile_options_html(profiles: list[dict[str, object]], active_profile_id: str) -> str:
+    if not profiles:
+        return '<option value="">zuerst Device-Profil speichern</option>'
+    options: list[str] = []
+    for profile in profiles:
+        profile_id = str(profile.get("id") or "")
+        name = str(profile.get("name") or "Pi Device")
+        active_badge = " (aktiv)" if profile.get("is_active") else ""
+        selected = " selected" if profile_id and profile_id == active_profile_id else ""
+        options.append(f'<option value="{escape(profile_id)}"{selected}>{escape(name + active_badge)}</option>')
+    return "".join(options)
 
 
 def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) -> str:
@@ -1718,6 +1916,15 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                         <label style="grid-column:1/-1;"><span>MI50_ROCM_SMI_COMMAND</span><input id="MI50_ROCM_SMI_COMMAND" value="__CFG_MI50_ROCM_SMI_COMMAND__"></label>
                       </div>
                     </details>
+                    <details style="margin-top:14px;">
+                      <summary style="cursor:pointer;font-weight:700;">Vision / Bildanalyse</summary>
+                      <div class="grid" style="margin-top:14px;">
+                        <label><span>VISION_BASE_URL</span><input id="VISION_BASE_URL" value="__CFG_VISION_BASE_URL__" placeholder="http://127.0.0.1:8081"></label>
+                        <label><span>VISION_MODEL_NAME</span><input id="VISION_MODEL_NAME" value="__CFG_VISION_MODEL_NAME__" placeholder="qwen2.5-vl"></label>
+                        <label><span>VISION_MAX_TOKENS</span><input id="VISION_MAX_TOKENS" value="__CFG_VISION_MAX_TOKENS__"></label>
+                        <label style="grid-column:1/-1;"><span>VISION_PROMPT</span><input id="VISION_PROMPT" value="__CFG_VISION_PROMPT__"></label>
+                      </div>
+                    </details>
                     <div class="actions">
                       <button class="primary" type="button" onclick="saveConfig({ preventDefault() {} })">Basis-Settings speichern</button>
                     </div>
@@ -2000,12 +2207,12 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                     </label>
                     <label><span>Titel optional</span><input name="DOCUMENT_TITLE" placeholder="z. B. Wissensnotiz, Aufgabenliste, Handbuch"></label>
                     <label><span>Tags optional</span><input name="DOCUMENT_TAGS" placeholder="projekt,aufgaben,pdf"></label>
-                    <label><span>Datei</span><input type="file" name="DOCUMENT_FILE" accept=".txt,.md,.markdown,.pdf,.log,.csv,.json,.yaml,.yml" required></label>
+                    <label><span>Datei</span><input type="file" name="DOCUMENT_FILE" accept=".txt,.md,.markdown,.pdf,.log,.csv,.json,.yaml,.yml,.jpg,.jpeg,.png,.webp,.gif,image/*" required></label>
                     <div class="actions">
                       <button class="primary" type="submit">Dokument speichern</button>
                     </div>
                   </form>
-                  <p class="muted" style="margin-top:12px;">Aktuell werden `.txt`, `.md`, `.pdf`, `.csv`, `.json`, `.log`, `.yaml`, `.yml` verarbeitet. Die Datei bleibt im gewaehlten Storage, waehrend extrahierter Text und Metadaten in PostgreSQL landen. Im Admin-Chat kannst du gespeicherte Dokumente danach direkt als Kontext auswaehlen.</p>
+                  <p class="muted" style="margin-top:12px;">Aktuell werden Textdateien, `.pdf` und gaengige Bilddateien verarbeitet. Die Datei bleibt im gewaehlten Storage, waehrend extrahierter Text, Bildanalyse und Metadaten in PostgreSQL landen. Im Admin-Chat kannst du gespeicherte Dokumente und Bilder danach direkt als Kontext auswaehlen.</p>
                 </div>
                 <div class="card">
                   <h2>Dokumente / Wissensbasis</h2>
@@ -2068,37 +2275,137 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
             <section id="devices" class="panel __PANEL_DEVICES__">
               <div class="hero">
                 <h1>Pi / Devices</h1>
-                <p>Hier verwaltest du Pi-Profile, Device-Tokens und eine erste SSH-Bootstrap-Strecke. V1 ist bewusst keybasiert und setzt nicht auf gespeicherte SSH-Passwoerter.</p>
+                <p>Hier verbindest du fertige Kai-Pis schnell ueber Gateway-URL, Token und optional SSH. Fuer einen laufenden Kai-Pi reichen praktisch Host, User, Port und auf Wunsch ein Passwort.</p>
                 <div id="deviceStatus" class="status">__DEVICE_STATUS__</div>
               </div>
               <div class="two-col">
                 <div class="card">
-                  <h2>Pi-Profil und Bootstrap</h2>
+                  <h2>Kai-Pi Schnell verbinden</h2>
                   <form method="post" action="/internal/admin/device/save-form">
                     <input type="hidden" name="DEVICE_PROFILE_ID" value="__DEVICE_PROFILE_FORM_ID__">
                     <div class="grid">
-                      <label><span>DEVICE_PROFILE_NAME</span><input name="DEVICE_PROFILE_NAME" value="__DEVICE_PROFILE_FORM_NAME__" placeholder="z. B. kai-pi-wohnzimmer"></label>
-                      <label><span>DEVICE_GATEWAY_BASE_URL</span><input name="DEVICE_GATEWAY_BASE_URL" value="__DEVICE_PROFILE_FORM_GATEWAY_BASE_URL__" placeholder="http://gateway:8000"></label>
-                      <label><span>DEVICE_TOKEN</span><input name="DEVICE_TOKEN" value="__DEVICE_PROFILE_FORM_DEVICE_TOKEN__" placeholder="eigener Pi-Token"></label>
                       <label><span>PI_SSH_HOST</span><input name="PI_SSH_HOST" value="__DEVICE_PROFILE_FORM_SSH_HOST__" placeholder="192.168.x.x"></label>
                       <label><span>PI_SSH_USER</span><input name="PI_SSH_USER" value="__DEVICE_PROFILE_FORM_SSH_USER__" placeholder="pi"></label>
                       <label><span>PI_SSH_PORT</span><input name="PI_SSH_PORT" value="__DEVICE_PROFILE_FORM_SSH_PORT__" placeholder="22"></label>
-                      <label><span>PI_REMOTE_DIR</span><input name="PI_REMOTE_DIR" value="__DEVICE_PROFILE_FORM_REMOTE_DIR__" placeholder="~/kai-pi"></label>
-                      <label><span>PI_SSH_ROOT_PREFIX</span><input name="PI_SSH_ROOT_PREFIX" value="__DEVICE_PROFILE_FORM_SSH_ROOT_PREFIX__" placeholder="sudo -n"></label>
+                      <label><span>PI_SSH_PASSWORD</span><input type="password" name="PI_SSH_PASSWORD" value="__DEVICE_PROFILE_FORM_SSH_PASSWORD__" placeholder="optional, sonst SSH-Key"></label>
+                      <label><span>DEVICE_PROFILE_NAME</span><input name="DEVICE_PROFILE_NAME" value="__DEVICE_PROFILE_FORM_NAME__" placeholder="z. B. kai-pi-wohnzimmer"></label>
+                      <label><span>DEVICE_GATEWAY_BASE_URL</span><input name="DEVICE_GATEWAY_BASE_URL" value="__DEVICE_PROFILE_FORM_GATEWAY_BASE_URL__" placeholder="http://gateway:8000"></label>
+                      <label><span>DEVICE_TOKEN</span><input name="DEVICE_TOKEN" value="__DEVICE_PROFILE_FORM_DEVICE_TOKEN__" placeholder="leer lassen = automatisch erzeugen"></label>
                       <label style="grid-column:1/-1;"><span>DEVICE_NOTES</span><input name="DEVICE_NOTES" value="__DEVICE_PROFILE_FORM_NOTES__" placeholder="z. B. Pi 5 mit 800x640 Display im Wohnzimmer"></label>
                     </div>
+                    <details style="margin-top:14px;">
+                      <summary style="cursor:pointer;font-weight:700;">Erweiterte SSH-/Bootstrap-Optionen</summary>
+                      <div class="grid" style="margin-top:14px;">
+                        <label><span>PI_REMOTE_DIR</span><input name="PI_REMOTE_DIR" value="__DEVICE_PROFILE_FORM_REMOTE_DIR__" placeholder="~/kai-pi"></label>
+                        <label><span>PI_SSH_ROOT_PREFIX</span><input name="PI_SSH_ROOT_PREFIX" value="__DEVICE_PROFILE_FORM_SSH_ROOT_PREFIX__" placeholder="sudo -n"></label>
+                      </div>
+                    </details>
                     <div class="actions">
                       <button class="primary" type="submit">Device-Profil speichern</button>
+                      <a class="secondary" href="/internal/admin?tab=devices">Neu / Formular leeren</a>
                     </div>
                   </form>
+                  <div class="card" style="margin-top:16px;">
+                    <h2>Kai Face zentral vom Gateway steuern</h2>
+                    <p class="muted">Das Pi-Menue wird bewusst nicht mehr benoetigt. Style, State und Layer steuerst du hier im Gateway und drueckst dann nur <code>Apply</code>.</p>
+                    <form method="post" action="/internal/admin/device/face-apply-form">
+                      <div class="grid">
+                        <label><span>Ziel-Pi Profil</span><select name="profile_id">__DEVICE_FACE_PROFILE_OPTIONS_HTML__</select></label>
+                        <label><span>Style Name</span><input name="FACE_STYLE_NAME" value="__DEVICE_FACE_STYLE_NAME__" placeholder="z. B. gaming_mode"></label>
+                        <label>
+                          <span>State</span>
+                          <select name="FACE_STATE">
+                            <option value="idle">idle</option>
+                            <option value="listening">listening</option>
+                            <option value="thinking">thinking</option>
+                            <option value="speaking">speaking</option>
+                            <option value="happy">happy</option>
+                            <option value="sleepy">sleepy</option>
+                            <option value="error">error</option>
+                          </select>
+                        </label>
+                        <label>
+                          <span>Render Mode</span>
+                          <select name="FACE_RENDER_MODE">
+                            <option value="vector">vector</option>
+                            <option value="sprite_pack">sprite_pack</option>
+                          </select>
+                        </label>
+                        <label><span>Sprite Pack</span><input name="FACE_SPRITE_PACK" value="__DEVICE_FACE_SPRITE_PACK__" placeholder="z. B. robot_v1"></label>
+                        <label>
+                          <span>Variant (F1..F17)</span>
+                          <select name="FACE_VARIANT">
+                            <option value="custom">custom</option>
+                            <option value="F1">F1 baseline</option>
+                            <option value="F2">F2 blue eyes</option>
+                            <option value="F3">F3 cheeks</option>
+                            <option value="F4">F4 close eyes</option>
+                            <option value="F5">F5 ears</option>
+                            <option value="F6">F6 eyebrows</option>
+                            <option value="F7">F7 eyelids</option>
+                            <option value="F8">F8 hair</option>
+                            <option value="F9">F9 iris</option>
+                            <option value="F10">F10 no mouth</option>
+                            <option value="F11">F11 no pupils</option>
+                            <option value="F12">F12 nose</option>
+                            <option value="F13">F13 oval eyes</option>
+                            <option value="F14">F14 raised eyes</option>
+                            <option value="F15">F15 small eyes</option>
+                            <option value="F16">F16 white face</option>
+                            <option value="F17">F17 far eyes</option>
+                          </select>
+                        </label>
+                        <label>
+                          <span>Face Color</span>
+                          <select name="FACE_FACE_COLOR">
+                            <option value="black">black</option>
+                            <option value="white">white</option>
+                          </select>
+                        </label>
+                        <label>
+                          <span>Eye Shape</span>
+                          <select name="FACE_EYE_SHAPE">
+                            <option value="round">round</option>
+                            <option value="oval">oval</option>
+                            <option value="small">small</option>
+                          </select>
+                        </label>
+                        <label>
+                          <span>Eye Spacing</span>
+                          <select name="FACE_EYE_SPACING">
+                            <option value="normal">normal</option>
+                            <option value="far">far</option>
+                            <option value="raised">raised</option>
+                          </select>
+                        </label>
+                        <label><span>Iris Color</span><input name="FACE_IRIS_COLOR" value="__DEVICE_FACE_IRIS_COLOR__" placeholder="#59c7ff"></label>
+                      </div>
+                      <p class="muted" style="margin-top:8px;">Eigene Designs: Lege auf dem Pi einen Pack-Ordner unter <code>/home/pi/kai/styles/packs/&lt;pack_name&gt;</code> mit <code>manifest.json</code> und PNG-Layern an. Dann hier <code>Render Mode = sprite_pack</code> und den Pack-Namen setzen.</p>
+                      <div class="grid" style="margin-top:8px;">
+                        <label><span><input type="checkbox" name="FACE_PUPILS" value="1" checked> pupils</span></label>
+                        <label><span><input type="checkbox" name="FACE_IRIS" value="1"> iris</span></label>
+                        <label><span><input type="checkbox" name="FACE_MOUTH" value="1" checked> mouth</span></label>
+                        <label><span><input type="checkbox" name="FACE_NOSE" value="1"> nose</span></label>
+                        <label><span><input type="checkbox" name="FACE_CHEEKS" value="1"> cheeks</span></label>
+                        <label><span><input type="checkbox" name="FACE_EARS" value="1"> ears</span></label>
+                        <label><span><input type="checkbox" name="FACE_EYEBROWS" value="1" checked> eyebrows</span></label>
+                        <label><span><input type="checkbox" name="FACE_EYELIDS" value="1"> eyelids</span></label>
+                        <label><span><input type="checkbox" name="FACE_HAIR" value="1"> hair</span></label>
+                        <label><span><input type="checkbox" name="FACE_CLOSE_EYES" value="1"> close eyes</span></label>
+                      </div>
+                      <div class="actions">
+                        <button class="primary" type="submit">Apply Face to Kai</button>
+                      </div>
+                    </form>
+                  </div>
                   <div class="list-stack" style="margin-top:16px;">
                     <div class="list-card">
                       <h3>Aktiver Device-Token</h3>
                       <div class="list-meta"><code>__DEVICE_ACTIVE_TOKEN_REDACTED__</code></div>
                     </div>
                     <div class="list-card">
-                      <h3>Device API</h3>
-                      <div class="list-meta">Der vorbereitete Pfad ist <code>/api/device/ask</code>. Ein aktiviertes Device-Profil uebernimmt den Device-Token direkt in den Gateway.</div>
+                      <h3>Was fuer fertige Kai-Pis reicht</h3>
+                      <div class="list-meta">Nutze bei bestehenden Kai-Pis den Button <code>Verbinden / .env sync</code>: der Gateway schreibt URL+Token direkt auf den Pi und startet <code>kai.service</code> neu. Fuer rohe Pi-Installationen gibt es pro Profil den Button <code>PI installieren</code>.</div>
                     </div>
                   </div>
                   <label style="margin-top:12px;">
@@ -2112,8 +2419,8 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                 <div class="card">
                   <h2>Gespeicherte Pi-Profile</h2>
                   <div class="list-stack">__DEVICE_PROFILES_HTML__</div>
-                  <label style="margin-top:14px;"><span>Bootstrap-Skript</span><textarea readonly>__DEVICE_BOOTSTRAP_PREVIEW__</textarea></label>
-                  <p class="muted" style="margin-top:12px;">Die Bootstrap-V1 nutzt bewusst SSH-Key-Auth. Sie installiert eine kleine Python-Basis auf dem Pi, legt `.env`, `requirements.txt` und einen ersten `pi_gateway_client.py` an und bereitet damit den Weg fuer den spaeteren Voice-/Avatar-Stack.</p>
+                  <label style="margin-top:14px;"><span>Pi-Install-Skript</span><textarea readonly>__DEVICE_BOOTSTRAP_PREVIEW__</textarea></label>
+                  <p class="muted" style="margin-top:12px;">Der Button <code>PI installieren</code> fuehrt dieses Script serverseitig ueber SSH aus. Damit kannst du auch einen rohen Pi ohne bestehendes Kai-Setup direkt vom Gateway aus vorbereiten.</p>
                 </div>
               </div>
             </section>
@@ -2142,6 +2449,10 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               "HOME_ASSISTANT_TIMEOUT_SECONDS",
               "HOME_ASSISTANT_ALLOWED_SERVICES",
               "HOME_ASSISTANT_ALLOWED_ENTITY_PREFIXES",
+              "VISION_BASE_URL",
+              "VISION_MODEL_NAME",
+              "VISION_PROMPT",
+              "VISION_MAX_TOKENS",
               "MI50_SSH_HOST",
               "MI50_SSH_USER",
               "MI50_SSH_PORT",
@@ -2796,6 +3107,25 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               outputNode.textContent = data.output || JSON.stringify(data, null, 2);
             }
 
+            function applyFaceFormDefaults() {
+              const form = document.querySelector('form[action="/internal/admin/device/face-apply-form"]');
+              if (!form) return;
+              const defaults = {
+                FACE_STATE: "__DEVICE_FACE_STATE__",
+                FACE_RENDER_MODE: "__DEVICE_FACE_RENDER_MODE__",
+                FACE_VARIANT: "__DEVICE_FACE_VARIANT__",
+                FACE_FACE_COLOR: "__DEVICE_FACE_FACE_COLOR__",
+                FACE_EYE_SHAPE: "__DEVICE_FACE_EYE_SHAPE__",
+                FACE_EYE_SPACING: "__DEVICE_FACE_EYE_SPACING__"
+              };
+              for (const [name, value] of Object.entries(defaults)) {
+                const node = form.querySelector(`[name="${name}"]`);
+                if (node && value) {
+                  node.value = value;
+                }
+              }
+            }
+
             loadDashboard();
             loadHeaderTelemetry();
             window.setInterval(loadHeaderTelemetry, 500);
@@ -2805,6 +3135,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
             loadStorageOverview();
             loadHomeAssistantStatus();
             loadContinueConfig();
+            applyFaceFormDefaults();
           </script>
         </body>
         </html>
@@ -2895,11 +3226,22 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__DEVICE_PROFILE_FORM_SSH_HOST__": escape(initial_data.get("device_profile_form_ssh_host", "")),
         "__DEVICE_PROFILE_FORM_SSH_USER__": escape(initial_data.get("device_profile_form_ssh_user", "")),
         "__DEVICE_PROFILE_FORM_SSH_PORT__": escape(initial_data.get("device_profile_form_ssh_port", "22")),
+        "__DEVICE_PROFILE_FORM_SSH_PASSWORD__": escape(initial_data.get("device_profile_form_ssh_password", "")),
         "__DEVICE_PROFILE_FORM_REMOTE_DIR__": escape(initial_data.get("device_profile_form_remote_dir", "~/kai-pi")),
         "__DEVICE_PROFILE_FORM_SSH_ROOT_PREFIX__": escape(initial_data.get("device_profile_form_ssh_root_prefix", "sudo -n")),
         "__DEVICE_PROFILE_FORM_NOTES__": escape(initial_data.get("device_profile_form_notes", "")),
         "__DEVICE_ACTIVE_TOKEN_REDACTED__": escape(initial_data.get("device_active_token_redacted", "-")),
         "__DEVICE_BOOTSTRAP_PREVIEW__": escape(initial_data.get("device_bootstrap_preview", "Noch kein Device-Profil ausgewaehlt.")),
+        "__DEVICE_FACE_PROFILE_OPTIONS_HTML__": initial_data.get("device_face_profile_options_html", '<option value="">zuerst Device-Profil speichern</option>'),
+        "__DEVICE_FACE_STYLE_NAME__": escape(initial_data.get("device_face_style_name", "gateway_idle")),
+        "__DEVICE_FACE_STATE__": escape(initial_data.get("device_face_state", "idle")),
+        "__DEVICE_FACE_RENDER_MODE__": escape(initial_data.get("device_face_render_mode", "vector")),
+        "__DEVICE_FACE_SPRITE_PACK__": escape(initial_data.get("device_face_sprite_pack", "robot_v1")),
+        "__DEVICE_FACE_VARIANT__": escape(initial_data.get("device_face_variant", "custom")),
+        "__DEVICE_FACE_FACE_COLOR__": escape(initial_data.get("device_face_face_color", "black")),
+        "__DEVICE_FACE_EYE_SHAPE__": escape(initial_data.get("device_face_eye_shape", "round")),
+        "__DEVICE_FACE_EYE_SPACING__": escape(initial_data.get("device_face_eye_spacing", "normal")),
+        "__DEVICE_FACE_IRIS_COLOR__": escape(initial_data.get("device_face_iris_color", "#59c7ff")),
         "__HA_STATUS__": escape(initial_data.get("ha_status", "-")),
         "__HA_CONFIGURED__": escape(initial_data.get("ha_configured", "-")),
         "__HA_CONNECTED__": escape(initial_data.get("ha_connected", "-")),
