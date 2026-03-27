@@ -855,6 +855,7 @@ Endpoints:
 Auth:
 
 - Standard ist `Authorization: Bearer API_BEARER_TOKEN`
+- Optional fuer Devices: `Authorization: Bearer DEVICE_SHARED_TOKEN` oder `X-Device-Token`
 
 Beispiel:
 

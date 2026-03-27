@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import JSONResponse
 
 from app.api_errors import error_response
-from app.auth import require_bearer_token
+from app.auth import require_mcp_auth
 from app.config import get_settings
 from app.schemas.mcp import MCPCallRequest, MCPCallResponse, MCPToolsResponse, MCPTool
 from app.services.home_assistant import HomeAssistantConfigError, HomeAssistantRequestError
@@ -14,7 +14,7 @@ from app.services.mcp_registry import find_mcp_tool, get_mcp_tools
 router = APIRouter(tags=["mcp"])
 
 
-@router.get("/api/mcp/tools", dependencies=[Depends(require_bearer_token)], response_model=MCPToolsResponse)
+@router.get("/api/mcp/tools", dependencies=[Depends(require_mcp_auth)], response_model=MCPToolsResponse)
 async def list_mcp_tools() -> MCPToolsResponse:
     tools = [
         MCPTool(
@@ -28,7 +28,7 @@ async def list_mcp_tools() -> MCPToolsResponse:
     return MCPToolsResponse(tools=tools)
 
 
-@router.post("/api/mcp/call", dependencies=[Depends(require_bearer_token)], response_model=None)
+@router.post("/api/mcp/call", dependencies=[Depends(require_mcp_auth)], response_model=None)
 async def call_mcp_tool(payload: MCPCallRequest, request: Request) -> MCPCallResponse | JSONResponse:
     tool = find_mcp_tool(payload.tool)
     if not tool:

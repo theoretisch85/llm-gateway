@@ -153,6 +153,36 @@ async def require_device_token(
     raise unauthorized_error("Invalid device token.")
 
 
+async def require_mcp_auth(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    admin_session: str | None = Cookie(default=None, alias=ADMIN_SESSION_COOKIE),
+    x_device_token: str | None = Header(default=None),
+) -> str:
+    settings = get_settings()
+
+    username = parse_admin_session_token(settings, admin_session)
+    if username:
+        return username
+
+    if authorization:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer" and token and _verify_token(token, settings.api_bearer_token):
+            return "bearer"
+
+    expected_device = settings.device_shared_token or settings.api_bearer_token
+    if x_device_token and _verify_token(x_device_token, expected_device):
+        return "device"
+
+    if authorization:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer" and token and _verify_token(token, expected_device):
+            return "device"
+
+    logger.warning("mcp auth failed reason=missing_or_invalid_credentials path=%s", request.url.path)
+    raise unauthorized_error("MCP authentication required.")
+
+
 def validate_admin_credentials(username: str, password: str, settings: Settings | None = None) -> bool:
     active_settings = settings or get_settings()
     if username != active_settings.admin_username:
