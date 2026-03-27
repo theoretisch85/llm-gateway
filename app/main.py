@@ -19,6 +19,7 @@ from app.routes.health import router as health_router
 from app.routes.home_assistant import router as home_assistant_router
 from app.routes.internal_health import router as internal_health_router
 from app.routes.metrics import router as metrics_router
+from app.routes.mcp import router as mcp_router
 from app.routes.models import router as models_router
 
 
@@ -101,5 +102,6 @@ app.include_router(device_router)
 app.include_router(home_assistant_router)
 app.include_router(internal_health_router)
 app.include_router(metrics_router)
+app.include_router(mcp_router)
 app.include_router(models_router)
 app.include_router(chat_router)

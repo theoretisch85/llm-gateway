@@ -842,6 +842,42 @@ Wichtige praktische Entscheidung:
   - `pi_gateway_client.py`
 - damit ist der Pi noch nicht der volle Sprach-/Avatar-Stack, aber sauber fuer die naechste Ausbaustufe vorbereitet
 
+## MCP (Tool-Broker)
+
+Der Gateway bietet eine kleine MCP-V1, damit Clients wie spaeter VS Code kontrollierte Tools nutzen koennen.
+Die Tools sind bewusst whitelisted und laufen ueber den Gateway als Broker.
+
+Endpoints:
+
+- `GET /api/mcp/tools` (Liste der verfuegbaren Tools)
+- `POST /api/mcp/call` (Tool ausfuehren)
+
+Auth:
+
+- Standard ist `Authorization: Bearer API_BEARER_TOKEN`
+
+Beispiel:
+
+```bash
+curl -s http://127.0.0.1:8000/api/mcp/tools \
+  -H "Authorization: Bearer API_BEARER_TOKEN"
+```
+
+```bash
+curl -s http://127.0.0.1:8000/api/mcp/call \
+  -H "Authorization: Bearer API_BEARER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tool":"ha.entities",
+    "arguments":{"domain":"light","limit":20}
+  }'
+```
+
+Hinweis:
+
+- Die MCP-V1 ist absichtlich klein gehalten.
+- Schreiben/Schalten laeuft nur ueber freigegebene HA-Services.
+
 ## llama.cpp Startbefehl
 
 Fuer dein aktuelles Ein-Modell-Setup ist der pragmatische Weg:
