@@ -2352,6 +2352,8 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                     <button class="secondary" type="button" onclick="loadOpsCatalog()">Ops-Katalog laden</button>
                   </div>
                   <label style="margin-top:12px;"><span>Aktive MCP-Tools</span><textarea id="mcpToolsView" readonly></textarea></label>
+                  <label><span>Ops-Katalog (Allowlist)</span><textarea id="mcpOpsCatalogView" readonly></textarea></label>
+                  <div class="muted">Letztes Skills/MCP-Refresh: <code id="skillsLastLoaded">-</code></div>
                   <p class="muted" style="margin-top:12px;">Custom-Tools rufen intern exakt einen freigegebenen Ops-Befehl auf, z. B. <code>gateway.install_htop</code>. Damit bleibt die Ausfuehrung nachvollziehbar und abgesichert.</p>
                 </div>
                 <div class="card">
@@ -2698,6 +2700,16 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               node.style.color = error ? "#942f2f" : "#16231b";
             }
 
+            function markSkillsLoadedNow() {
+              const node = document.getElementById("skillsLastLoaded");
+              if (!node) return;
+              try {
+                node.textContent = new Date().toLocaleTimeString("de-DE");
+              } catch (_error) {
+                node.textContent = String(Date.now());
+              }
+            }
+
             window.opsCatalog = { gateway: [], kai: [] };
 
             function refreshCustomMcpCommandOptions() {
@@ -2736,13 +2748,37 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               `).join("");
             }
 
+            function renderOpsCatalogView(catalog) {
+              const node = document.getElementById("mcpOpsCatalogView");
+              if (!node) return;
+              if (!catalog || typeof catalog !== "object") {
+                node.value = "-";
+                return;
+              }
+              const targets = Object.keys(catalog).sort();
+              const lines = [];
+              for (const target of targets) {
+                const commands = Array.isArray(catalog[target]) ? catalog[target] : [];
+                lines.push(`${target}:`);
+                lines.push(...commands.map((item) => `  - ${item}`));
+                lines.push("");
+              }
+              node.value = lines.join("\\n").trim() || "-";
+            }
+
             async function loadOpsCatalog() {
               try {
+                setSkillsStatus("Ops-Katalog wird geladen...");
                 const res = await fetch("/api/admin/ops/catalog");
                 const data = await res.json();
                 if (!res.ok) throw new Error(errorMessage(data, `Ops-Katalog fehlgeschlagen: ${res.status}`));
                 window.opsCatalog = data.targets || { gateway: [], kai: [] };
                 refreshCustomMcpCommandOptions();
+                renderOpsCatalogView(window.opsCatalog);
+                const gatewayCount = Array.isArray(window.opsCatalog.gateway) ? window.opsCatalog.gateway.length : 0;
+                const kaiCount = Array.isArray(window.opsCatalog.kai) ? window.opsCatalog.kai.length : 0;
+                markSkillsLoadedNow();
+                setSkillsStatus(`Ops-Katalog geladen (gateway: ${gatewayCount}, kai: ${kaiCount}).`);
               } catch (error) {
                 setSkillsStatus(error.message, true);
               }
@@ -2750,6 +2786,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
 
             async function loadMcpTools() {
               try {
+                setSkillsStatus("MCP-Tools werden geladen...");
                 const res = await fetch("/api/admin/mcp/tools");
                 const data = await res.json();
                 if (!res.ok) throw new Error(errorMessage(data, `MCP-Tools fehlgeschlagen: ${res.status}`));
@@ -2762,6 +2799,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                 });
                 setValue("mcpToolsView", lines.join("\\n"));
                 setText("mcpToolsCount", String(tools.length));
+                markSkillsLoadedNow();
                 setSkillsStatus(`MCP-Tools geladen (${tools.length}).`);
               } catch (error) {
                 setSkillsStatus(error.message, true);
