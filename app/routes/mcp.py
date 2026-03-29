@@ -6,19 +6,21 @@ from fastapi.responses import JSONResponse
 from app.api_errors import error_response
 from app.auth import require_mcp_auth
 from app.config import get_settings
+from app.core.roles import ActorContext, normalize_mcp_role
+from app.orchestrator import ToolOrchestrator
 from app.schemas.mcp import MCPCallRequest, MCPCallResponse, MCPToolsResponse, MCPTool
 from app.services.home_assistant import HomeAssistantConfigError, HomeAssistantRequestError
-from app.services.mcp_registry import find_mcp_tool, get_mcp_tools
+from app.tools.executor import ToolNotFoundError, ToolPermissionError
 
 
 router = APIRouter(tags=["mcp"])
+tool_orchestrator = ToolOrchestrator()
 
 
 @router.get("/api/mcp/tools", response_model=MCPToolsResponse)
-async def list_mcp_tools(auth_role: str = Depends(require_mcp_auth)) -> MCPToolsResponse:
-    visible_tools = [
-        item for item in get_mcp_tools() if not (auth_role == "device" and bool(item.get("requires_admin")))
-    ]
+async def list_mcp_tools(auth_subject: str = Depends(require_mcp_auth)) -> MCPToolsResponse:
+    role = normalize_mcp_role(auth_subject)
+    visible_tools = tool_orchestrator.list_tools_for_role(role)
     tools = [
         MCPTool(
             name=item["name"],
@@ -35,10 +37,24 @@ async def list_mcp_tools(auth_role: str = Depends(require_mcp_auth)) -> MCPTools
 async def call_mcp_tool(
     payload: MCPCallRequest,
     request: Request,
-    auth_role: str = Depends(require_mcp_auth),
+    auth_subject: str = Depends(require_mcp_auth),
 ) -> MCPCallResponse | JSONResponse:
-    tool = find_mcp_tool(payload.tool)
-    if not tool:
+    role = normalize_mcp_role(auth_subject)
+    actor = ActorContext(
+        actor_id=auth_subject or "unknown",
+        role=role,
+        source="api.mcp",
+    )
+    settings = get_settings()
+    try:
+        result = await tool_orchestrator.execute_tool(
+            settings=settings,
+            actor=actor,
+            request_id=request.state.request_id,
+            tool_name=payload.tool,
+            arguments=payload.arguments,
+        )
+    except ToolNotFoundError:
         return error_response(
             request_id=request.state.request_id,
             status_code=status.HTTP_404_NOT_FOUND,
@@ -46,7 +62,7 @@ async def call_mcp_tool(
             error_type="invalid_request_error",
             code="mcp_tool_not_found",
         )
-    if auth_role == "device" and bool(tool.get("requires_admin")):
+    except ToolPermissionError:
         return error_response(
             request_id=request.state.request_id,
             status_code=status.HTTP_403_FORBIDDEN,
@@ -54,10 +70,6 @@ async def call_mcp_tool(
             error_type="permission_error",
             code="mcp_forbidden_for_device",
         )
-
-    settings = get_settings()
-    try:
-        result = await tool["handler"](settings, payload.arguments)
     except HomeAssistantConfigError as exc:
         return error_response(
             request_id=request.state.request_id,
