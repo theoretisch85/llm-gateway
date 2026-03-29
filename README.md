@@ -927,6 +927,7 @@ Hinweis:
 - Schreiben/Schalten laeuft nur ueber freigegebene HA-Services.
 - Custom-Tools sind kein freies Shell-Feature: sie duerfen nur auf den vorhandenen Ops-Allowlist-Befehlen aufsetzen.
 - Fuer automatisches Tool-Management stehen zusaetzlich die MCP-Tools `gateway.custom_tool.list`, `gateway.custom_tool.save` und `gateway.custom_tool.delete` bereit.
+- Builin-Tool-Namen sind reserviert und koennen nicht als Custom-Tool-Namen ueberschrieben oder geloescht werden.
 
 ## Vision / Bildanalyse
 

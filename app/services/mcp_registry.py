@@ -93,9 +93,12 @@ async def _custom_tool_list(settings: Settings, args: dict[str, Any]) -> Any:
 
 async def _custom_tool_save(settings: Settings, args: dict[str, Any]) -> Any:
     _ = settings
+    name = str(args.get("name") or "").strip().lower()
+    if name in get_builtin_mcp_tool_names():
+        raise ValueError("Name ist reserviert (builtin MCP-Tool).")
     try:
         return save_custom_mcp_tool(
-            name=str(args.get("name") or ""),
+            name=name,
             description=str(args.get("description") or ""),
             target=str(args.get("target") or ""),
             command=str(args.get("command") or ""),
@@ -106,9 +109,11 @@ async def _custom_tool_save(settings: Settings, args: dict[str, Any]) -> Any:
 
 async def _custom_tool_delete(settings: Settings, args: dict[str, Any]) -> Any:
     _ = settings
-    name = str(args.get("name") or "").strip()
+    name = str(args.get("name") or "").strip().lower()
     if not name:
         raise ValueError("name ist erforderlich.")
+    if name in get_builtin_mcp_tool_names():
+        raise ValueError("Builtin MCP-Tools koennen nicht geloescht werden.")
     try:
         return delete_custom_mcp_tool(name)
     except RuntimeError as exc:
