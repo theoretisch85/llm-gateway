@@ -229,7 +229,6 @@ def build_runtime_updates_for_backend_profile(profile: dict[str, object]) -> dic
     context_window = str(profile.get("context_window") or "").strip()
     response_reserve = str(profile.get("response_reserve") or "").strip()
     default_max_tokens = str(profile.get("default_max_tokens") or "").strip()
-    ngl_layers = str(profile.get("ngl_layers") or "").strip()
     updates = {
         "LLAMACPP_BASE_URL": str(profile.get("base_url") or "").strip(),
         "PUBLIC_MODEL_NAME": str(profile.get("public_model_name") or "").strip(),
@@ -247,8 +246,6 @@ def build_runtime_updates_for_backend_profile(profile: dict[str, object]) -> dic
         updates["CONTEXT_RESPONSE_RESERVE"] = response_reserve
     if default_max_tokens:
         updates["DEFAULT_MAX_TOKENS"] = default_max_tokens
-    if ngl_layers:
-        updates["MI50_PROFILE_NGL"] = ngl_layers
     if activate_command:
         updates["MI50_RESTART_COMMAND"] = activate_command
     elif service_name:

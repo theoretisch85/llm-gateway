@@ -5,6 +5,7 @@ from typing import Any, Awaitable, Callable
 from app.config import Settings
 from app.services.backend_control import run_ops_command
 from app.services.home_assistant import HomeAssistantClient
+from app.services.mcp_custom_tools import delete_custom_mcp_tool, list_custom_mcp_tools, save_custom_mcp_tool
 from app.services.storage_library import get_document_contexts, list_documents
 
 
@@ -17,6 +18,7 @@ def _tool(
     input_schema: dict[str, Any],
     output_schema: dict[str, Any],
     handler: MCPHandler,
+    requires_admin: bool = False,
 ) -> dict[str, Any]:
     return {
         "name": name,
@@ -24,6 +26,7 @@ def _tool(
         "input_schema": input_schema,
         "output_schema": output_schema,
         "handler": handler,
+        "requires_admin": requires_admin,
     }
 
 
@@ -67,14 +70,69 @@ async def _storage_get(settings: Settings, args: dict[str, Any]) -> Any:
 
 
 async def _gateway_ops(settings: Settings, args: dict[str, Any]) -> Any:
-    command = str(args.get("command") or "").strip()
+    _ = settings
+    command = str(args.get("command") or "").strip().lower()
+    target = str(args.get("target") or "").strip().lower() or "gateway"
+    if "." in command and "target" not in args:
+        split_target, split_command = command.split(".", 1)
+        if split_target in {"gateway", "kai"} and split_command:
+            target = split_target
+            command = split_command
     if not command:
         raise ValueError("command ist erforderlich.")
-    return run_ops_command(command, settings)
+    try:
+        return run_ops_command(target, command)
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
 
 
-def get_mcp_tools() -> list[dict[str, Any]]:
-    # MCP registry is intentionally small in v1 and backed by existing services.
+async def _custom_tool_list(settings: Settings, args: dict[str, Any]) -> Any:
+    _ = settings, args
+    return list_custom_mcp_tools()
+
+
+async def _custom_tool_save(settings: Settings, args: dict[str, Any]) -> Any:
+    _ = settings
+    name = str(args.get("name") or "").strip().lower()
+    if name in get_builtin_mcp_tool_names():
+        raise ValueError("Name ist reserviert (builtin MCP-Tool).")
+    try:
+        return save_custom_mcp_tool(
+            name=name,
+            description=str(args.get("description") or ""),
+            target=str(args.get("target") or ""),
+            command=str(args.get("command") or ""),
+        )
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+async def _custom_tool_delete(settings: Settings, args: dict[str, Any]) -> Any:
+    _ = settings
+    name = str(args.get("name") or "").strip().lower()
+    if not name:
+        raise ValueError("name ist erforderlich.")
+    if name in get_builtin_mcp_tool_names():
+        raise ValueError("Builtin MCP-Tools koennen nicht geloescht werden.")
+    try:
+        return delete_custom_mcp_tool(name)
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _custom_ops_tool_handler(target: str, command: str) -> MCPHandler:
+    async def _handler(settings: Settings, args: dict[str, Any]) -> Any:
+        _ = settings, args
+        try:
+            return run_ops_command(target, command)
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
+
+    return _handler
+
+
+def _builtin_mcp_tools() -> list[dict[str, Any]]:
+    # Builtins stay intentionally small and are backed by existing services.
     return [
         _tool(
             name="ha.entities",
@@ -115,11 +173,86 @@ def get_mcp_tools() -> list[dict[str, Any]]:
         _tool(
             name="gateway.ops",
             description="Fuehrt freigegebene Gateway-Ops-Presets aus.",
-            input_schema={"type": "object", "properties": {"command": {"type": "string"}}},
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "gateway oder kai"},
+                    "command": {"type": "string", "description": "z. B. status, skills, install_htop"},
+                },
+                "required": ["command"],
+            },
             output_schema={"type": "object"},
             handler=_gateway_ops,
+            requires_admin=True,
+        ),
+        _tool(
+            name="gateway.custom_tool.list",
+            description="Listet gespeicherte Custom-MCP-Tools.",
+            input_schema={"type": "object", "properties": {}},
+            output_schema={"type": "array"},
+            handler=_custom_tool_list,
+            requires_admin=True,
+        ),
+        _tool(
+            name="gateway.custom_tool.save",
+            description="Speichert ein Custom-MCP-Tool (Name -> target/command).",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "target": {"type": "string"},
+                    "command": {"type": "string"},
+                },
+                "required": ["name", "target", "command"],
+            },
+            output_schema={"type": "object"},
+            handler=_custom_tool_save,
+            requires_admin=True,
+        ),
+        _tool(
+            name="gateway.custom_tool.delete",
+            description="Loescht ein gespeichertes Custom-MCP-Tool per Name.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                },
+                "required": ["name"],
+            },
+            output_schema={"type": "object"},
+            handler=_custom_tool_delete,
+            requires_admin=True,
         ),
     ]
+
+
+def get_builtin_mcp_tool_names() -> set[str]:
+    return {item["name"] for item in _builtin_mcp_tools()}
+
+
+def get_mcp_tools() -> list[dict[str, Any]]:
+    tools = _builtin_mcp_tools()
+    reserved_names = {item["name"] for item in tools}
+
+    for item in list_custom_mcp_tools():
+        name = str(item.get("name") or "").strip().lower()
+        description = str(item.get("description") or "").strip() or f"Custom Ops Tool: {item.get('target')}.{item.get('command')}"
+        target = str(item.get("target") or "").strip().lower()
+        command = str(item.get("command") or "").strip().lower()
+        if not name or name in reserved_names or not target or not command:
+            continue
+        tools.append(
+            _tool(
+                name=name,
+                description=description,
+                input_schema={"type": "object", "properties": {}},
+                output_schema={"type": "object"},
+                handler=_custom_ops_tool_handler(target, command),
+                requires_admin=True,
+            )
+        )
+    return tools
 
 
 def find_mcp_tool(tool_name: str) -> dict[str, Any] | None:

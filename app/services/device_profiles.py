@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 from pathlib import Path
 from uuid import uuid4
 
@@ -70,6 +71,7 @@ def list_device_profiles() -> list[dict[str, object]]:
                 "ssh_host": str(item.get("ssh_host") or ""),
                 "ssh_user": str(item.get("ssh_user") or ""),
                 "ssh_port": str(item.get("ssh_port") or "22"),
+                "ssh_auth_mode": "password" if str(item.get("ssh_password") or "").strip() else "key",
                 "remote_dir": str(item.get("remote_dir") or "~/kai-pi"),
                 "ssh_root_prefix": str(item.get("ssh_root_prefix") or "sudo -n"),
                 "notes": str(item.get("notes") or ""),
@@ -105,6 +107,7 @@ def save_device_profile(
     ssh_host: str,
     ssh_user: str,
     ssh_port: str,
+    ssh_password: str,
     remote_dir: str,
     ssh_root_prefix: str,
     notes: str = "",
@@ -112,10 +115,11 @@ def save_device_profile(
 ) -> dict[str, object]:
     clean_name = (name or "").strip() or "Pi Device"
     clean_gateway_base_url = (gateway_base_url or "").strip().rstrip("/")
-    clean_device_token = (device_token or "").strip()
+    clean_device_token = (device_token or "").strip() or secrets.token_urlsafe(24)
     clean_ssh_host = (ssh_host or "").strip()
-    clean_ssh_user = (ssh_user or "").strip()
+    clean_ssh_user = (ssh_user or "").strip() or "pi"
     clean_ssh_port = (ssh_port or "").strip() or "22"
+    clean_ssh_password = (ssh_password or "").strip()
     clean_remote_dir = (remote_dir or "").strip() or "~/kai-pi"
     clean_ssh_root_prefix = (ssh_root_prefix or "").strip() or "sudo -n"
     clean_notes = (notes or "").strip()
@@ -124,11 +128,6 @@ def save_device_profile(
         raise RuntimeError("Gateway-Base-URL fuer das Pi-Profil fehlt.")
     if not clean_device_token:
         raise RuntimeError("Device-Token fuer das Pi-Profil fehlt.")
-    if not clean_ssh_host:
-        raise RuntimeError("PI_SSH_HOST fehlt.")
-    if not clean_ssh_user:
-        raise RuntimeError("PI_SSH_USER fehlt.")
-
     state = _load_state()
     profiles = state.get("profiles") or []
     existing: dict[str, object] | None = None
@@ -144,6 +143,8 @@ def save_device_profile(
     if existing is None:
         existing = {"id": clean_profile_id or uuid4().hex}
         profiles.append(existing)
+    elif not clean_ssh_password:
+        clean_ssh_password = str(existing.get("ssh_password") or "").strip()
 
     existing.update(
         {
@@ -154,6 +155,7 @@ def save_device_profile(
             "ssh_host": clean_ssh_host,
             "ssh_user": clean_ssh_user,
             "ssh_port": clean_ssh_port,
+            "ssh_password": clean_ssh_password,
             "remote_dir": clean_remote_dir,
             "ssh_root_prefix": clean_ssh_root_prefix,
             "notes": clean_notes,

@@ -95,7 +95,7 @@ async def create_chat_completion(
         response_payload["request_id"] = request_id
         logger.info("chat completion succeeded public_model=%s", response_payload["model"])
         return JSONResponse(content=response_payload)
-    except LlamaCppTimeoutError as exc:
+    except LlamaCppTimeoutError:
         logger.warning("request timeout method=%s path=%s", request.method, request.url.path)
         return error_response(
             request_id=request_id,

@@ -14,8 +14,11 @@ from app.services.mcp_registry import find_mcp_tool, get_mcp_tools
 router = APIRouter(tags=["mcp"])
 
 
-@router.get("/api/mcp/tools", dependencies=[Depends(require_mcp_auth)], response_model=MCPToolsResponse)
-async def list_mcp_tools() -> MCPToolsResponse:
+@router.get("/api/mcp/tools", response_model=MCPToolsResponse)
+async def list_mcp_tools(auth_role: str = Depends(require_mcp_auth)) -> MCPToolsResponse:
+    visible_tools = [
+        item for item in get_mcp_tools() if not (auth_role == "device" and bool(item.get("requires_admin")))
+    ]
     tools = [
         MCPTool(
             name=item["name"],
@@ -23,13 +26,17 @@ async def list_mcp_tools() -> MCPToolsResponse:
             input_schema=item["input_schema"],
             output_schema=item["output_schema"],
         )
-        for item in get_mcp_tools()
+        for item in visible_tools
     ]
     return MCPToolsResponse(tools=tools)
 
 
-@router.post("/api/mcp/call", dependencies=[Depends(require_mcp_auth)], response_model=None)
-async def call_mcp_tool(payload: MCPCallRequest, request: Request) -> MCPCallResponse | JSONResponse:
+@router.post("/api/mcp/call", response_model=None)
+async def call_mcp_tool(
+    payload: MCPCallRequest,
+    request: Request,
+    auth_role: str = Depends(require_mcp_auth),
+) -> MCPCallResponse | JSONResponse:
     tool = find_mcp_tool(payload.tool)
     if not tool:
         return error_response(
@@ -38,6 +45,14 @@ async def call_mcp_tool(payload: MCPCallRequest, request: Request) -> MCPCallRes
             message=f"Unbekanntes MCP-Tool: {payload.tool}",
             error_type="invalid_request_error",
             code="mcp_tool_not_found",
+        )
+    if auth_role == "device" and bool(tool.get("requires_admin")):
+        return error_response(
+            request_id=request.state.request_id,
+            status_code=status.HTTP_403_FORBIDDEN,
+            message=f"MCP-Tool '{payload.tool}' ist nur fuer Admin/API-Token erlaubt.",
+            error_type="permission_error",
+            code="mcp_forbidden_for_device",
         )
 
     settings = get_settings()

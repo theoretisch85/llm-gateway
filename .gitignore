@@ -1,7 +1,10 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 *.pyc
+.coverage
 .env
 .env.*
 !.env.example
@@ -10,3 +13,4 @@ deploy/continue.config.local.yaml
 .vscode/
 .idea/
 .runtime/
+.tmp/

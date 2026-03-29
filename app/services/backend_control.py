@@ -522,36 +522,52 @@ def kai_telemetry() -> dict[str, object]:
     }
 
 
+def _gateway_ops_handlers():
+    return {
+        "status": gateway_status,
+        "logs": gateway_logs,
+        "restart": restart_gateway,
+        "uptime": lambda: {"status": "ok", "output": _run_local_command(["uptime"])},
+        "health": lambda: {"status": "ok", "output": _run_local_command(["curl", "-sS", "http://127.0.0.1:8000/health"])},
+        "tools": gateway_tools,
+        "skills": gateway_skills,
+        "apt_update": gateway_apt_update,
+        "install_git": lambda: gateway_install_package("git"),
+        "install_curl": lambda: gateway_install_package("curl"),
+        "install_gh": lambda: gateway_install_package("gh"),
+        "install_ripgrep": lambda: gateway_install_package("ripgrep"),
+        "install_htop": lambda: gateway_install_package("htop"),
+        "install_tmux": lambda: gateway_install_package("tmux"),
+    }
+
+
+def _kai_ops_handlers():
+    return {
+        "status": kai_status,
+        "logs": kai_logs,
+        "restart": restart_mi50_backend,
+        "health": lambda: {"status": "ok", "output": _run_remote_command("curl -sS http://127.0.0.1:8080/health")},
+        "models": lambda: {"status": "ok", "output": _run_remote_command("curl -sS http://127.0.0.1:8080/v1/models")},
+        "telemetry": kai_telemetry,
+    }
+
+
+def ops_command_catalog() -> dict[str, list[str]]:
+    # Shared allowlist for UI, MCP custom tools and chat/Ops routing.
+    return {
+        "gateway": sorted(_gateway_ops_handlers().keys()),
+        "kai": sorted(_kai_ops_handlers().keys()),
+    }
+
+
 def run_ops_command(target: str, command_name: str) -> dict[str, str]:
     normalized_target = target.strip().lower()
     normalized_command = command_name.strip().lower()
 
     if normalized_target == "gateway":
-        handlers = {
-            "status": gateway_status,
-            "logs": gateway_logs,
-            "restart": restart_gateway,
-            "uptime": lambda: {"status": "ok", "output": _run_local_command(["uptime"])},
-            "health": lambda: {"status": "ok", "output": _run_local_command(["curl", "-sS", "http://127.0.0.1:8000/health"])},
-            "tools": gateway_tools,
-            "skills": gateway_skills,
-            "apt_update": gateway_apt_update,
-            "install_git": lambda: gateway_install_package("git"),
-            "install_curl": lambda: gateway_install_package("curl"),
-            "install_gh": lambda: gateway_install_package("gh"),
-            "install_ripgrep": lambda: gateway_install_package("ripgrep"),
-            "install_htop": lambda: gateway_install_package("htop"),
-            "install_tmux": lambda: gateway_install_package("tmux"),
-        }
+        handlers = _gateway_ops_handlers()
     elif normalized_target == "kai":
-        handlers = {
-            "status": kai_status,
-            "logs": kai_logs,
-            "restart": restart_mi50_backend,
-            "health": lambda: {"status": "ok", "output": _run_remote_command("curl -sS http://127.0.0.1:8080/health")},
-            "models": lambda: {"status": "ok", "output": _run_remote_command("curl -sS http://127.0.0.1:8080/v1/models")},
-            "telemetry": kai_telemetry,
-        }
+        handlers = _kai_ops_handlers()
     else:
         raise RuntimeError("Unbekanntes Ops-Ziel.")
 

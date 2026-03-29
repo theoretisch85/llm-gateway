@@ -7,7 +7,7 @@ Ein lokaler OpenAI-kompatibler Orchestrator fuer VS Code Clients, der Requests a
 </p>
 
 <p align="center">
-  Linux-styliger Admin-Hub mit Dashboard, Profilumschaltung, Chat, Memory, Database, Storage, Home Assistant und Ops.
+  Linux-styliger Admin-Hub mit Dashboard, Profilumschaltung, Skills/MCP, Chat, Memory, Database, Storage, Home Assistant und Ops.
 </p>
 
 ## Praxis-Setup
@@ -657,6 +657,9 @@ Im Admin-Hub gibt es jetzt zusaetzlich:
   Dateien wie `.txt`, `.md`, `.pdf`, `.csv`, `.json`, `.log`, `.yaml`, `.yml` koennen dort abgelegt werden. Die Datei selbst bleibt im Storage, waehrend Metadaten und extrahierter Text in PostgreSQL landen.
   Damit ist die Grundlage gelegt, diese Dokumente als KI-Kontext oder Wissensbasis zu verwenden. Im Admin-Chat koennen gespeicherte Dokumente direkt als Kontext ausgewaehlt werden.
   Wichtige ehrliche Einschraenkung: Der Gateway macht bewusst keinen nativen SMB-Login. SMB wird als gemountetes Dateisystem behandelt.
+- `Skills / MCP`
+  Zeigt alle aktiven MCP-Tools (builtin + custom) und erlaubt das Anlegen eigener Custom-MCP-Tools.
+  Ein Custom-Tool mappt genau auf einen freigegebenen Ops-Befehl (`target + command`), damit Kai kontrolliert Tools nutzen kann, ohne ein freies Root-Terminal zu bekommen.
 
 Fuer dein geplantes Homelab-Setup ist das die pragmatische Empfehlung:
 
@@ -831,16 +834,51 @@ Neu im Admin-Hub unter `Pi / Devices`:
 - SSH-Ziel fuer den Pi
 - serverseitig generiertes Bootstrap-Skript
 - SSH-Bootstrap-V1 direkt aus dem Admin-Hub
+- expliziter Button `PI installieren` pro Profil (fuer rohe Pi-Installationen)
+- direkter Connect-Flow `Verbinden / .env sync` fuer bestehende Kai-Pis
+- neue zentrale `Kai Face`-Steuerung (Style + State + Layer) direkt aus dem Gateway
+- in der Face-Steuerung jetzt auch `Render Mode` (`vector` oder `sprite_pack`) plus Pack-Name
+- `F1..F17`-Varianten direkt im Gateway waehlbar (nahe am Referenz-Set)
+- fuer fertige Kai-Pis reicht auch ein einfaches Profil mit Host, User, Port und optional Passwort
+- wenn `DEVICE_TOKEN` leer bleibt, wird beim Speichern automatisch ein neuer Token erzeugt
 
 Wichtige praktische Entscheidung:
 
-- V1 setzt auf SSH-Key-Auth statt gespeicherter SSH-Passwoerter
+- V1 bevorzugt SSH-Key-Auth, kann fuer einfache Pi-Setups aber auch SSH-Passwoerter nutzen
 - beim Aktivieren eines Device-Profils wird dessen Token als `DEVICE_SHARED_TOKEN` in den Gateway uebernommen
+- `PI installieren` startet denselben SSH-Install-Flow direkt pro Profil und ist fuer frische Pi-Basisimages gedacht
+- der Connect-Flow schreibt `GATEWAY_BASE_URL` und `DEVICE_TOKEN` direkt in die Pi-`.env` und startet `kai.service` neu
+- Face-Styles koennen jetzt via Gateway ueber SSH direkt auf dem Pi angewendet werden (kein Pi-Menue notwendig)
+- eigene Sprite-Packs koennen auf dem Pi unter `/home/pi/kai/styles/packs/<name>` abgelegt und danach im Gateway aktiviert werden
+- bei der Pi-Probe erkennt der Gateway jetzt sowohl `kai.service` als User-Service als auch als System-Service
 - der Bootstrap legt auf dem Pi eine kleine Python-Basis an:
   - `.env`
   - `requirements.txt`
   - `pi_gateway_client.py`
 - damit ist der Pi noch nicht der volle Sprach-/Avatar-Stack, aber sauber fuer die naechste Ausbaustufe vorbereitet
+
+Fuer spaetere Kamera-/Snapshot-Events gibt es jetzt zusaetzlich:
+
+- `POST /api/device/vision/event`
+
+Gedacht fuer:
+
+- Pi-Webcam oder externe Kamera-Node
+- Snapshot bei Trigger wie `person_detected`
+- Bild landet im Storage
+- wenn `VISION_MODEL_NAME` gesetzt ist, wird direkt eine Bildanalyse erzeugt
+- optional kann zusammen mit dem Bild auch gleich eine Sprach-/Chat-Anfrage an Kai geschickt werden
+
+Beispiel:
+
+```bash
+curl -s http://127.0.0.1:8000/api/device/vision/event \
+  -H "Authorization: Bearer DEVICE_TOKEN" \
+  -F "CAMERA_NAME=pi-cam" \
+  -F "TRIGGER_TYPE=person_detected" \
+  -F "MESSAGE=Wer oder was ist auf diesem Bild und wie soll ich darauf reagieren?" \
+  -F "IMAGE_FILE=@/pfad/zum/snapshot.jpg"
+```
 
 ## MCP (Tool-Broker)
 
@@ -852,10 +890,19 @@ Endpoints:
 - `GET /api/mcp/tools` (Liste der verfuegbaren Tools)
 - `POST /api/mcp/call` (Tool ausfuehren)
 
+Admin-Management (Skills-Tab):
+
+- `GET /api/admin/mcp/tools`
+- `GET /api/admin/mcp/custom-tools`
+- `POST /api/admin/mcp/custom-tools`
+- `POST /api/admin/mcp/custom-tools/{tool_name}/delete`
+- `GET /api/admin/ops/catalog` (erlaubte Ops-Targets/Befehle fuer Custom-Tools)
+
 Auth:
 
 - Standard ist `Authorization: Bearer API_BEARER_TOKEN`
 - Optional fuer Devices: `Authorization: Bearer DEVICE_SHARED_TOKEN` oder `X-Device-Token`
+- Sensitive Gateway-Tools (`gateway.ops`, `gateway.custom_tool.*` und daraus abgeleitete Custom-Ops-Tools) sind bewusst nur fuer Admin/API-Token erlaubt, nicht fuer Device-Token.
 
 Beispiel:
 
@@ -878,6 +925,26 @@ Hinweis:
 
 - Die MCP-V1 ist absichtlich klein gehalten.
 - Schreiben/Schalten laeuft nur ueber freigegebene HA-Services.
+- Custom-Tools sind kein freies Shell-Feature: sie duerfen nur auf den vorhandenen Ops-Allowlist-Befehlen aufsetzen.
+- Fuer automatisches Tool-Management stehen zusaetzlich die MCP-Tools `gateway.custom_tool.list`, `gateway.custom_tool.save` und `gateway.custom_tool.delete` bereit.
+- Builin-Tool-Namen sind reserviert und koennen nicht als Custom-Tool-Namen ueberschrieben oder geloescht werden.
+
+## Vision / Bildanalyse
+
+Fuer Bild-Uploads im Chat, Snapshot-Events vom Pi und spaetere Kamera-Nodes kann der Gateway optional ein eigenes Vision-Modell benutzen.
+
+Relevante Settings:
+
+- `VISION_BASE_URL`
+- `VISION_MODEL_NAME`
+- `VISION_PROMPT`
+- `VISION_MAX_TOKENS`
+
+Wichtige praktische Entscheidung:
+
+- Devstral bleibt dein Text-/Steuerungsmodell.
+- Bildverstehen sollte ueber ein separates Vision-Modell laufen.
+- Wenn kein Vision-Modell gesetzt ist, werden Bilddateien trotzdem gespeichert, aber nur ohne echte Bildbeschreibung.
 
 ## llama.cpp Startbefehl
 

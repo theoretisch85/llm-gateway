@@ -11,11 +11,14 @@ from uuid import uuid4
 from fastapi import UploadFile
 
 from app.config import Settings
+from app.services.llamacpp_client import LlamaCppError, LlamaCppTimeoutError
+from app.services.vision import VisionConfigError, analyze_image_bytes, vision_is_configured
 
 
 STORAGE_PROFILE_FILE = Path("/opt/llm-gateway/.runtime/storage_locations.json")
 ALLOWED_STORAGE_TYPES = {"local", "smb_mount"}
 TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".log", ".csv", ".json", ".yaml", ".yml"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 MAX_UPLOAD_SIZE_BYTES = 25 * 1024 * 1024
 DOCUMENT_SCHEMA_SQL = """
 create table if not exists document_assets (
@@ -29,9 +32,12 @@ create table if not exists document_assets (
   relative_path text not null,
   extracted_text text,
   text_excerpt text,
+  asset_kind text not null default 'document',
   tags text,
   created_at timestamptz not null default now()
 );
+
+alter table document_assets add column if not exists asset_kind text not null default 'document';
 
 create index if not exists idx_document_assets_created
   on document_assets(created_at desc);
@@ -70,6 +76,11 @@ def _sanitize_filename(file_name: str) -> str:
     base_name = Path(file_name or "document").name
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", base_name).strip("._")
     return safe or "document"
+
+
+def _is_image_upload(file_name: str, media_type: str | None) -> bool:
+    suffix = Path(file_name).suffix.lower()
+    return suffix in IMAGE_EXTENSIONS or (media_type or "").startswith("image/")
 
 
 def _default_profile_name(backend_type: str, base_path: str) -> str:
@@ -243,7 +254,28 @@ def _extract_text(file_name: str, media_type: str | None, raw_bytes: bytes) -> s
                 pages.append(text.strip())
         return "\n\n".join(pages).strip()
 
-    raise RuntimeError("Dateityp nicht unterstuetzt. Erlaubt sind aktuell .txt, .md und .pdf.")
+    raise RuntimeError("Dateityp nicht unterstuetzt. Erlaubt sind aktuell Text, PDF und gaengige Bilddateien.")
+
+
+async def _extract_image_analysis(settings: Settings, file_name: str, media_type: str | None, raw_bytes: bytes) -> tuple[str, str]:
+    if not vision_is_configured(settings):
+        return "", "Bild gespeichert. Vision-Modell ist noch nicht konfiguriert."
+    try:
+        summary = await analyze_image_bytes(
+            settings,
+            file_name=file_name,
+            media_type=media_type,
+            raw_bytes=raw_bytes,
+        )
+    except VisionConfigError as exc:
+        return "", f"Bild gespeichert. Vision-Konfiguration fehlt: {exc}"
+    except (LlamaCppError, LlamaCppTimeoutError) as exc:
+        return "", f"Bild gespeichert. Vision-Analyse fehlgeschlagen: {exc}"
+
+    summary = summary.strip()
+    if not summary:
+        return "", "Bild gespeichert. Vision-Modell hat keine Beschreibung geliefert."
+    return summary, _build_excerpt(summary)
 
 
 def _build_excerpt(text: str, limit: int = 400) -> str:
@@ -291,6 +323,7 @@ async def upload_document(
         raise RuntimeError("Datei ist zu gross. Aktuell sind maximal 25 MB pro Upload vorgesehen.")
 
     safe_name = _sanitize_filename(file.filename or "document")
+    asset_kind = "image" if _is_image_upload(safe_name, file.content_type) else "document"
     created_at = _utcnow()
     subdir = Path(str(created_at.year)) / f"{created_at.month:02d}"
     base_path = _ensure_writable_path(str(profile["base_path"]))
@@ -301,9 +334,18 @@ async def upload_document(
     try:
         target_path.write_bytes(raw_bytes)
 
-        extracted_text = _extract_text(safe_name, file.content_type, raw_bytes)
-        if not extracted_text.strip():
-            extracted_text = ""
+        extracted_text = ""
+        text_excerpt = ""
+        analysis_status = ""
+        if asset_kind == "image":
+            extracted_text, text_excerpt = await _extract_image_analysis(settings, safe_name, file.content_type, raw_bytes)
+            analysis_status = "analyzed" if extracted_text else "stored_without_analysis"
+        else:
+            extracted_text = _extract_text(safe_name, file.content_type, raw_bytes)
+            if not extracted_text.strip():
+                extracted_text = ""
+            text_excerpt = _build_excerpt(extracted_text) if extracted_text else ""
+            analysis_status = "extracted" if extracted_text else "stored_without_text"
 
         conn = await _connect(settings)
         try:
@@ -319,11 +361,12 @@ async def upload_document(
                   relative_path,
                   extracted_text,
                   text_excerpt,
+                  asset_kind,
                   tags
                 )
-                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 returning id, storage_location_id, storage_location_name, title, file_name, media_type,
-                          size_bytes, relative_path, text_excerpt, tags, created_at
+                          size_bytes, relative_path, extracted_text, text_excerpt, asset_kind, tags, created_at
                 """,
                 str(profile["id"]),
                 str(profile["name"]),
@@ -333,7 +376,8 @@ async def upload_document(
                 len(raw_bytes),
                 relative_path,
                 extracted_text,
-                _build_excerpt(extracted_text) if extracted_text else "",
+                text_excerpt,
+                asset_kind,
                 (tags or "").strip(),
             )
         finally:
@@ -342,7 +386,9 @@ async def upload_document(
         target_path.unlink(missing_ok=True)
         raise
 
-    return _serialize_document_row(row)
+    document = _serialize_document_row(row)
+    document["analysis_status"] = analysis_status
+    return document
 
 
 async def list_documents(settings: Settings, limit: int = 30) -> list[dict[str, object]]:
@@ -351,7 +397,7 @@ async def list_documents(settings: Settings, limit: int = 30) -> list[dict[str, 
         rows = await conn.fetch(
             """
             select id, storage_location_id, storage_location_name, title, file_name, media_type,
-                   size_bytes, relative_path, text_excerpt, tags, created_at
+                   size_bytes, relative_path, text_excerpt, asset_kind, tags, created_at
             from document_assets
             order by created_at desc
             limit $1
@@ -371,7 +417,7 @@ async def get_document_contexts(settings: Settings, document_ids: list[str]) -> 
     try:
         rows = await conn.fetch(
             """
-            select id, title, file_name, extracted_text, text_excerpt
+            select id, title, file_name, media_type, asset_kind, extracted_text, text_excerpt
             from document_assets
             where id = any($1::uuid[])
             order by created_at asc

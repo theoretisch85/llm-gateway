@@ -12,6 +12,7 @@ from app.metrics import metrics
 from app.services.home_assistant import HomeAssistantClient, HomeAssistantConfigError, HomeAssistantRequestError
 from app.services.backend_control import (
     gateway_logs,
+    ops_command_catalog,
     gateway_system_telemetry,
     gateway_status,
     kai_logs,
@@ -34,6 +35,8 @@ from app.services.backend_profiles import (
     list_backend_profiles,
     save_backend_profile,
 )
+from app.services.mcp_custom_tools import delete_custom_mcp_tool, list_custom_mcp_tools, save_custom_mcp_tool
+from app.services.mcp_registry import get_builtin_mcp_tool_names, get_mcp_tools
 from app.services.config_store import read_runtime_config, write_runtime_config
 from app.services.database_admin import database_status, initialize_database_schema
 from app.services.database_profiles import (
@@ -42,7 +45,14 @@ from app.services.database_profiles import (
     list_database_profiles,
     save_database_profile,
 )
-from app.services.device_bootstrap import build_device_bootstrap_script, run_device_bootstrap_over_ssh
+from app.services.device_bootstrap import (
+    build_device_install_script,
+    run_device_bootstrap_over_ssh,
+    run_device_env_sync_over_ssh,
+    run_device_face_apply_over_ssh,
+    run_device_install_over_ssh,
+    run_device_probe_over_ssh,
+)
 from app.services.device_profiles import (
     activate_device_profile,
     delete_device_profile,
@@ -71,7 +81,7 @@ async def admin_page(request: Request, tab: str = "dashboard") -> HTMLResponse |
     username = get_admin_session_username(request)
     if not username:
         return RedirectResponse(url="/admin/login?next=/internal/admin", status_code=303)
-    active_tab = tab if tab in {"dashboard", "settings", "chat", "memory", "database", "home-assistant", "storage", "ops", "devices"} else "dashboard"
+    active_tab = tab if tab in {"dashboard", "settings", "skills", "chat", "memory", "database", "home-assistant", "storage", "ops", "devices"} else "dashboard"
     initial_data = await _build_initial_admin_data(base_url=str(request.base_url).rstrip("/"))
     db_message = request.query_params.get("db_message")
     if db_message:
@@ -117,10 +127,11 @@ async def admin_page(request: Request, tab: str = "dashboard") -> HTMLResponse |
             initial_data["device_profile_form_ssh_host"] = str(profile.get("ssh_host") or "")
             initial_data["device_profile_form_ssh_user"] = str(profile.get("ssh_user") or "")
             initial_data["device_profile_form_ssh_port"] = str(profile.get("ssh_port") or "22")
+            initial_data["device_profile_form_ssh_password"] = ""
             initial_data["device_profile_form_remote_dir"] = str(profile.get("remote_dir") or "~/kai-pi")
             initial_data["device_profile_form_ssh_root_prefix"] = str(profile.get("ssh_root_prefix") or "sudo -n")
             initial_data["device_profile_form_notes"] = str(profile.get("notes") or "")
-            initial_data["device_bootstrap_preview"] = build_device_bootstrap_script(profile)
+            initial_data["device_bootstrap_preview"] = build_device_install_script(profile)
             initial_data["device_status"] = f"Device-Profil '{profile.get('name')}' zum Bearbeiten geladen."
         except Exception as exc:
             initial_data["device_status"] = str(exc)
@@ -168,6 +179,10 @@ def _build_admin_config_values(settings) -> dict[str, str]:
     current.setdefault("HOME_ASSISTANT_TIMEOUT_SECONDS", str(settings.home_assistant_timeout_seconds))
     current.setdefault("HOME_ASSISTANT_ALLOWED_SERVICES", settings.home_assistant_allowed_services)
     current.setdefault("HOME_ASSISTANT_ALLOWED_ENTITY_PREFIXES", settings.home_assistant_allowed_entity_prefixes)
+    current.setdefault("VISION_BASE_URL", settings.vision_base_url or "")
+    current.setdefault("VISION_MODEL_NAME", settings.vision_model_name or "")
+    current.setdefault("VISION_PROMPT", settings.vision_prompt)
+    current.setdefault("VISION_MAX_TOKENS", str(settings.vision_max_tokens))
     current.setdefault("MI50_SSH_HOST", settings.mi50_ssh_host or "")
     current.setdefault("MI50_SSH_USER", settings.mi50_ssh_user or "")
     current.setdefault("MI50_SSH_PORT", str(settings.mi50_ssh_port))
@@ -537,6 +552,7 @@ async def save_device_form(
     PI_SSH_HOST: str = Form(default=""),
     PI_SSH_USER: str = Form(default=""),
     PI_SSH_PORT: str = Form(default="22"),
+    PI_SSH_PASSWORD: str = Form(default=""),
     PI_REMOTE_DIR: str = Form(default="~/kai-pi"),
     PI_SSH_ROOT_PREFIX: str = Form(default="sudo -n"),
     DEVICE_NOTES: str = Form(default=""),
@@ -552,6 +568,7 @@ async def save_device_form(
             ssh_host=PI_SSH_HOST,
             ssh_user=PI_SSH_USER,
             ssh_port=PI_SSH_PORT,
+            ssh_password=PI_SSH_PASSWORD,
             remote_dir=PI_REMOTE_DIR,
             ssh_root_prefix=PI_SSH_ROOT_PREFIX,
             notes=DEVICE_NOTES,
@@ -584,6 +601,136 @@ async def bootstrap_device_form(request: Request, profile_id: str = Form(...)) -
         run_device_bootstrap_over_ssh(profile)
         activate_device_profile(profile_id)
         return _device_redirect(f"Pi-Bootstrap fuer '{profile['name']}' erfolgreich ueber SSH ausgefuehrt.", error=False)
+    except Exception as exc:
+        return _device_redirect(str(exc), error=True)
+
+
+@router.post("/internal/admin/device/install-form")
+async def install_device_form(request: Request, profile_id: str = Form(...)) -> RedirectResponse:
+    if not get_admin_session_username(request):
+        return RedirectResponse(url="/admin/login?next=/internal/admin%3Ftab%3Ddevices", status_code=303)
+    try:
+        profile = get_device_profile(profile_id)
+        write_runtime_config({"DEVICE_SHARED_TOKEN": str(profile.get("device_token") or "")})
+        result = run_device_install_over_ssh(profile)
+        activate_device_profile(profile_id)
+        output = str(result.get("output") or "").strip()
+        compact = " | ".join(line.strip() for line in output.splitlines() if line.strip())
+        return _device_redirect(f"Pi-Installation fuer '{profile['name']}' erfolgreich: {compact or 'ok'}", error=False)
+    except Exception as exc:
+        return _device_redirect(str(exc), error=True)
+
+
+@router.post("/internal/admin/device/connect-form")
+async def connect_device_form(request: Request, profile_id: str = Form(...)) -> RedirectResponse:
+    if not get_admin_session_username(request):
+        return RedirectResponse(url="/admin/login?next=/internal/admin%3Ftab%3Ddevices", status_code=303)
+    try:
+        profile = get_device_profile(profile_id)
+        write_runtime_config({"DEVICE_SHARED_TOKEN": str(profile.get("device_token") or "")})
+        result = run_device_env_sync_over_ssh(profile)
+        activate_device_profile(profile_id)
+        output = str(result.get("output") or "").strip()
+        compact = " | ".join(line.strip() for line in output.splitlines() if line.strip())
+        return _device_redirect(f"Kai-Pi '{profile['name']}' verbunden: {compact or 'ok'}", error=False)
+    except Exception as exc:
+        return _device_redirect(str(exc), error=True)
+
+
+@router.post("/internal/admin/device/probe-form")
+async def probe_device_form(request: Request, profile_id: str = Form(...)) -> RedirectResponse:
+    if not get_admin_session_username(request):
+        return RedirectResponse(url="/admin/login?next=/internal/admin%3Ftab%3Ddevices", status_code=303)
+    try:
+        profile = get_device_profile(profile_id)
+        result = run_device_probe_over_ssh(profile)
+        output = str(result.get("output") or "").strip()
+        compact = " | ".join(line.strip() for line in output.splitlines() if line.strip())
+        return _device_redirect(f"Pi-Probe fuer '{profile['name']}': {compact or 'ok'}", error=False)
+    except Exception as exc:
+        return _device_redirect(str(exc), error=True)
+
+
+@router.post("/internal/admin/device/face-apply-form")
+async def apply_device_face_form(
+    request: Request,
+    profile_id: str = Form(...),
+    FACE_STYLE_NAME: str = Form(default=""),
+    FACE_STATE: str = Form(default="idle"),
+    FACE_RENDER_MODE: str = Form(default="vector"),
+    FACE_SPRITE_PACK: str = Form(default=""),
+    FACE_VARIANT: str = Form(default="custom"),
+    FACE_FACE_COLOR: str = Form(default="black"),
+    FACE_EYE_SHAPE: str = Form(default="round"),
+    FACE_EYE_SPACING: str = Form(default="normal"),
+    FACE_IRIS_COLOR: str = Form(default="#59c7ff"),
+    FACE_PUPILS: str = Form(default=""),
+    FACE_IRIS: str = Form(default=""),
+    FACE_MOUTH: str = Form(default=""),
+    FACE_NOSE: str = Form(default=""),
+    FACE_CHEEKS: str = Form(default=""),
+    FACE_EARS: str = Form(default=""),
+    FACE_EYEBROWS: str = Form(default=""),
+    FACE_EYELIDS: str = Form(default=""),
+    FACE_HAIR: str = Form(default=""),
+    FACE_CLOSE_EYES: str = Form(default=""),
+) -> RedirectResponse:
+    if not get_admin_session_username(request):
+        return RedirectResponse(url="/admin/login?next=/internal/admin%3Ftab%3Ddevices", status_code=303)
+    try:
+        profile = get_device_profile(profile_id)
+        write_runtime_config({"DEVICE_SHARED_TOKEN": str(profile.get("device_token") or "")})
+        activate_device_profile(profile_id)
+
+        state_value = (FACE_STATE or "idle").strip().lower()
+        if state_value not in {"idle", "listening", "thinking", "speaking", "happy", "sleepy", "error"}:
+            state_value = "idle"
+        render_mode = (FACE_RENDER_MODE or "vector").strip().lower()
+        if render_mode not in {"vector", "sprite_pack"}:
+            render_mode = "vector"
+        sprite_pack = (FACE_SPRITE_PACK or "").strip()
+        variant = (FACE_VARIANT or "custom").strip().upper()
+        if variant not in {"CUSTOM", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13", "F14", "F15", "F16", "F17"}:
+            variant = "CUSTOM"
+        face_color = (FACE_FACE_COLOR or "black").strip().lower()
+        if face_color not in {"black", "white"}:
+            face_color = "black"
+        eye_shape = (FACE_EYE_SHAPE or "round").strip().lower()
+        if eye_shape not in {"round", "oval", "small"}:
+            eye_shape = "round"
+        eye_spacing = (FACE_EYE_SPACING or "normal").strip().lower()
+        if eye_spacing not in {"normal", "far", "raised"}:
+            eye_spacing = "normal"
+
+        face_config = {
+            "renderMode": render_mode,
+            "spritePack": sprite_pack,
+            "variant": variant,
+            "faceColor": face_color,
+            "eyeShape": eye_shape,
+            "eyeSpacing": eye_spacing,
+            "irisColor": (FACE_IRIS_COLOR or "#59c7ff").strip() or "#59c7ff",
+            "pupils": _form_bool(FACE_PUPILS),
+            "iris": _form_bool(FACE_IRIS),
+            "mouth": _form_bool(FACE_MOUTH),
+            "nose": _form_bool(FACE_NOSE),
+            "cheeks": _form_bool(FACE_CHEEKS),
+            "ears": _form_bool(FACE_EARS),
+            "eyebrows": _form_bool(FACE_EYEBROWS),
+            "eyelids": _form_bool(FACE_EYELIDS),
+            "hair": _form_bool(FACE_HAIR),
+            "closeEyes": _form_bool(FACE_CLOSE_EYES),
+        }
+        style_name = (FACE_STYLE_NAME or "").strip() or f"gateway_{state_value}"
+        result = run_device_face_apply_over_ssh(
+            profile,
+            style_name=style_name,
+            state=state_value,
+            face_config=face_config,
+        )
+        output = str(result.get("output") or "").strip()
+        compact = " | ".join(line.strip() for line in output.splitlines() if line.strip())
+        return _device_redirect(f"Kai-Face auf '{profile['name']}' gesetzt: {compact or style_name}", error=False)
     except Exception as exc:
         return _device_redirect(str(exc), error=True)
 
@@ -630,6 +777,10 @@ def _device_redirect(message: str, error: bool) -> RedirectResponse:
     return RedirectResponse(url=f"/internal/admin?{urlencode(query)}", status_code=303)
 
 
+def _form_bool(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 @router.get("/api/admin/ops/{target}/status", dependencies=[Depends(require_admin_api_auth)])
 async def ops_status(target: str) -> JSONResponse:
     try:
@@ -674,6 +825,74 @@ async def ops_run(request: Request, target: str, command_name: str) -> JSONRespo
         return JSONResponse(run_ops_command(target, command_name))
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/api/admin/ops/catalog", dependencies=[Depends(require_admin_api_auth)])
+async def get_ops_catalog() -> JSONResponse:
+    return JSONResponse({"targets": ops_command_catalog()})
+
+
+@router.get("/api/admin/mcp/tools", dependencies=[Depends(require_admin_api_auth)])
+async def get_admin_mcp_tools() -> JSONResponse:
+    custom_map = {item["name"]: item for item in list_custom_mcp_tools()}
+    tools: list[dict[str, object]] = []
+    for item in get_mcp_tools():
+        name = str(item.get("name") or "")
+        custom = custom_map.get(name)
+        tool_row: dict[str, object] = {
+            "name": name,
+            "description": str(item.get("description") or ""),
+            "input_schema": item.get("input_schema") if isinstance(item.get("input_schema"), dict) else {},
+            "output_schema": item.get("output_schema") if isinstance(item.get("output_schema"), dict) else {},
+            "is_custom": bool(custom),
+            "requires_admin": bool(item.get("requires_admin")),
+        }
+        if custom:
+            tool_row["target"] = custom.get("target")
+            tool_row["command"] = custom.get("command")
+        tools.append(tool_row)
+    return JSONResponse({"tools": tools})
+
+
+@router.get("/api/admin/mcp/custom-tools", dependencies=[Depends(require_admin_api_auth)])
+async def get_admin_custom_mcp_tools() -> JSONResponse:
+    return JSONResponse(
+        {
+            "tools": list_custom_mcp_tools(),
+            "ops_catalog": ops_command_catalog(),
+            "reserved_tool_names": sorted(get_builtin_mcp_tool_names()),
+        }
+    )
+
+
+@router.post("/api/admin/mcp/custom-tools", dependencies=[Depends(require_admin_api_auth)])
+async def save_admin_custom_mcp_tool(payload: dict[str, str | None]) -> JSONResponse:
+    name = str(payload.get("name") or "").strip().lower()
+    if name in get_builtin_mcp_tool_names():
+        raise HTTPException(status_code=400, detail="Name ist reserviert (builtin MCP-Tool).")
+
+    try:
+        saved = save_custom_mcp_tool(
+            name=name,
+            description=str(payload.get("description") or ""),
+            target=str(payload.get("target") or ""),
+            command=str(payload.get("command") or ""),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return JSONResponse({"saved": saved, "tools": list_custom_mcp_tools()})
+
+
+@router.post("/api/admin/mcp/custom-tools/{tool_name}/delete", dependencies=[Depends(require_admin_api_auth)])
+async def delete_admin_custom_mcp_tool(tool_name: str) -> JSONResponse:
+    if tool_name.strip().lower() in get_builtin_mcp_tool_names():
+        raise HTTPException(status_code=400, detail="Builtin MCP-Tools koennen nicht geloescht werden.")
+    try:
+        result = delete_custom_mcp_tool(tool_name)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse({"deleted": result, "tools": list_custom_mcp_tools()})
 
 
 async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
@@ -740,6 +959,10 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
         "ha_configured": "-",
         "ha_connected": "-",
         "ha_location": "-",
+        "skills_status": "Skills/MCP-Verwaltung ist bereit.",
+        "mcp_tools_count": "0",
+        "mcp_custom_tools_count": "0",
+        "mcp_custom_tools_html": '<div class="muted">Noch keine Custom-MCP-Tools gespeichert.</div>',
         "device_status": "Pi-/Device-Profilverwaltung ist bereit.",
         "device_profiles_html": '<div class="muted">Noch keine Device-Profile gespeichert.</div>',
         "device_profile_form_id": "",
@@ -749,11 +972,22 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
         "device_profile_form_ssh_host": "",
         "device_profile_form_ssh_user": "pi",
         "device_profile_form_ssh_port": "22",
+        "device_profile_form_ssh_password": "",
         "device_profile_form_remote_dir": "~/kai-pi",
         "device_profile_form_ssh_root_prefix": "sudo -n",
         "device_profile_form_notes": "",
         "device_active_token_redacted": _redact_device_token(settings.device_shared_token or ""),
         "device_bootstrap_preview": "Noch kein Device-Profil ausgewaehlt.",
+        "device_face_profile_options_html": '<option value="">zuerst Device-Profil speichern</option>',
+        "device_face_style_name": "gateway_idle",
+        "device_face_state": "idle",
+        "device_face_render_mode": "vector",
+        "device_face_sprite_pack": "robot_v1",
+        "device_face_variant": "custom",
+        "device_face_face_color": "black",
+        "device_face_eye_shape": "round",
+        "device_face_eye_spacing": "normal",
+        "device_face_iris_color": "#59c7ff",
         "backend_profiles_html": '<div class="muted">Noch keine KI-Profile gespeichert.</div>',
         "backend_profile_form_id": "",
         "backend_profile_form_name": "",
@@ -800,12 +1034,16 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
         data["device_profile_form_ssh_host"] = str(active_device_profile.get("ssh_host") or "")
         data["device_profile_form_ssh_user"] = str(active_device_profile.get("ssh_user") or "pi")
         data["device_profile_form_ssh_port"] = str(active_device_profile.get("ssh_port") or "22")
+        data["device_profile_form_ssh_password"] = ""
         data["device_profile_form_remote_dir"] = str(active_device_profile.get("remote_dir") or "~/kai-pi")
         data["device_profile_form_ssh_root_prefix"] = str(active_device_profile.get("ssh_root_prefix") or "sudo -n")
         data["device_profile_form_notes"] = str(active_device_profile.get("notes") or "")
         data["device_active_token_redacted"] = _redact_device_token(str(active_device_profile.get("device_token") or settings.device_shared_token or ""))
-        data["device_bootstrap_preview"] = build_device_bootstrap_script(active_device_profile)
+        data["device_bootstrap_preview"] = build_device_install_script(active_device_profile)
+        data["device_face_style_name"] = f"gateway_{str(active_device_profile.get('name') or 'kai')}"
     data["device_profiles_html"] = _render_device_profiles_html(list_device_profiles())
+    data["device_face_profile_options_html"] = _render_device_profile_options_html(list_device_profiles(), str(active_device_profile.get("id") or "") if active_device_profile else "")
+    data["mcp_custom_tools_html"] = _render_mcp_custom_tools_html(list_custom_mcp_tools())
 
     client = LlamaCppClient(settings)
     try:
@@ -909,6 +1147,8 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
         data["ha_configured"] = "yes"
         data["ha_connected"] = "no"
     data["dashboard_ha_summary"] = f"{data['ha_configured']} / {data['ha_connected']}"
+    data["mcp_tools_count"] = str(len(get_mcp_tools()))
+    data["mcp_custom_tools_count"] = str(len(list_custom_mcp_tools()))
 
     return data
 
@@ -1085,6 +1325,32 @@ def _render_backend_profile_preview(profile: dict[str, object]) -> str:
     ).strip()
 
 
+def _render_mcp_custom_tools_html(tools: list[dict[str, object]]) -> str:
+    if not tools:
+        return '<div class="muted">Noch keine Custom-MCP-Tools gespeichert.</div>'
+
+    items: list[str] = []
+    for tool in tools:
+        name = escape(str(tool.get("name") or "custom.tool"))
+        description = escape(str(tool.get("description") or "-"))
+        target = escape(str(tool.get("target") or "gateway"))
+        command = escape(str(tool.get("command") or "status"))
+        name_js = str(tool.get("name") or "").replace("\\", "\\\\").replace("'", "\\'")
+        items.append(
+            f"""
+            <div class="list-card">
+              <h3>{name}</h3>
+              <div class="list-meta">{description}</div>
+              <div class="list-meta">Ops: <code>{target}.{command}</code></div>
+              <div class="actions">
+                <button class="secondary" type="button" onclick="deleteCustomMcpTool('{name_js}')">Loeschen</button>
+              </div>
+            </div>
+            """
+        )
+    return "".join(items)
+
+
 def _render_storage_profiles_html(profiles: list[dict[str, object]]) -> str:
     if not profiles:
         return '<div class="muted">Noch keine Storage-Profile vorhanden.</div>'
@@ -1184,11 +1450,15 @@ def _render_device_profiles_html(profiles: list[dict[str, object]]) -> str:
         profile_id = escape(str(profile.get("id") or ""))
         name = escape(str(profile.get("name") or "Pi Device"))
         gateway_base_url = escape(str(profile.get("gateway_base_url") or "-"))
-        ssh_host = escape(str(profile.get("ssh_host") or "-"))
-        ssh_user = escape(str(profile.get("ssh_user") or "-"))
+        raw_ssh_host = str(profile.get("ssh_host") or "").strip()
+        raw_ssh_user = str(profile.get("ssh_user") or "").strip()
+        ssh_host = escape(raw_ssh_host or "-")
+        ssh_user = escape(raw_ssh_user or "-")
         ssh_port = escape(str(profile.get("ssh_port") or "22"))
         remote_dir = escape(str(profile.get("remote_dir") or "~/kai-pi"))
         token_redacted = escape(str(profile.get("device_token_redacted") or "-"))
+        ssh_auth_mode = escape(str(profile.get("ssh_auth_mode") or "key"))
+        bootstrap_ready = bool(raw_ssh_host and raw_ssh_user)
         badge = '<span class="status" style="display:inline-block;padding:4px 8px;margin:0 0 0 8px;">aktiv</span>' if profile.get("is_active") else ""
         actions = []
         if not profile.get("is_active"):
@@ -1201,14 +1471,33 @@ def _render_device_profiles_html(profiles: list[dict[str, object]]) -> str:
                 """
             )
         actions.append(f'<a class="secondary" href="/internal/admin?tab=devices&edit_device={profile_id}">Bearbeiten</a>')
-        actions.append(
-            f"""
-            <form method="post" action="/internal/admin/device/bootstrap-form" onsubmit="return confirm('Pi-Bootstrap fuer dieses Profil jetzt ueber SSH starten?');">
-              <input type="hidden" name="profile_id" value="{profile_id}">
-              <button class="secondary" type="submit">Bootstrap</button>
-            </form>
-            """
-        )
+        if bootstrap_ready:
+            actions.append(
+                f"""
+                <form method="post" action="/internal/admin/device/connect-form" onsubmit="return confirm('Gateway-URL und Device-Token jetzt per SSH auf den Kai-Pi schreiben und kai.service neu starten?');">
+                  <input type="hidden" name="profile_id" value="{profile_id}">
+                  <button class="primary" type="submit">Verbinden / .env sync</button>
+                </form>
+                """
+            )
+        if bootstrap_ready:
+            actions.append(
+                f"""
+                <form method="post" action="/internal/admin/device/probe-form">
+                  <input type="hidden" name="profile_id" value="{profile_id}">
+                  <button class="secondary" type="submit">Pruefen</button>
+                </form>
+                """
+            )
+        if bootstrap_ready:
+            actions.append(
+                f"""
+                <form method="post" action="/internal/admin/device/install-form" onsubmit="return confirm('Roher Pi fuer dieses Profil jetzt ueber SSH installieren?');">
+                  <input type="hidden" name="profile_id" value="{profile_id}">
+                  <button class="primary" type="submit">PI installieren</button>
+                </form>
+                """
+            )
         actions.append(
             f"""
             <form method="post" action="/internal/admin/device/delete-form" onsubmit="return confirm('Device-Profil wirklich loeschen?');">
@@ -1222,12 +1511,25 @@ def _render_device_profiles_html(profiles: list[dict[str, object]]) -> str:
             <div class="list-card">
               <h3>{name}{badge}</h3>
               <div class="list-meta">Gateway: <code>{gateway_base_url}</code> | Token: <code>{token_redacted}</code></div>
-              <div class="list-meta">SSH: <code>{ssh_user}@{ssh_host}:{ssh_port}</code> | Ziel: <code>{remote_dir}</code></div>
+              <div class="list-meta">SSH: <code>{ssh_user}@{ssh_host}:{ssh_port}</code> | Auth: <code>{ssh_auth_mode}</code> | Ziel: <code>{remote_dir}</code>{'' if bootstrap_ready else ' | nur Direktverbindung, kein Bootstrap'}</div>
               <div class="actions">{''.join(actions)}</div>
             </div>
             """
         )
     return "".join(items)
+
+
+def _render_device_profile_options_html(profiles: list[dict[str, object]], active_profile_id: str) -> str:
+    if not profiles:
+        return '<option value="">zuerst Device-Profil speichern</option>'
+    options: list[str] = []
+    for profile in profiles:
+        profile_id = str(profile.get("id") or "")
+        name = str(profile.get("name") or "Pi Device")
+        active_badge = " (aktiv)" if profile.get("is_active") else ""
+        selected = " selected" if profile_id and profile_id == active_profile_id else ""
+        options.append(f'<option value="{escape(profile_id)}"{selected}>{escape(name + active_badge)}</option>')
+    return "".join(options)
 
 
 def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) -> str:
@@ -1520,6 +1822,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                 <div class="nav-buttons">
                   <a class="__NAV_DASHBOARD__" href="/internal/admin?tab=dashboard">Dashboard</a>
                   <a class="__NAV_SETTINGS__" href="/internal/admin?tab=settings">Settings</a>
+                  <a class="__NAV_SKILLS__" href="/internal/admin?tab=skills">Skills / MCP</a>
                   <a class="__NAV_CHAT__" href="/internal/admin?tab=chat">Chat</a>
                   <a class="__NAV_MEMORY__" href="/internal/admin?tab=memory">Memory</a>
                   <a class="__NAV_DATABASE__" href="/internal/admin?tab=database">Database</a>
@@ -1716,6 +2019,15 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                         <label style="grid-column:1/-1;"><span>MI50_STATUS_COMMAND</span><input id="MI50_STATUS_COMMAND" value="__CFG_MI50_STATUS_COMMAND__"></label>
                         <label style="grid-column:1/-1;"><span>MI50_LOGS_COMMAND</span><input id="MI50_LOGS_COMMAND" value="__CFG_MI50_LOGS_COMMAND__"></label>
                         <label style="grid-column:1/-1;"><span>MI50_ROCM_SMI_COMMAND</span><input id="MI50_ROCM_SMI_COMMAND" value="__CFG_MI50_ROCM_SMI_COMMAND__"></label>
+                      </div>
+                    </details>
+                    <details style="margin-top:14px;">
+                      <summary style="cursor:pointer;font-weight:700;">Vision / Bildanalyse</summary>
+                      <div class="grid" style="margin-top:14px;">
+                        <label><span>VISION_BASE_URL</span><input id="VISION_BASE_URL" value="__CFG_VISION_BASE_URL__" placeholder="http://127.0.0.1:8081"></label>
+                        <label><span>VISION_MODEL_NAME</span><input id="VISION_MODEL_NAME" value="__CFG_VISION_MODEL_NAME__" placeholder="qwen2.5-vl"></label>
+                        <label><span>VISION_MAX_TOKENS</span><input id="VISION_MAX_TOKENS" value="__CFG_VISION_MAX_TOKENS__"></label>
+                        <label style="grid-column:1/-1;"><span>VISION_PROMPT</span><input id="VISION_PROMPT" value="__CFG_VISION_PROMPT__"></label>
                       </div>
                     </details>
                     <div class="actions">
@@ -2000,16 +2312,73 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                     </label>
                     <label><span>Titel optional</span><input name="DOCUMENT_TITLE" placeholder="z. B. Wissensnotiz, Aufgabenliste, Handbuch"></label>
                     <label><span>Tags optional</span><input name="DOCUMENT_TAGS" placeholder="projekt,aufgaben,pdf"></label>
-                    <label><span>Datei</span><input type="file" name="DOCUMENT_FILE" accept=".txt,.md,.markdown,.pdf,.log,.csv,.json,.yaml,.yml" required></label>
+                    <label><span>Datei</span><input type="file" name="DOCUMENT_FILE" accept=".txt,.md,.markdown,.pdf,.log,.csv,.json,.yaml,.yml,.jpg,.jpeg,.png,.webp,.gif,image/*" required></label>
                     <div class="actions">
                       <button class="primary" type="submit">Dokument speichern</button>
                     </div>
                   </form>
-                  <p class="muted" style="margin-top:12px;">Aktuell werden `.txt`, `.md`, `.pdf`, `.csv`, `.json`, `.log`, `.yaml`, `.yml` verarbeitet. Die Datei bleibt im gewaehlten Storage, waehrend extrahierter Text und Metadaten in PostgreSQL landen. Im Admin-Chat kannst du gespeicherte Dokumente danach direkt als Kontext auswaehlen.</p>
+                  <p class="muted" style="margin-top:12px;">Aktuell werden Textdateien, `.pdf` und gaengige Bilddateien verarbeitet. Die Datei bleibt im gewaehlten Storage, waehrend extrahierter Text, Bildanalyse und Metadaten in PostgreSQL landen. Im Admin-Chat kannst du gespeicherte Dokumente und Bilder danach direkt als Kontext auswaehlen.</p>
                 </div>
                 <div class="card">
                   <h2>Dokumente / Wissensbasis</h2>
                   <div id="storageDocumentsList" class="list-stack">__STORAGE_DOCUMENTS_HTML__</div>
+                </div>
+              </div>
+            </section>
+
+            <section id="skills" class="panel __PANEL_SKILLS__">
+              <div class="hero">
+                <h1>Skills / MCP</h1>
+                <p>Hier verwaltest du den MCP-Tool-Broker. Builtin-Tools bleiben stabil, zusaetzliche Custom-Tools mappen auf freigegebene Ops-Befehle. So kann Kai kontrolliert neue Wartungs-/Installationsaktionen nutzen, ohne ein freies Root-Terminal zu bekommen.</p>
+                <div id="skillsStatus" class="status">__SKILLS_STATUS__</div>
+              </div>
+              <div class="two-col">
+                <div class="card">
+                  <h2>MCP Tool-Broker</h2>
+                  <div class="grid">
+                    <div class="card stat">
+                      <div class="muted">MCP Tools</div>
+                      <strong id="mcpToolsCount">__MCP_TOOLS_COUNT__</strong>
+                      <div class="muted">builtin + custom</div>
+                    </div>
+                    <div class="card stat">
+                      <div class="muted">Custom Tools</div>
+                      <strong id="mcpCustomToolsCount">__MCP_CUSTOM_TOOLS_COUNT__</strong>
+                      <div class="muted">eigene Mappings</div>
+                    </div>
+                  </div>
+                  <div class="actions">
+                    <button class="secondary" type="button" onclick="loadMcpTools()">MCP-Tools laden</button>
+                    <button class="secondary" type="button" onclick="loadOpsCatalog()">Ops-Katalog laden</button>
+                  </div>
+                  <label style="margin-top:12px;"><span>Aktive MCP-Tools</span><textarea id="mcpToolsView" readonly></textarea></label>
+                  <p class="muted" style="margin-top:12px;">Custom-Tools rufen intern exakt einen freigegebenen Ops-Befehl auf, z. B. <code>gateway.install_htop</code>. Damit bleibt die Ausfuehrung nachvollziehbar und abgesichert.</p>
+                </div>
+                <div class="card">
+                  <h2>Custom MCP-Tool hinzufuegen</h2>
+                  <div class="grid">
+                    <label><span>Tool Name</span><input id="customMcpName" placeholder="z. B. gateway.install_htop_alias"></label>
+                    <label><span>Beschreibung</span><input id="customMcpDescription" placeholder="Kurze Beschreibung fuer Clients"></label>
+                    <label><span>Ops Target</span>
+                      <select id="customMcpTarget" onchange="refreshCustomMcpCommandOptions()">
+                        <option value="gateway">gateway</option>
+                        <option value="kai">kai</option>
+                      </select>
+                    </label>
+                    <label><span>Ops Command</span>
+                      <select id="customMcpCommand">
+                        <option value="">zuerst Ops-Katalog laden</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div class="actions">
+                    <button class="primary" type="button" onclick="saveCustomMcpTool()">Tool speichern</button>
+                  </div>
+                  <p class="muted" style="margin-top:12px;">Der Tool-Name muss 3-64 Zeichen lang sein und darf nur <code>a-z</code>, <code>0-9</code>, <code>.</code>, <code>-</code> und <code>_</code> enthalten.</p>
+                  <div style="margin-top:16px;">
+                    <h2>Gespeicherte Custom-Tools</h2>
+                    <div id="mcpCustomToolsList" class="list-stack">__MCP_CUSTOM_TOOLS_HTML__</div>
+                  </div>
                 </div>
               </div>
             </section>
@@ -2068,37 +2437,137 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
             <section id="devices" class="panel __PANEL_DEVICES__">
               <div class="hero">
                 <h1>Pi / Devices</h1>
-                <p>Hier verwaltest du Pi-Profile, Device-Tokens und eine erste SSH-Bootstrap-Strecke. V1 ist bewusst keybasiert und setzt nicht auf gespeicherte SSH-Passwoerter.</p>
+                <p>Hier verbindest du fertige Kai-Pis schnell ueber Gateway-URL, Token und optional SSH. Fuer einen laufenden Kai-Pi reichen praktisch Host, User, Port und auf Wunsch ein Passwort.</p>
                 <div id="deviceStatus" class="status">__DEVICE_STATUS__</div>
               </div>
               <div class="two-col">
                 <div class="card">
-                  <h2>Pi-Profil und Bootstrap</h2>
+                  <h2>Kai-Pi Schnell verbinden</h2>
                   <form method="post" action="/internal/admin/device/save-form">
                     <input type="hidden" name="DEVICE_PROFILE_ID" value="__DEVICE_PROFILE_FORM_ID__">
                     <div class="grid">
-                      <label><span>DEVICE_PROFILE_NAME</span><input name="DEVICE_PROFILE_NAME" value="__DEVICE_PROFILE_FORM_NAME__" placeholder="z. B. kai-pi-wohnzimmer"></label>
-                      <label><span>DEVICE_GATEWAY_BASE_URL</span><input name="DEVICE_GATEWAY_BASE_URL" value="__DEVICE_PROFILE_FORM_GATEWAY_BASE_URL__" placeholder="http://gateway:8000"></label>
-                      <label><span>DEVICE_TOKEN</span><input name="DEVICE_TOKEN" value="__DEVICE_PROFILE_FORM_DEVICE_TOKEN__" placeholder="eigener Pi-Token"></label>
                       <label><span>PI_SSH_HOST</span><input name="PI_SSH_HOST" value="__DEVICE_PROFILE_FORM_SSH_HOST__" placeholder="192.168.x.x"></label>
                       <label><span>PI_SSH_USER</span><input name="PI_SSH_USER" value="__DEVICE_PROFILE_FORM_SSH_USER__" placeholder="pi"></label>
                       <label><span>PI_SSH_PORT</span><input name="PI_SSH_PORT" value="__DEVICE_PROFILE_FORM_SSH_PORT__" placeholder="22"></label>
-                      <label><span>PI_REMOTE_DIR</span><input name="PI_REMOTE_DIR" value="__DEVICE_PROFILE_FORM_REMOTE_DIR__" placeholder="~/kai-pi"></label>
-                      <label><span>PI_SSH_ROOT_PREFIX</span><input name="PI_SSH_ROOT_PREFIX" value="__DEVICE_PROFILE_FORM_SSH_ROOT_PREFIX__" placeholder="sudo -n"></label>
+                      <label><span>PI_SSH_PASSWORD</span><input type="password" name="PI_SSH_PASSWORD" value="__DEVICE_PROFILE_FORM_SSH_PASSWORD__" placeholder="optional, sonst SSH-Key"></label>
+                      <label><span>DEVICE_PROFILE_NAME</span><input name="DEVICE_PROFILE_NAME" value="__DEVICE_PROFILE_FORM_NAME__" placeholder="z. B. kai-pi-wohnzimmer"></label>
+                      <label><span>DEVICE_GATEWAY_BASE_URL</span><input name="DEVICE_GATEWAY_BASE_URL" value="__DEVICE_PROFILE_FORM_GATEWAY_BASE_URL__" placeholder="http://gateway:8000"></label>
+                      <label><span>DEVICE_TOKEN</span><input name="DEVICE_TOKEN" value="__DEVICE_PROFILE_FORM_DEVICE_TOKEN__" placeholder="leer lassen = automatisch erzeugen"></label>
                       <label style="grid-column:1/-1;"><span>DEVICE_NOTES</span><input name="DEVICE_NOTES" value="__DEVICE_PROFILE_FORM_NOTES__" placeholder="z. B. Pi 5 mit 800x640 Display im Wohnzimmer"></label>
                     </div>
+                    <details style="margin-top:14px;">
+                      <summary style="cursor:pointer;font-weight:700;">Erweiterte SSH-/Bootstrap-Optionen</summary>
+                      <div class="grid" style="margin-top:14px;">
+                        <label><span>PI_REMOTE_DIR</span><input name="PI_REMOTE_DIR" value="__DEVICE_PROFILE_FORM_REMOTE_DIR__" placeholder="~/kai-pi"></label>
+                        <label><span>PI_SSH_ROOT_PREFIX</span><input name="PI_SSH_ROOT_PREFIX" value="__DEVICE_PROFILE_FORM_SSH_ROOT_PREFIX__" placeholder="sudo -n"></label>
+                      </div>
+                    </details>
                     <div class="actions">
                       <button class="primary" type="submit">Device-Profil speichern</button>
+                      <a class="secondary" href="/internal/admin?tab=devices">Neu / Formular leeren</a>
                     </div>
                   </form>
+                  <div class="card" style="margin-top:16px;">
+                    <h2>Kai Face zentral vom Gateway steuern</h2>
+                    <p class="muted">Das Pi-Menue wird bewusst nicht mehr benoetigt. Style, State und Layer steuerst du hier im Gateway und drueckst dann nur <code>Apply</code>.</p>
+                    <form method="post" action="/internal/admin/device/face-apply-form">
+                      <div class="grid">
+                        <label><span>Ziel-Pi Profil</span><select name="profile_id">__DEVICE_FACE_PROFILE_OPTIONS_HTML__</select></label>
+                        <label><span>Style Name</span><input name="FACE_STYLE_NAME" value="__DEVICE_FACE_STYLE_NAME__" placeholder="z. B. gaming_mode"></label>
+                        <label>
+                          <span>State</span>
+                          <select name="FACE_STATE">
+                            <option value="idle">idle</option>
+                            <option value="listening">listening</option>
+                            <option value="thinking">thinking</option>
+                            <option value="speaking">speaking</option>
+                            <option value="happy">happy</option>
+                            <option value="sleepy">sleepy</option>
+                            <option value="error">error</option>
+                          </select>
+                        </label>
+                        <label>
+                          <span>Render Mode</span>
+                          <select name="FACE_RENDER_MODE">
+                            <option value="vector">vector</option>
+                            <option value="sprite_pack">sprite_pack</option>
+                          </select>
+                        </label>
+                        <label><span>Sprite Pack</span><input name="FACE_SPRITE_PACK" value="__DEVICE_FACE_SPRITE_PACK__" placeholder="z. B. robot_v1"></label>
+                        <label>
+                          <span>Variant (F1..F17)</span>
+                          <select name="FACE_VARIANT">
+                            <option value="custom">custom</option>
+                            <option value="F1">F1 baseline</option>
+                            <option value="F2">F2 blue eyes</option>
+                            <option value="F3">F3 cheeks</option>
+                            <option value="F4">F4 close eyes</option>
+                            <option value="F5">F5 ears</option>
+                            <option value="F6">F6 eyebrows</option>
+                            <option value="F7">F7 eyelids</option>
+                            <option value="F8">F8 hair</option>
+                            <option value="F9">F9 iris</option>
+                            <option value="F10">F10 no mouth</option>
+                            <option value="F11">F11 no pupils</option>
+                            <option value="F12">F12 nose</option>
+                            <option value="F13">F13 oval eyes</option>
+                            <option value="F14">F14 raised eyes</option>
+                            <option value="F15">F15 small eyes</option>
+                            <option value="F16">F16 white face</option>
+                            <option value="F17">F17 far eyes</option>
+                          </select>
+                        </label>
+                        <label>
+                          <span>Face Color</span>
+                          <select name="FACE_FACE_COLOR">
+                            <option value="black">black</option>
+                            <option value="white">white</option>
+                          </select>
+                        </label>
+                        <label>
+                          <span>Eye Shape</span>
+                          <select name="FACE_EYE_SHAPE">
+                            <option value="round">round</option>
+                            <option value="oval">oval</option>
+                            <option value="small">small</option>
+                          </select>
+                        </label>
+                        <label>
+                          <span>Eye Spacing</span>
+                          <select name="FACE_EYE_SPACING">
+                            <option value="normal">normal</option>
+                            <option value="far">far</option>
+                            <option value="raised">raised</option>
+                          </select>
+                        </label>
+                        <label><span>Iris Color</span><input name="FACE_IRIS_COLOR" value="__DEVICE_FACE_IRIS_COLOR__" placeholder="#59c7ff"></label>
+                      </div>
+                      <p class="muted" style="margin-top:8px;">Eigene Designs: Lege auf dem Pi einen Pack-Ordner unter <code>/home/pi/kai/styles/packs/&lt;pack_name&gt;</code> mit <code>manifest.json</code> und PNG-Layern an. Dann hier <code>Render Mode = sprite_pack</code> und den Pack-Namen setzen.</p>
+                      <div class="grid" style="margin-top:8px;">
+                        <label><span><input type="checkbox" name="FACE_PUPILS" value="1" checked> pupils</span></label>
+                        <label><span><input type="checkbox" name="FACE_IRIS" value="1"> iris</span></label>
+                        <label><span><input type="checkbox" name="FACE_MOUTH" value="1" checked> mouth</span></label>
+                        <label><span><input type="checkbox" name="FACE_NOSE" value="1"> nose</span></label>
+                        <label><span><input type="checkbox" name="FACE_CHEEKS" value="1"> cheeks</span></label>
+                        <label><span><input type="checkbox" name="FACE_EARS" value="1"> ears</span></label>
+                        <label><span><input type="checkbox" name="FACE_EYEBROWS" value="1" checked> eyebrows</span></label>
+                        <label><span><input type="checkbox" name="FACE_EYELIDS" value="1"> eyelids</span></label>
+                        <label><span><input type="checkbox" name="FACE_HAIR" value="1"> hair</span></label>
+                        <label><span><input type="checkbox" name="FACE_CLOSE_EYES" value="1"> close eyes</span></label>
+                      </div>
+                      <div class="actions">
+                        <button class="primary" type="submit">Apply Face to Kai</button>
+                      </div>
+                    </form>
+                  </div>
                   <div class="list-stack" style="margin-top:16px;">
                     <div class="list-card">
                       <h3>Aktiver Device-Token</h3>
                       <div class="list-meta"><code>__DEVICE_ACTIVE_TOKEN_REDACTED__</code></div>
                     </div>
                     <div class="list-card">
-                      <h3>Device API</h3>
-                      <div class="list-meta">Der vorbereitete Pfad ist <code>/api/device/ask</code>. Ein aktiviertes Device-Profil uebernimmt den Device-Token direkt in den Gateway.</div>
+                      <h3>Was fuer fertige Kai-Pis reicht</h3>
+                      <div class="list-meta">Nutze bei bestehenden Kai-Pis den Button <code>Verbinden / .env sync</code>: der Gateway schreibt URL+Token direkt auf den Pi und startet <code>kai.service</code> neu. Fuer rohe Pi-Installationen gibt es pro Profil den Button <code>PI installieren</code>.</div>
                     </div>
                   </div>
                   <label style="margin-top:12px;">
@@ -2112,8 +2581,8 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                 <div class="card">
                   <h2>Gespeicherte Pi-Profile</h2>
                   <div class="list-stack">__DEVICE_PROFILES_HTML__</div>
-                  <label style="margin-top:14px;"><span>Bootstrap-Skript</span><textarea readonly>__DEVICE_BOOTSTRAP_PREVIEW__</textarea></label>
-                  <p class="muted" style="margin-top:12px;">Die Bootstrap-V1 nutzt bewusst SSH-Key-Auth. Sie installiert eine kleine Python-Basis auf dem Pi, legt `.env`, `requirements.txt` und einen ersten `pi_gateway_client.py` an und bereitet damit den Weg fuer den spaeteren Voice-/Avatar-Stack.</p>
+                  <label style="margin-top:14px;"><span>Pi-Install-Skript</span><textarea readonly>__DEVICE_BOOTSTRAP_PREVIEW__</textarea></label>
+                  <p class="muted" style="margin-top:12px;">Der Button <code>PI installieren</code> fuehrt dieses Script serverseitig ueber SSH aus. Damit kannst du auch einen rohen Pi ohne bestehendes Kai-Setup direkt vom Gateway aus vorbereiten.</p>
                 </div>
               </div>
             </section>
@@ -2142,6 +2611,10 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               "HOME_ASSISTANT_TIMEOUT_SECONDS",
               "HOME_ASSISTANT_ALLOWED_SERVICES",
               "HOME_ASSISTANT_ALLOWED_ENTITY_PREFIXES",
+              "VISION_BASE_URL",
+              "VISION_MODEL_NAME",
+              "VISION_PROMPT",
+              "VISION_MAX_TOKENS",
               "MI50_SSH_HOST",
               "MI50_SSH_USER",
               "MI50_SSH_PORT",
@@ -2215,6 +2688,144 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               node.textContent = message;
               node.style.background = error ? "#f9dddd" : "#dff5e7";
               node.style.color = error ? "#942f2f" : "#16231b";
+            }
+
+            function setSkillsStatus(message, error = false) {
+              const node = document.getElementById("skillsStatus");
+              if (!node) return;
+              node.textContent = message;
+              node.style.background = error ? "#f9dddd" : "#dff5e7";
+              node.style.color = error ? "#942f2f" : "#16231b";
+            }
+
+            window.opsCatalog = { gateway: [], kai: [] };
+
+            function refreshCustomMcpCommandOptions() {
+              const targetNode = document.getElementById("customMcpTarget");
+              const commandNode = document.getElementById("customMcpCommand");
+              if (!targetNode || !commandNode) return;
+              const target = targetNode.value || "gateway";
+              const commands = (window.opsCatalog && window.opsCatalog[target]) || [];
+              const currentValue = commandNode.value;
+              if (!commands.length) {
+                commandNode.innerHTML = '<option value="">keine Befehle geladen</option>';
+                return;
+              }
+              commandNode.innerHTML = commands.map((item) => `<option value="${escapeHtml(item)}">${escapeHtml(item)}</option>`).join("");
+              if (commands.includes(currentValue)) {
+                commandNode.value = currentValue;
+              }
+            }
+
+            function renderCustomMcpTools(items) {
+              const node = document.getElementById("mcpCustomToolsList");
+              if (!node) return;
+              if (!items || items.length === 0) {
+                node.innerHTML = '<div class="muted">Noch keine Custom-MCP-Tools gespeichert.</div>';
+                return;
+              }
+              node.innerHTML = items.map((tool) => `
+                <div class="list-card">
+                  <h3>${escapeHtml(tool.name || "custom.tool")}</h3>
+                  <div class="list-meta">${escapeHtml(tool.description || "-")}</div>
+                  <div class="list-meta">Ops: <code>${escapeHtml(tool.target || "gateway")}.${escapeHtml(tool.command || "status")}</code></div>
+                  <div class="actions">
+                    <button class="secondary" type="button" onclick="deleteCustomMcpTool('${escapeHtml(tool.name || "")}')">Loeschen</button>
+                  </div>
+                </div>
+              `).join("");
+            }
+
+            async function loadOpsCatalog() {
+              try {
+                const res = await fetch("/api/admin/ops/catalog");
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessage(data, `Ops-Katalog fehlgeschlagen: ${res.status}`));
+                window.opsCatalog = data.targets || { gateway: [], kai: [] };
+                refreshCustomMcpCommandOptions();
+              } catch (error) {
+                setSkillsStatus(error.message, true);
+              }
+            }
+
+            async function loadMcpTools() {
+              try {
+                const res = await fetch("/api/admin/mcp/tools");
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessage(data, `MCP-Tools fehlgeschlagen: ${res.status}`));
+                const tools = data.tools || [];
+                const lines = tools.map((tool) => {
+                  const prefix = tool.is_custom ? "[custom]" : "[builtin]";
+                  const authPart = tool.requires_admin ? " [admin]" : " [device-ok]";
+                  const opsPart = tool.target && tool.command ? ` -> ${tool.target}.${tool.command}` : "";
+                  return `${prefix}${authPart} ${tool.name}${opsPart} | ${tool.description || "-"}`;
+                });
+                setValue("mcpToolsView", lines.join("\\n"));
+                setText("mcpToolsCount", String(tools.length));
+                setSkillsStatus(`MCP-Tools geladen (${tools.length}).`);
+              } catch (error) {
+                setSkillsStatus(error.message, true);
+              }
+            }
+
+            async function loadCustomMcpTools() {
+              try {
+                const res = await fetch("/api/admin/mcp/custom-tools");
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessage(data, `Custom-MCP-Tools fehlgeschlagen: ${res.status}`));
+                const tools = data.tools || [];
+                renderCustomMcpTools(tools);
+                setText("mcpCustomToolsCount", String(tools.length));
+                if (data.ops_catalog) {
+                  window.opsCatalog = data.ops_catalog;
+                  refreshCustomMcpCommandOptions();
+                }
+              } catch (error) {
+                setSkillsStatus(error.message, true);
+              }
+            }
+
+            async function saveCustomMcpTool() {
+              try {
+                const payload = {
+                  name: document.getElementById("customMcpName").value.trim().toLowerCase(),
+                  description: document.getElementById("customMcpDescription").value.trim(),
+                  target: document.getElementById("customMcpTarget").value,
+                  command: document.getElementById("customMcpCommand").value,
+                };
+                const res = await fetch("/api/admin/mcp/custom-tools", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(payload),
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessage(data, `Tool speichern fehlgeschlagen: ${res.status}`));
+                document.getElementById("customMcpName").value = "";
+                document.getElementById("customMcpDescription").value = "";
+                await loadCustomMcpTools();
+                await loadMcpTools();
+                setSkillsStatus(`Custom-Tool gespeichert: ${payload.name}`);
+              } catch (error) {
+                setSkillsStatus(error.message, true);
+              }
+            }
+
+            async function deleteCustomMcpTool(name) {
+              const toolName = String(name || "").trim().toLowerCase();
+              if (!toolName) return;
+              if (!window.confirm(`Custom-Tool '${toolName}' wirklich loeschen?`)) return;
+              try {
+                const res = await fetch(`/api/admin/mcp/custom-tools/${encodeURIComponent(toolName)}/delete`, {
+                  method: "POST",
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessage(data, `Tool loeschen fehlgeschlagen: ${res.status}`));
+                await loadCustomMcpTools();
+                await loadMcpTools();
+                setSkillsStatus(`Custom-Tool geloescht: ${toolName}`);
+              } catch (error) {
+                setSkillsStatus(error.message, true);
+              }
             }
 
             function formatUptime(seconds) {
@@ -2796,6 +3407,25 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               outputNode.textContent = data.output || JSON.stringify(data, null, 2);
             }
 
+            function applyFaceFormDefaults() {
+              const form = document.querySelector('form[action="/internal/admin/device/face-apply-form"]');
+              if (!form) return;
+              const defaults = {
+                FACE_STATE: "__DEVICE_FACE_STATE__",
+                FACE_RENDER_MODE: "__DEVICE_FACE_RENDER_MODE__",
+                FACE_VARIANT: "__DEVICE_FACE_VARIANT__",
+                FACE_FACE_COLOR: "__DEVICE_FACE_FACE_COLOR__",
+                FACE_EYE_SHAPE: "__DEVICE_FACE_EYE_SHAPE__",
+                FACE_EYE_SPACING: "__DEVICE_FACE_EYE_SPACING__"
+              };
+              for (const [name, value] of Object.entries(defaults)) {
+                const node = form.querySelector(`[name="${name}"]`);
+                if (node && value) {
+                  node.value = value;
+                }
+              }
+            }
+
             loadDashboard();
             loadHeaderTelemetry();
             window.setInterval(loadHeaderTelemetry, 500);
@@ -2805,6 +3435,10 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
             loadStorageOverview();
             loadHomeAssistantStatus();
             loadContinueConfig();
+            loadOpsCatalog();
+            loadCustomMcpTools();
+            loadMcpTools();
+            applyFaceFormDefaults();
           </script>
         </body>
         </html>
@@ -2814,6 +3448,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__USERNAME__": escape(username),
         "__NAV_DASHBOARD__": "active" if active_tab == "dashboard" else "",
         "__NAV_SETTINGS__": "active" if active_tab == "settings" else "",
+        "__NAV_SKILLS__": "active" if active_tab == "skills" else "",
         "__NAV_CHAT__": "active" if active_tab == "chat" else "",
         "__NAV_MEMORY__": "active" if active_tab == "memory" else "",
         "__NAV_DATABASE__": "active" if active_tab == "database" else "",
@@ -2823,6 +3458,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__NAV_DEVICES__": "active" if active_tab == "devices" else "",
         "__PANEL_DASHBOARD__": "active" if active_tab == "dashboard" else "",
         "__PANEL_SETTINGS__": "active" if active_tab == "settings" else "",
+        "__PANEL_SKILLS__": "active" if active_tab == "skills" else "",
         "__PANEL_CHAT__": "active" if active_tab == "chat" else "",
         "__PANEL_MEMORY__": "active" if active_tab == "memory" else "",
         "__PANEL_DATABASE__": "active" if active_tab == "database" else "",
@@ -2832,6 +3468,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__PANEL_DEVICES__": "active" if active_tab == "devices" else "",
         "__DASHBOARD_STATUS__": escape(initial_data.get("dashboard_status", "-")),
         "__SETTINGS_STATUS__": escape(initial_data.get("settings_status", "-")),
+        "__SKILLS_STATUS__": escape(initial_data.get("skills_status", "-")),
         "__GATEWAY_STATE__": escape(initial_data.get("gateway_state", "-")),
         "__GATEWAY_INFO__": escape(initial_data.get("gateway_info", "-")),
         "__BACKEND_STATE__": escape(initial_data.get("backend_state", "-")),
@@ -2886,6 +3523,9 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__STORAGE_PROFILES_HTML__": initial_data.get("storage_profiles_html", ""),
         "__STORAGE_DOCUMENTS_HTML__": initial_data.get("storage_documents_html", ""),
         "__STORAGE_UPLOAD_OPTIONS_HTML__": initial_data.get("storage_upload_options_html", '<option value="">aktives Profil verwenden</option>'),
+        "__MCP_TOOLS_COUNT__": escape(initial_data.get("mcp_tools_count", "0")),
+        "__MCP_CUSTOM_TOOLS_COUNT__": escape(initial_data.get("mcp_custom_tools_count", "0")),
+        "__MCP_CUSTOM_TOOLS_HTML__": initial_data.get("mcp_custom_tools_html", '<div class="muted">Noch keine Custom-MCP-Tools gespeichert.</div>'),
         "__DEVICE_STATUS__": escape(initial_data.get("device_status", "-")),
         "__DEVICE_PROFILES_HTML__": initial_data.get("device_profiles_html", ""),
         "__DEVICE_PROFILE_FORM_ID__": escape(initial_data.get("device_profile_form_id", "")),
@@ -2895,11 +3535,22 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__DEVICE_PROFILE_FORM_SSH_HOST__": escape(initial_data.get("device_profile_form_ssh_host", "")),
         "__DEVICE_PROFILE_FORM_SSH_USER__": escape(initial_data.get("device_profile_form_ssh_user", "")),
         "__DEVICE_PROFILE_FORM_SSH_PORT__": escape(initial_data.get("device_profile_form_ssh_port", "22")),
+        "__DEVICE_PROFILE_FORM_SSH_PASSWORD__": escape(initial_data.get("device_profile_form_ssh_password", "")),
         "__DEVICE_PROFILE_FORM_REMOTE_DIR__": escape(initial_data.get("device_profile_form_remote_dir", "~/kai-pi")),
         "__DEVICE_PROFILE_FORM_SSH_ROOT_PREFIX__": escape(initial_data.get("device_profile_form_ssh_root_prefix", "sudo -n")),
         "__DEVICE_PROFILE_FORM_NOTES__": escape(initial_data.get("device_profile_form_notes", "")),
         "__DEVICE_ACTIVE_TOKEN_REDACTED__": escape(initial_data.get("device_active_token_redacted", "-")),
         "__DEVICE_BOOTSTRAP_PREVIEW__": escape(initial_data.get("device_bootstrap_preview", "Noch kein Device-Profil ausgewaehlt.")),
+        "__DEVICE_FACE_PROFILE_OPTIONS_HTML__": initial_data.get("device_face_profile_options_html", '<option value="">zuerst Device-Profil speichern</option>'),
+        "__DEVICE_FACE_STYLE_NAME__": escape(initial_data.get("device_face_style_name", "gateway_idle")),
+        "__DEVICE_FACE_STATE__": escape(initial_data.get("device_face_state", "idle")),
+        "__DEVICE_FACE_RENDER_MODE__": escape(initial_data.get("device_face_render_mode", "vector")),
+        "__DEVICE_FACE_SPRITE_PACK__": escape(initial_data.get("device_face_sprite_pack", "robot_v1")),
+        "__DEVICE_FACE_VARIANT__": escape(initial_data.get("device_face_variant", "custom")),
+        "__DEVICE_FACE_FACE_COLOR__": escape(initial_data.get("device_face_face_color", "black")),
+        "__DEVICE_FACE_EYE_SHAPE__": escape(initial_data.get("device_face_eye_shape", "round")),
+        "__DEVICE_FACE_EYE_SPACING__": escape(initial_data.get("device_face_eye_spacing", "normal")),
+        "__DEVICE_FACE_IRIS_COLOR__": escape(initial_data.get("device_face_iris_color", "#59c7ff")),
         "__HA_STATUS__": escape(initial_data.get("ha_status", "-")),
         "__HA_CONFIGURED__": escape(initial_data.get("ha_configured", "-")),
         "__HA_CONNECTED__": escape(initial_data.get("ha_connected", "-")),
