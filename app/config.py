@@ -23,8 +23,8 @@ class Settings(BaseSettings):
 
     @classmethod
     def settings_customise_sources(
-        cls,
-        settings_cls,
+        _cls,
+        _settings_cls,
         init_settings,
         env_settings,
         dotenv_settings,
