@@ -2425,7 +2425,7 @@ def _admin_chat_html() -> str:
               background:#0a0f14;
               color:#d7e3ef;
             }
-            .row { display:grid; grid-template-columns:minmax(0, 1fr); gap:12px; }
+            .composer { display:grid; grid-template-columns:minmax(0, 1fr); gap:12px; }
             .composer-main { min-width:0; }
             .primary-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
             .primary-actions button { min-width:120px; }
@@ -2499,7 +2499,6 @@ def _admin_chat_html() -> str:
             pre { white-space:pre-wrap; word-break:break-word; margin:0; }
             @media (max-width: 980px) {
               main { grid-template-columns:1fr; }
-              .row { grid-template-columns:1fr; }
               .stats { grid-template-columns:1fr; }
             }
           </style>
@@ -2532,7 +2531,7 @@ def _admin_chat_html() -> str:
                 </div>
               </div>
               <div id="messages" class="messages"></div>
-              <div class="row">
+              <div class="composer">
                 <div class="composer-main">
                   <label>
                     <span>Nachricht</span>
