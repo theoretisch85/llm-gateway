@@ -19,6 +19,7 @@ from app.schemas.admin_chat import (
     AdminMemoryOverviewResponse,
     AdminMemorySummaryResponse,
     AdminSessionCreateRequest,
+    AdminSessionRenameRequest,
     AdminSessionResponse,
 )
 from app.services.llamacpp_client import LlamaCppClient, LlamaCppError, LlamaCppTimeoutError
@@ -113,6 +114,19 @@ async def reset_session(session_id: str) -> AdminSessionResponse:
     settings = get_settings()
     store = get_session_store(settings)
     session = await store.reset_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return _serialize_session(session)
+
+
+@router.post("/api/admin/sessions/{session_id}/rename", dependencies=[Depends(require_admin_api_auth)], response_model=AdminSessionResponse)
+async def rename_session(session_id: str, payload: AdminSessionRenameRequest) -> AdminSessionResponse:
+    settings = get_settings()
+    store = get_session_store(settings)
+    clean_title = payload.title.strip()
+    if not clean_title:
+        raise HTTPException(status_code=400, detail="Titel darf nicht leer sein.")
+    session = await store.rename_session(session_id, clean_title)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found.")
     return _serialize_session(session)
@@ -2539,6 +2553,7 @@ def _admin_chat_html() -> str:
                   </label>
                   <div class="primary-actions">
                     <button type="button" onclick="sendMessage()">Senden</button>
+                    <button type="button" class="secondary" onclick="renameSession()">Umbenennen</button>
                     <button type="button" class="secondary" onclick="resetSession()">Reset</button>
                     <button type="button" class="secondary" onclick="deleteSession()">Loeschen</button>
                   </div>
@@ -2849,6 +2864,33 @@ def _admin_chat_html() -> str:
                 renderSession(session);
                 await loadSessions();
                 setStatus("Session zurueckgesetzt.");
+              } catch (error) {
+                setStatus(error.message, true);
+              }
+            }
+
+            async function renameSession() {
+              if (!currentSessionId) return;
+              const currentTitle = sessionTitle.textContent || "";
+              const nextTitle = window.prompt("Neuer Session-Name:", currentTitle);
+              if (nextTitle === null) return;
+              const cleanTitle = String(nextTitle || "").trim();
+              if (!cleanTitle) {
+                setStatus("Titel darf nicht leer sein.", true);
+                return;
+              }
+
+              try {
+                const res = await fetch(`/api/admin/sessions/${currentSessionId}/rename`, {
+                  method: "POST",
+                  headers: headers(),
+                  body: JSON.stringify({ title: cleanTitle }),
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessageFrom(data, `Umbenennen fehlgeschlagen: ${res.status}`));
+                renderSession(data);
+                await loadSessions();
+                setStatus("Session umbenannt.");
               } catch (error) {
                 setStatus(error.message, true);
               }
