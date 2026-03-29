@@ -10,6 +10,8 @@ from app.api_errors import error_response
 from app.auth import get_admin_session_username, require_admin_api_auth
 from app.config import get_settings
 from app.context_guard import ContextGuardError, fit_messages_to_budget
+from app.core.roles import ActorContext, ROLE_ADMIN
+from app.orchestrator import ToolOrchestrator
 from app.schemas.chat import ChatMessage
 from app.schemas.admin_chat import (
     AdminChatRequest,
@@ -30,13 +32,14 @@ from app.services.home_assistant_memory import (
     parse_home_assistant_note_instruction,
 )
 from app.services.model_router import ModelRouter
-from app.services.backend_control import OpsActionError, run_ops_command
 from app.services.session_memory import ChatSession, get_session_store
 from app.services.storage_library import get_document_contexts
+from app.tools.executor import ToolExecutionError
 
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["admin-chat"])
+tool_orchestrator = ToolOrchestrator()
 
 
 @router.get("/internal/chat", response_class=HTMLResponse, response_model=None)
@@ -117,10 +120,14 @@ async def reset_session(session_id: str) -> AdminSessionResponse:
 
 @router.post(
     "/api/admin/sessions/{session_id}/chat",
-    dependencies=[Depends(require_admin_api_auth)],
     response_model=None,
 )
-async def admin_chat(payload: AdminChatRequest, session_id: str, request: Request) -> AdminChatResponse | JSONResponse:
+async def admin_chat(
+    payload: AdminChatRequest,
+    session_id: str,
+    request: Request,
+    auth_subject: str = Depends(require_admin_api_auth),
+) -> AdminChatResponse | JSONResponse:
     settings = get_settings()
     store = get_session_store(settings)
     session = await _require_session(store, session_id)
@@ -251,7 +258,12 @@ async def admin_chat(payload: AdminChatRequest, session_id: str, request: Reques
                 route_reason=ha_query_result["route_reason"],
             )
 
-        gateway_ops_result = await _try_handle_gateway_ops_action(payload.message)
+        gateway_ops_result = await _try_handle_gateway_ops_action(
+            settings=settings,
+            message=payload.message,
+            request_id=request.state.request_id,
+            actor_id=auth_subject or "admin",
+        )
         if gateway_ops_result is not None:
             await store.add_message(session_id, "user", payload.message)
             await store.update_route(session_id, "gateway_ops", gateway_ops_result["route_reason"], payload.mode or session.mode)
@@ -315,7 +327,7 @@ async def admin_chat(payload: AdminChatRequest, session_id: str, request: Reques
             error_type="upstream_error",
             code="home_assistant_request_failed",
         )
-    except OpsActionError as exc:
+    except (ToolExecutionError, ValueError) as exc:
         return error_response(
             request_id=request.state.request_id,
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -343,10 +355,14 @@ async def admin_chat(payload: AdminChatRequest, session_id: str, request: Reques
 
 @router.post(
     "/api/admin/sessions/{session_id}/chat/stream",
-    dependencies=[Depends(require_admin_api_auth)],
     response_model=None,
 )
-async def admin_chat_stream(payload: AdminChatRequest, session_id: str, request: Request) -> StreamingResponse | JSONResponse:
+async def admin_chat_stream(
+    payload: AdminChatRequest,
+    session_id: str,
+    request: Request,
+    auth_subject: str = Depends(require_admin_api_auth),
+) -> StreamingResponse | JSONResponse:
     settings = get_settings()
     store = get_session_store(settings)
     session = await _require_session(store, session_id)
@@ -562,7 +578,12 @@ async def admin_chat_stream(payload: AdminChatRequest, session_id: str, request:
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
 
-        gateway_ops_result = await _try_handle_gateway_ops_action(payload.message)
+        gateway_ops_result = await _try_handle_gateway_ops_action(
+            settings=settings,
+            message=payload.message,
+            request_id=request.state.request_id,
+            actor_id=auth_subject or "admin",
+        )
         if gateway_ops_result is not None:
             await store.add_message(session_id, "user", payload.message)
             await store.update_route(session_id, "gateway_ops", gateway_ops_result["route_reason"], payload.mode or session.mode)
@@ -622,7 +643,7 @@ async def admin_chat_stream(payload: AdminChatRequest, session_id: str, request:
             error_type="upstream_error",
             code="home_assistant_request_failed",
         )
-    except OpsActionError as exc:
+    except (ToolExecutionError, ValueError) as exc:
         return error_response(
             request_id=request.state.request_id,
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -834,12 +855,31 @@ def _parse_gateway_ops_action(message: str) -> dict[str, str] | None:
     return None
 
 
-async def _try_handle_gateway_ops_action(message: str) -> dict[str, str] | None:
+async def _try_handle_gateway_ops_action(
+    *,
+    settings,
+    message: str,
+    request_id: str,
+    actor_id: str,
+) -> dict[str, str] | None:
     parsed = _parse_gateway_ops_action(message)
     if parsed is None:
         return None
 
-    result = run_ops_command("gateway", parsed["command_name"])
+    result = await tool_orchestrator.execute_tool(
+        settings=settings,
+        actor=ActorContext(
+            actor_id=actor_id or "admin",
+            role=ROLE_ADMIN,
+            source="api.admin_chat.gateway_ops",
+        ),
+        request_id=request_id,
+        tool_name="gateway.ops",
+        arguments={
+            "target": "gateway",
+            "command": parsed["command_name"],
+        },
+    )
     assistant_text = f"Gateway-Ops ausgefuehrt: {parsed['label']}.\n\n{result.get('output') or 'OK'}"
     return {
         "assistant_text": assistant_text,
