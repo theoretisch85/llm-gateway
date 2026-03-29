@@ -3,7 +3,7 @@
 Ein lokaler OpenAI-kompatibler Orchestrator fuer VS Code Clients, der Requests an einen externen `llama.cpp`-Server weiterleitet. Der aktuelle Standardbetrieb ist `devstral-q3`, optional mit umschaltbaren MI50-Profilen wie `Qwen`.
 
 <p align="center">
-  <img src="docs/admin-hub-preview.svg" alt="llm-gateway admin hub preview" width="1100">
+  <img src="docs/admin-hub-preview.png" alt="llm-gateway admin hub preview" width="1100">
 </p>
 
 <p align="center">
