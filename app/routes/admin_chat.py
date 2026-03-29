@@ -2258,13 +2258,14 @@ def _admin_chat_html() -> str:
                 linear-gradient(180deg,#10151c 0%, var(--bg) 100%);
               color:var(--ink);
             }
-            main { padding:20px; display:grid; grid-template-columns:300px 1fr; gap:18px; min-height:100vh; }
+            main { padding:20px; display:grid; grid-template-columns:minmax(260px, 320px) minmax(0, 1fr); gap:18px; min-height:100vh; }
             .panel {
               position:relative;
               background:linear-gradient(180deg, var(--card-2), var(--card));
               border:1px solid var(--line);
               border-radius:10px;
               padding:44px 18px 18px;
+              min-width:0;
             }
             .panel::before {
               content:"";
@@ -2424,11 +2425,15 @@ def _admin_chat_html() -> str:
               background:#0a0f14;
               color:#d7e3ef;
             }
-            .row { display:grid; grid-template-columns:1fr 180px; gap:12px; }
+            .row { display:grid; grid-template-columns:minmax(0, 1fr); gap:12px; }
+            .composer-main { min-width:0; }
+            .primary-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
+            .primary-actions button { min-width:120px; }
             .composer-side {
-              display:flex;
-              flex-direction:column;
+              display:grid;
+              grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));
               gap:12px;
+              align-items:start;
             }
             .upload-box {
               border:1px solid var(--line);
@@ -2528,10 +2533,17 @@ def _admin_chat_html() -> str:
               </div>
               <div id="messages" class="messages"></div>
               <div class="row">
-                <label>
-                  <span>Nachricht</span>
-                  <textarea id="prompt" placeholder="Schreibe hier direkt an die AI-Plattform..."></textarea>
-                </label>
+                <div class="composer-main">
+                  <label>
+                    <span>Nachricht</span>
+                    <textarea id="prompt" placeholder="Schreibe hier direkt an die AI-Plattform..."></textarea>
+                  </label>
+                  <div class="primary-actions">
+                    <button type="button" onclick="sendMessage()">Senden</button>
+                    <button type="button" class="secondary" onclick="resetSession()">Reset</button>
+                    <button type="button" class="secondary" onclick="deleteSession()">Loeschen</button>
+                  </div>
+                </div>
                 <div class="composer-side">
                   <div class="upload-box">
                     <div class="stat-label">Datei direkt in den Chat laden</div>
@@ -2560,11 +2572,6 @@ def _admin_chat_html() -> str:
                       <option value="true">Immer einbeziehen</option>
                     </select>
                   </label>
-                  <div class="actions">
-                    <button type="button" onclick="sendMessage()">Senden</button>
-                    <button type="button" class="secondary" onclick="resetSession()">Reset</button>
-                    <button type="button" class="secondary" onclick="deleteSession()">Loeschen</button>
-                  </div>
                 </div>
               </div>
               <div id="status" class="status">Session anlegen und loschatten.</div>
@@ -2609,6 +2616,12 @@ def _admin_chat_html() -> str:
 
             function selectedDocumentIds() {
               return Array.from(documentIdsInput.selectedOptions || []).map((item) => item.value).filter(Boolean);
+            }
+
+            function scrollMessagesToBottom() {
+              requestAnimationFrame(() => {
+                messagesNode.scrollTop = messagesNode.scrollHeight;
+              });
             }
 
             function escapeHtml(value) {
@@ -2699,7 +2712,7 @@ def _admin_chat_html() -> str:
                 `;
                 messagesNode.appendChild(node);
               }
-              messagesNode.scrollTop = messagesNode.scrollHeight;
+              scrollMessagesToBottom();
             }
 
             function renderSession(session) {
@@ -2920,7 +2933,7 @@ def _admin_chat_html() -> str:
               assistantNode.innerHTML = '<div class="message-header"><div class="message-role">assistant</div></div>';
               assistantNode.appendChild(assistantBody);
               messagesNode.appendChild(assistantNode);
-              messagesNode.scrollTop = messagesNode.scrollHeight;
+              scrollMessagesToBottom();
 
               try {
                 setStatus("Streaming laeuft...");
@@ -2970,6 +2983,7 @@ def _admin_chat_html() -> str:
                     if (delta) {
                       assistantText += delta;
                       assistantBody.innerHTML = renderMessageContent(assistantText);
+                      scrollMessagesToBottom();
                     }
                   }
                 }
