@@ -26,7 +26,7 @@ for handler in logging.getLogger().handlers:
 
 app = FastAPI(
     title="llm-gateway",
-    version="1.2.0",
+    version="1.31",
     description="OpenAI-compatible local orchestrator for llama.cpp backends.",
 )
 
