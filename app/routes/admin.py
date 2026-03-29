@@ -12,6 +12,7 @@ from app.metrics import metrics
 from app.services.home_assistant import HomeAssistantClient, HomeAssistantConfigError, HomeAssistantRequestError
 from app.services.backend_control import (
     gateway_logs,
+    ops_command_catalog,
     gateway_system_telemetry,
     gateway_status,
     kai_logs,
@@ -34,6 +35,8 @@ from app.services.backend_profiles import (
     list_backend_profiles,
     save_backend_profile,
 )
+from app.services.mcp_custom_tools import delete_custom_mcp_tool, list_custom_mcp_tools, save_custom_mcp_tool
+from app.services.mcp_registry import get_builtin_mcp_tool_names, get_mcp_tools
 from app.services.config_store import read_runtime_config, write_runtime_config
 from app.services.database_admin import database_status, initialize_database_schema
 from app.services.database_profiles import (
@@ -78,7 +81,7 @@ async def admin_page(request: Request, tab: str = "dashboard") -> HTMLResponse |
     username = get_admin_session_username(request)
     if not username:
         return RedirectResponse(url="/admin/login?next=/internal/admin", status_code=303)
-    active_tab = tab if tab in {"dashboard", "settings", "chat", "memory", "database", "home-assistant", "storage", "ops", "devices"} else "dashboard"
+    active_tab = tab if tab in {"dashboard", "settings", "skills", "chat", "memory", "database", "home-assistant", "storage", "ops", "devices"} else "dashboard"
     initial_data = await _build_initial_admin_data(base_url=str(request.base_url).rstrip("/"))
     db_message = request.query_params.get("db_message")
     if db_message:
@@ -824,6 +827,74 @@ async def ops_run(request: Request, target: str, command_name: str) -> JSONRespo
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/api/admin/ops/catalog", dependencies=[Depends(require_admin_api_auth)])
+async def get_ops_catalog() -> JSONResponse:
+    return JSONResponse({"targets": ops_command_catalog()})
+
+
+@router.get("/api/admin/mcp/tools", dependencies=[Depends(require_admin_api_auth)])
+async def get_admin_mcp_tools() -> JSONResponse:
+    custom_map = {item["name"]: item for item in list_custom_mcp_tools()}
+    tools: list[dict[str, object]] = []
+    for item in get_mcp_tools():
+        name = str(item.get("name") or "")
+        custom = custom_map.get(name)
+        tool_row: dict[str, object] = {
+            "name": name,
+            "description": str(item.get("description") or ""),
+            "input_schema": item.get("input_schema") if isinstance(item.get("input_schema"), dict) else {},
+            "output_schema": item.get("output_schema") if isinstance(item.get("output_schema"), dict) else {},
+            "is_custom": bool(custom),
+            "requires_admin": bool(item.get("requires_admin")),
+        }
+        if custom:
+            tool_row["target"] = custom.get("target")
+            tool_row["command"] = custom.get("command")
+        tools.append(tool_row)
+    return JSONResponse({"tools": tools})
+
+
+@router.get("/api/admin/mcp/custom-tools", dependencies=[Depends(require_admin_api_auth)])
+async def get_admin_custom_mcp_tools() -> JSONResponse:
+    return JSONResponse(
+        {
+            "tools": list_custom_mcp_tools(),
+            "ops_catalog": ops_command_catalog(),
+            "reserved_tool_names": sorted(get_builtin_mcp_tool_names()),
+        }
+    )
+
+
+@router.post("/api/admin/mcp/custom-tools", dependencies=[Depends(require_admin_api_auth)])
+async def save_admin_custom_mcp_tool(payload: dict[str, str | None]) -> JSONResponse:
+    name = str(payload.get("name") or "").strip().lower()
+    if name in get_builtin_mcp_tool_names():
+        raise HTTPException(status_code=400, detail="Name ist reserviert (builtin MCP-Tool).")
+
+    try:
+        saved = save_custom_mcp_tool(
+            name=name,
+            description=str(payload.get("description") or ""),
+            target=str(payload.get("target") or ""),
+            command=str(payload.get("command") or ""),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return JSONResponse({"saved": saved, "tools": list_custom_mcp_tools()})
+
+
+@router.post("/api/admin/mcp/custom-tools/{tool_name}/delete", dependencies=[Depends(require_admin_api_auth)])
+async def delete_admin_custom_mcp_tool(tool_name: str) -> JSONResponse:
+    if tool_name.strip().lower() in get_builtin_mcp_tool_names():
+        raise HTTPException(status_code=400, detail="Builtin MCP-Tools koennen nicht geloescht werden.")
+    try:
+        result = delete_custom_mcp_tool(tool_name)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse({"deleted": result, "tools": list_custom_mcp_tools()})
+
+
 async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
     settings = get_settings()
     config_values = _build_admin_config_values(settings)
@@ -888,6 +959,10 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
         "ha_configured": "-",
         "ha_connected": "-",
         "ha_location": "-",
+        "skills_status": "Skills/MCP-Verwaltung ist bereit.",
+        "mcp_tools_count": "0",
+        "mcp_custom_tools_count": "0",
+        "mcp_custom_tools_html": '<div class="muted">Noch keine Custom-MCP-Tools gespeichert.</div>',
         "device_status": "Pi-/Device-Profilverwaltung ist bereit.",
         "device_profiles_html": '<div class="muted">Noch keine Device-Profile gespeichert.</div>',
         "device_profile_form_id": "",
@@ -968,6 +1043,7 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
         data["device_face_style_name"] = f"gateway_{str(active_device_profile.get('name') or 'kai')}"
     data["device_profiles_html"] = _render_device_profiles_html(list_device_profiles())
     data["device_face_profile_options_html"] = _render_device_profile_options_html(list_device_profiles(), str(active_device_profile.get("id") or "") if active_device_profile else "")
+    data["mcp_custom_tools_html"] = _render_mcp_custom_tools_html(list_custom_mcp_tools())
 
     client = LlamaCppClient(settings)
     try:
@@ -1071,6 +1147,8 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
         data["ha_configured"] = "yes"
         data["ha_connected"] = "no"
     data["dashboard_ha_summary"] = f"{data['ha_configured']} / {data['ha_connected']}"
+    data["mcp_tools_count"] = str(len(get_mcp_tools()))
+    data["mcp_custom_tools_count"] = str(len(list_custom_mcp_tools()))
 
     return data
 
@@ -1245,6 +1323,32 @@ def _render_backend_profile_preview(profile: dict[str, object]) -> str:
         logs_command={logs_command}
         """
     ).strip()
+
+
+def _render_mcp_custom_tools_html(tools: list[dict[str, object]]) -> str:
+    if not tools:
+        return '<div class="muted">Noch keine Custom-MCP-Tools gespeichert.</div>'
+
+    items: list[str] = []
+    for tool in tools:
+        name = escape(str(tool.get("name") or "custom.tool"))
+        description = escape(str(tool.get("description") or "-"))
+        target = escape(str(tool.get("target") or "gateway"))
+        command = escape(str(tool.get("command") or "status"))
+        name_js = str(tool.get("name") or "").replace("\\", "\\\\").replace("'", "\\'")
+        items.append(
+            f"""
+            <div class="list-card">
+              <h3>{name}</h3>
+              <div class="list-meta">{description}</div>
+              <div class="list-meta">Ops: <code>{target}.{command}</code></div>
+              <div class="actions">
+                <button class="secondary" type="button" onclick="deleteCustomMcpTool('{name_js}')">Loeschen</button>
+              </div>
+            </div>
+            """
+        )
+    return "".join(items)
 
 
 def _render_storage_profiles_html(profiles: list[dict[str, object]]) -> str:
@@ -1718,6 +1822,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                 <div class="nav-buttons">
                   <a class="__NAV_DASHBOARD__" href="/internal/admin?tab=dashboard">Dashboard</a>
                   <a class="__NAV_SETTINGS__" href="/internal/admin?tab=settings">Settings</a>
+                  <a class="__NAV_SKILLS__" href="/internal/admin?tab=skills">Skills / MCP</a>
                   <a class="__NAV_CHAT__" href="/internal/admin?tab=chat">Chat</a>
                   <a class="__NAV_MEMORY__" href="/internal/admin?tab=memory">Memory</a>
                   <a class="__NAV_DATABASE__" href="/internal/admin?tab=database">Database</a>
@@ -2221,6 +2326,63 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               </div>
             </section>
 
+            <section id="skills" class="panel __PANEL_SKILLS__">
+              <div class="hero">
+                <h1>Skills / MCP</h1>
+                <p>Hier verwaltest du den MCP-Tool-Broker. Builtin-Tools bleiben stabil, zusaetzliche Custom-Tools mappen auf freigegebene Ops-Befehle. So kann Kai kontrolliert neue Wartungs-/Installationsaktionen nutzen, ohne ein freies Root-Terminal zu bekommen.</p>
+                <div id="skillsStatus" class="status">__SKILLS_STATUS__</div>
+              </div>
+              <div class="two-col">
+                <div class="card">
+                  <h2>MCP Tool-Broker</h2>
+                  <div class="grid">
+                    <div class="card stat">
+                      <div class="muted">MCP Tools</div>
+                      <strong id="mcpToolsCount">__MCP_TOOLS_COUNT__</strong>
+                      <div class="muted">builtin + custom</div>
+                    </div>
+                    <div class="card stat">
+                      <div class="muted">Custom Tools</div>
+                      <strong id="mcpCustomToolsCount">__MCP_CUSTOM_TOOLS_COUNT__</strong>
+                      <div class="muted">eigene Mappings</div>
+                    </div>
+                  </div>
+                  <div class="actions">
+                    <button class="secondary" type="button" onclick="loadMcpTools()">MCP-Tools laden</button>
+                    <button class="secondary" type="button" onclick="loadOpsCatalog()">Ops-Katalog laden</button>
+                  </div>
+                  <label style="margin-top:12px;"><span>Aktive MCP-Tools</span><textarea id="mcpToolsView" readonly></textarea></label>
+                  <p class="muted" style="margin-top:12px;">Custom-Tools rufen intern exakt einen freigegebenen Ops-Befehl auf, z. B. <code>gateway.install_htop</code>. Damit bleibt die Ausfuehrung nachvollziehbar und abgesichert.</p>
+                </div>
+                <div class="card">
+                  <h2>Custom MCP-Tool hinzufuegen</h2>
+                  <div class="grid">
+                    <label><span>Tool Name</span><input id="customMcpName" placeholder="z. B. gateway.install_htop_alias"></label>
+                    <label><span>Beschreibung</span><input id="customMcpDescription" placeholder="Kurze Beschreibung fuer Clients"></label>
+                    <label><span>Ops Target</span>
+                      <select id="customMcpTarget" onchange="refreshCustomMcpCommandOptions()">
+                        <option value="gateway">gateway</option>
+                        <option value="kai">kai</option>
+                      </select>
+                    </label>
+                    <label><span>Ops Command</span>
+                      <select id="customMcpCommand">
+                        <option value="">zuerst Ops-Katalog laden</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div class="actions">
+                    <button class="primary" type="button" onclick="saveCustomMcpTool()">Tool speichern</button>
+                  </div>
+                  <p class="muted" style="margin-top:12px;">Der Tool-Name muss 3-64 Zeichen lang sein und darf nur <code>a-z</code>, <code>0-9</code>, <code>.</code>, <code>-</code> und <code>_</code> enthalten.</p>
+                  <div style="margin-top:16px;">
+                    <h2>Gespeicherte Custom-Tools</h2>
+                    <div id="mcpCustomToolsList" class="list-stack">__MCP_CUSTOM_TOOLS_HTML__</div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
             <section id="chat" class="panel __PANEL_CHAT__">
               <div class="hero">
                 <h1>Admin Chat</h1>
@@ -2526,6 +2688,144 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               node.textContent = message;
               node.style.background = error ? "#f9dddd" : "#dff5e7";
               node.style.color = error ? "#942f2f" : "#16231b";
+            }
+
+            function setSkillsStatus(message, error = false) {
+              const node = document.getElementById("skillsStatus");
+              if (!node) return;
+              node.textContent = message;
+              node.style.background = error ? "#f9dddd" : "#dff5e7";
+              node.style.color = error ? "#942f2f" : "#16231b";
+            }
+
+            window.opsCatalog = { gateway: [], kai: [] };
+
+            function refreshCustomMcpCommandOptions() {
+              const targetNode = document.getElementById("customMcpTarget");
+              const commandNode = document.getElementById("customMcpCommand");
+              if (!targetNode || !commandNode) return;
+              const target = targetNode.value || "gateway";
+              const commands = (window.opsCatalog && window.opsCatalog[target]) || [];
+              const currentValue = commandNode.value;
+              if (!commands.length) {
+                commandNode.innerHTML = '<option value="">keine Befehle geladen</option>';
+                return;
+              }
+              commandNode.innerHTML = commands.map((item) => `<option value="${escapeHtml(item)}">${escapeHtml(item)}</option>`).join("");
+              if (commands.includes(currentValue)) {
+                commandNode.value = currentValue;
+              }
+            }
+
+            function renderCustomMcpTools(items) {
+              const node = document.getElementById("mcpCustomToolsList");
+              if (!node) return;
+              if (!items || items.length === 0) {
+                node.innerHTML = '<div class="muted">Noch keine Custom-MCP-Tools gespeichert.</div>';
+                return;
+              }
+              node.innerHTML = items.map((tool) => `
+                <div class="list-card">
+                  <h3>${escapeHtml(tool.name || "custom.tool")}</h3>
+                  <div class="list-meta">${escapeHtml(tool.description || "-")}</div>
+                  <div class="list-meta">Ops: <code>${escapeHtml(tool.target || "gateway")}.${escapeHtml(tool.command || "status")}</code></div>
+                  <div class="actions">
+                    <button class="secondary" type="button" onclick="deleteCustomMcpTool('${escapeHtml(tool.name || "")}')">Loeschen</button>
+                  </div>
+                </div>
+              `).join("");
+            }
+
+            async function loadOpsCatalog() {
+              try {
+                const res = await fetch("/api/admin/ops/catalog");
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessage(data, `Ops-Katalog fehlgeschlagen: ${res.status}`));
+                window.opsCatalog = data.targets || { gateway: [], kai: [] };
+                refreshCustomMcpCommandOptions();
+              } catch (error) {
+                setSkillsStatus(error.message, true);
+              }
+            }
+
+            async function loadMcpTools() {
+              try {
+                const res = await fetch("/api/admin/mcp/tools");
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessage(data, `MCP-Tools fehlgeschlagen: ${res.status}`));
+                const tools = data.tools || [];
+                const lines = tools.map((tool) => {
+                  const prefix = tool.is_custom ? "[custom]" : "[builtin]";
+                  const authPart = tool.requires_admin ? " [admin]" : " [device-ok]";
+                  const opsPart = tool.target && tool.command ? ` -> ${tool.target}.${tool.command}` : "";
+                  return `${prefix}${authPart} ${tool.name}${opsPart} | ${tool.description || "-"}`;
+                });
+                setValue("mcpToolsView", lines.join("\\n"));
+                setText("mcpToolsCount", String(tools.length));
+                setSkillsStatus(`MCP-Tools geladen (${tools.length}).`);
+              } catch (error) {
+                setSkillsStatus(error.message, true);
+              }
+            }
+
+            async function loadCustomMcpTools() {
+              try {
+                const res = await fetch("/api/admin/mcp/custom-tools");
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessage(data, `Custom-MCP-Tools fehlgeschlagen: ${res.status}`));
+                const tools = data.tools || [];
+                renderCustomMcpTools(tools);
+                setText("mcpCustomToolsCount", String(tools.length));
+                if (data.ops_catalog) {
+                  window.opsCatalog = data.ops_catalog;
+                  refreshCustomMcpCommandOptions();
+                }
+              } catch (error) {
+                setSkillsStatus(error.message, true);
+              }
+            }
+
+            async function saveCustomMcpTool() {
+              try {
+                const payload = {
+                  name: document.getElementById("customMcpName").value.trim().toLowerCase(),
+                  description: document.getElementById("customMcpDescription").value.trim(),
+                  target: document.getElementById("customMcpTarget").value,
+                  command: document.getElementById("customMcpCommand").value,
+                };
+                const res = await fetch("/api/admin/mcp/custom-tools", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(payload),
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessage(data, `Tool speichern fehlgeschlagen: ${res.status}`));
+                document.getElementById("customMcpName").value = "";
+                document.getElementById("customMcpDescription").value = "";
+                await loadCustomMcpTools();
+                await loadMcpTools();
+                setSkillsStatus(`Custom-Tool gespeichert: ${payload.name}`);
+              } catch (error) {
+                setSkillsStatus(error.message, true);
+              }
+            }
+
+            async function deleteCustomMcpTool(name) {
+              const toolName = String(name || "").trim().toLowerCase();
+              if (!toolName) return;
+              if (!window.confirm(`Custom-Tool '${toolName}' wirklich loeschen?`)) return;
+              try {
+                const res = await fetch(`/api/admin/mcp/custom-tools/${encodeURIComponent(toolName)}/delete`, {
+                  method: "POST",
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessage(data, `Tool loeschen fehlgeschlagen: ${res.status}`));
+                await loadCustomMcpTools();
+                await loadMcpTools();
+                setSkillsStatus(`Custom-Tool geloescht: ${toolName}`);
+              } catch (error) {
+                setSkillsStatus(error.message, true);
+              }
             }
 
             function formatUptime(seconds) {
@@ -3135,6 +3435,9 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
             loadStorageOverview();
             loadHomeAssistantStatus();
             loadContinueConfig();
+            loadOpsCatalog();
+            loadCustomMcpTools();
+            loadMcpTools();
             applyFaceFormDefaults();
           </script>
         </body>
@@ -3145,6 +3448,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__USERNAME__": escape(username),
         "__NAV_DASHBOARD__": "active" if active_tab == "dashboard" else "",
         "__NAV_SETTINGS__": "active" if active_tab == "settings" else "",
+        "__NAV_SKILLS__": "active" if active_tab == "skills" else "",
         "__NAV_CHAT__": "active" if active_tab == "chat" else "",
         "__NAV_MEMORY__": "active" if active_tab == "memory" else "",
         "__NAV_DATABASE__": "active" if active_tab == "database" else "",
@@ -3154,6 +3458,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__NAV_DEVICES__": "active" if active_tab == "devices" else "",
         "__PANEL_DASHBOARD__": "active" if active_tab == "dashboard" else "",
         "__PANEL_SETTINGS__": "active" if active_tab == "settings" else "",
+        "__PANEL_SKILLS__": "active" if active_tab == "skills" else "",
         "__PANEL_CHAT__": "active" if active_tab == "chat" else "",
         "__PANEL_MEMORY__": "active" if active_tab == "memory" else "",
         "__PANEL_DATABASE__": "active" if active_tab == "database" else "",
@@ -3163,6 +3468,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__PANEL_DEVICES__": "active" if active_tab == "devices" else "",
         "__DASHBOARD_STATUS__": escape(initial_data.get("dashboard_status", "-")),
         "__SETTINGS_STATUS__": escape(initial_data.get("settings_status", "-")),
+        "__SKILLS_STATUS__": escape(initial_data.get("skills_status", "-")),
         "__GATEWAY_STATE__": escape(initial_data.get("gateway_state", "-")),
         "__GATEWAY_INFO__": escape(initial_data.get("gateway_info", "-")),
         "__BACKEND_STATE__": escape(initial_data.get("backend_state", "-")),
@@ -3217,6 +3523,9 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__STORAGE_PROFILES_HTML__": initial_data.get("storage_profiles_html", ""),
         "__STORAGE_DOCUMENTS_HTML__": initial_data.get("storage_documents_html", ""),
         "__STORAGE_UPLOAD_OPTIONS_HTML__": initial_data.get("storage_upload_options_html", '<option value="">aktives Profil verwenden</option>'),
+        "__MCP_TOOLS_COUNT__": escape(initial_data.get("mcp_tools_count", "0")),
+        "__MCP_CUSTOM_TOOLS_COUNT__": escape(initial_data.get("mcp_custom_tools_count", "0")),
+        "__MCP_CUSTOM_TOOLS_HTML__": initial_data.get("mcp_custom_tools_html", '<div class="muted">Noch keine Custom-MCP-Tools gespeichert.</div>'),
         "__DEVICE_STATUS__": escape(initial_data.get("device_status", "-")),
         "__DEVICE_PROFILES_HTML__": initial_data.get("device_profiles_html", ""),
         "__DEVICE_PROFILE_FORM_ID__": escape(initial_data.get("device_profile_form_id", "")),

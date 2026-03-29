@@ -7,7 +7,7 @@ Ein lokaler OpenAI-kompatibler Orchestrator fuer VS Code Clients, der Requests a
 </p>
 
 <p align="center">
-  Linux-styliger Admin-Hub mit Dashboard, Profilumschaltung, Chat, Memory, Database, Storage, Home Assistant und Ops.
+  Linux-styliger Admin-Hub mit Dashboard, Profilumschaltung, Skills/MCP, Chat, Memory, Database, Storage, Home Assistant und Ops.
 </p>
 
 ## Praxis-Setup
@@ -657,6 +657,9 @@ Im Admin-Hub gibt es jetzt zusaetzlich:
   Dateien wie `.txt`, `.md`, `.pdf`, `.csv`, `.json`, `.log`, `.yaml`, `.yml` koennen dort abgelegt werden. Die Datei selbst bleibt im Storage, waehrend Metadaten und extrahierter Text in PostgreSQL landen.
   Damit ist die Grundlage gelegt, diese Dokumente als KI-Kontext oder Wissensbasis zu verwenden. Im Admin-Chat koennen gespeicherte Dokumente direkt als Kontext ausgewaehlt werden.
   Wichtige ehrliche Einschraenkung: Der Gateway macht bewusst keinen nativen SMB-Login. SMB wird als gemountetes Dateisystem behandelt.
+- `Skills / MCP`
+  Zeigt alle aktiven MCP-Tools (builtin + custom) und erlaubt das Anlegen eigener Custom-MCP-Tools.
+  Ein Custom-Tool mappt genau auf einen freigegebenen Ops-Befehl (`target + command`), damit Kai kontrolliert Tools nutzen kann, ohne ein freies Root-Terminal zu bekommen.
 
 Fuer dein geplantes Homelab-Setup ist das die pragmatische Empfehlung:
 
@@ -887,10 +890,19 @@ Endpoints:
 - `GET /api/mcp/tools` (Liste der verfuegbaren Tools)
 - `POST /api/mcp/call` (Tool ausfuehren)
 
+Admin-Management (Skills-Tab):
+
+- `GET /api/admin/mcp/tools`
+- `GET /api/admin/mcp/custom-tools`
+- `POST /api/admin/mcp/custom-tools`
+- `POST /api/admin/mcp/custom-tools/{tool_name}/delete`
+- `GET /api/admin/ops/catalog` (erlaubte Ops-Targets/Befehle fuer Custom-Tools)
+
 Auth:
 
 - Standard ist `Authorization: Bearer API_BEARER_TOKEN`
 - Optional fuer Devices: `Authorization: Bearer DEVICE_SHARED_TOKEN` oder `X-Device-Token`
+- Sensitive Gateway-Tools (`gateway.ops`, `gateway.custom_tool.*` und daraus abgeleitete Custom-Ops-Tools) sind bewusst nur fuer Admin/API-Token erlaubt, nicht fuer Device-Token.
 
 Beispiel:
 
@@ -913,6 +925,8 @@ Hinweis:
 
 - Die MCP-V1 ist absichtlich klein gehalten.
 - Schreiben/Schalten laeuft nur ueber freigegebene HA-Services.
+- Custom-Tools sind kein freies Shell-Feature: sie duerfen nur auf den vorhandenen Ops-Allowlist-Befehlen aufsetzen.
+- Fuer automatisches Tool-Management stehen zusaetzlich die MCP-Tools `gateway.custom_tool.list`, `gateway.custom_tool.save` und `gateway.custom_tool.delete` bereit.
 
 ## Vision / Bildanalyse
 
