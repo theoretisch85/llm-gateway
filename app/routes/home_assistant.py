@@ -7,15 +7,19 @@ from pydantic import BaseModel, Field
 
 from app.auth import require_admin_api_auth, require_device_token
 from app.config import get_settings
+from app.core.roles import ActorContext, ROLE_ADMIN, ROLE_DEVICE
+from app.orchestrator import ToolOrchestrator
 from app.services.home_assistant import (
     HomeAssistantClient,
     HomeAssistantConfigError,
     HomeAssistantRequestError,
 )
 from app.services.home_assistant_memory import get_home_assistant_note_store
+from app.tools.executor import ToolPermissionError
 
 
 router = APIRouter(tags=["home-assistant"])
+tool_orchestrator = ToolOrchestrator()
 
 
 class HomeAssistantActionRequest(BaseModel):
@@ -50,19 +54,32 @@ async def admin_home_assistant_status() -> dict[str, object]:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
 
-@router.get("/api/admin/home-assistant/entities", dependencies=[Depends(require_admin_api_auth)])
+@router.get("/api/admin/home-assistant/entities")
 async def admin_home_assistant_entities(
+    request: Request,
     domain: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
+    auth_subject: str = Depends(require_admin_api_auth),
 ) -> dict[str, object]:
     settings = get_settings()
-    client = HomeAssistantClient(settings)
     try:
-        entities = await client.list_entities(domain=domain, limit=limit)
+        entities = await tool_orchestrator.execute_tool(
+            settings=settings,
+            actor=ActorContext(
+                actor_id=auth_subject or "admin",
+                role=ROLE_ADMIN,
+                source="api.home_assistant.entities",
+            ),
+            request_id=request.state.request_id,
+            tool_name="ha.entities",
+            arguments={"domain": domain, "limit": limit},
+        )
     except HomeAssistantConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except HomeAssistantRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    except ToolPermissionError as exc:
+        raise HTTPException(status_code=403, detail=exc.message) from exc
     return {
         "domain": domain,
         "count": len(entities),
@@ -70,40 +87,72 @@ async def admin_home_assistant_entities(
     }
 
 
-@router.post("/api/admin/home-assistant/action", dependencies=[Depends(require_admin_api_auth)])
-async def admin_home_assistant_action(payload: HomeAssistantActionRequest, request: Request) -> dict[str, object]:
+@router.post("/api/admin/home-assistant/action")
+async def admin_home_assistant_action(
+    payload: HomeAssistantActionRequest,
+    request: Request,
+    auth_subject: str = Depends(require_admin_api_auth),
+) -> dict[str, object]:
     settings = get_settings()
-    client = HomeAssistantClient(settings)
-    request.state.backend_called = True
     try:
-        return await client.call_service(
-            domain=payload.domain,
-            service=payload.service,
-            entity_id=payload.entity_id,
-            service_data=payload.service_data,
+        result = await tool_orchestrator.execute_tool(
+            settings=settings,
+            actor=ActorContext(
+                actor_id=auth_subject or "admin",
+                role=ROLE_ADMIN,
+                source="api.home_assistant.action.admin",
+            ),
+            request_id=request.state.request_id,
+            tool_name="ha.call",
+            arguments={
+                "domain": payload.domain,
+                "service": payload.service,
+                "entity_id": payload.entity_id,
+                "service_data": payload.service_data,
+            },
         )
+        request.state.backend_called = True
+        return result
     except HomeAssistantConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except HomeAssistantRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ToolPermissionError as exc:
+        raise HTTPException(status_code=403, detail=exc.message) from exc
 
 
 @router.post("/api/device/home-assistant/action", dependencies=[Depends(require_device_token)])
 async def device_home_assistant_action(payload: HomeAssistantActionRequest, request: Request) -> dict[str, object]:
     settings = get_settings()
-    client = HomeAssistantClient(settings)
-    request.state.backend_called = True
     try:
-        return await client.call_service(
-            domain=payload.domain,
-            service=payload.service,
-            entity_id=payload.entity_id,
-            service_data=payload.service_data,
+        result = await tool_orchestrator.execute_tool(
+            settings=settings,
+            actor=ActorContext(
+                actor_id="device_token",
+                role=ROLE_DEVICE,
+                source="api.home_assistant.action.device",
+            ),
+            request_id=request.state.request_id,
+            tool_name="ha.call",
+            arguments={
+                "domain": payload.domain,
+                "service": payload.service,
+                "entity_id": payload.entity_id,
+                "service_data": payload.service_data,
+            },
         )
+        request.state.backend_called = True
+        return result
     except HomeAssistantConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except HomeAssistantRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ToolPermissionError as exc:
+        raise HTTPException(status_code=403, detail=exc.message) from exc
 
 
 @router.get("/api/admin/home-assistant/notes", dependencies=[Depends(require_admin_api_auth)])

@@ -101,6 +101,15 @@ class InMemorySessionStore:
             session.updated_at = utcnow()
             return session
 
+    async def rename_session(self, session_id: str, title: str) -> ChatSession | None:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            session.title = title
+            session.updated_at = utcnow()
+            return session
+
     async def add_message(
         self,
         session_id: str,
@@ -285,6 +294,25 @@ class PostgresSessionStore:
                 session_id,
             )
             return self._session_from_row(row, [])
+
+    async def rename_session(self, session_id: str, title: str) -> ChatSession | None:
+        pool = await self._pool_instance()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                update chat_sessions
+                set title = $2,
+                    updated_at = now()
+                where id = $1::uuid
+                returning id, title, selected_mode, resolved_model, route_reason, rolling_summary, created_at, updated_at
+                """,
+                session_id,
+                title,
+            )
+            if row is None:
+                return None
+            messages = await self._fetch_messages(conn, session_id)
+            return self._session_from_row(row, messages)
 
     async def add_message(
         self,

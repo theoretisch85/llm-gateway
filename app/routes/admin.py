@@ -8,18 +8,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from app.auth import get_admin_session_username, require_admin_api_auth
 from app.config import get_settings
+from app.core.roles import ActorContext, ROLE_ADMIN
 from app.metrics import metrics
+from app.orchestrator import ToolOrchestrator
 from app.services.home_assistant import HomeAssistantClient, HomeAssistantConfigError, HomeAssistantRequestError
 from app.services.backend_control import (
-    gateway_logs,
     ops_command_catalog,
     gateway_system_telemetry,
-    gateway_status,
-    kai_logs,
-    kai_status,
-    restart_gateway,
-    restart_mi50_backend,
-    run_ops_command,
     run_remote_backend_activation,
     stop_mi50_service,
     switch_mi50_service,
@@ -70,10 +65,12 @@ from app.services.storage_library import (
     storage_overview,
     upload_document,
 )
+from app.tools.executor import ToolExecutionError
 
 
 router = APIRouter(tags=["admin"])
 logger = logging.getLogger("llm_gateway")
+tool_orchestrator = ToolOrchestrator()
 
 
 @router.get("/internal/admin", response_class=HTMLResponse, response_model=None)
@@ -331,13 +328,19 @@ async def get_continue_config(request: Request) -> JSONResponse:
     return JSONResponse({"yaml": rendered})
 
 
-@router.post("/internal/admin/restart-backend", dependencies=[Depends(require_admin_api_auth)])
-async def restart_backend(request: Request) -> JSONResponse:
-    request.state.backend_called = True
+@router.post("/internal/admin/restart-backend")
+async def restart_backend(request: Request, auth_subject: str = Depends(require_admin_api_auth)) -> JSONResponse:
     logger.info("admin requested mi50 backend restart")
     try:
-        return JSONResponse(restart_mi50_backend())
-    except RuntimeError as exc:
+        result = await _run_admin_ops_tool(
+            request=request,
+            auth_subject=auth_subject,
+            target="kai",
+            command_name="restart",
+            source="api.admin.restart_backend",
+        )
+        return JSONResponse(result)
+    except ToolExecutionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -781,49 +784,104 @@ def _form_bool(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-@router.get("/api/admin/ops/{target}/status", dependencies=[Depends(require_admin_api_auth)])
-async def ops_status(target: str) -> JSONResponse:
+async def _run_admin_ops_tool(
+    *,
+    request: Request,
+    auth_subject: str,
+    target: str,
+    command_name: str,
+    source: str,
+) -> dict[str, object]:
+    settings = get_settings()
+    normalized_target = (target or "").strip().lower()
+    normalized_command = (command_name or "").strip().lower()
+    result = await tool_orchestrator.execute_tool(
+        settings=settings,
+        actor=ActorContext(
+            actor_id=auth_subject or "admin",
+            role=ROLE_ADMIN,
+            source=source,
+        ),
+        request_id=request.state.request_id,
+        tool_name="gateway.ops",
+        arguments={
+            "target": normalized_target,
+            "command": normalized_command,
+        },
+    )
+    if normalized_target == "kai":
+        request.state.backend_called = True
+    return result if isinstance(result, dict) else {"result": result}
+
+
+@router.get("/api/admin/ops/{target}/status")
+async def ops_status(target: str, request: Request, auth_subject: str = Depends(require_admin_api_auth)) -> JSONResponse:
     try:
-        if target == "gateway":
-            return JSONResponse(gateway_status())
-        if target == "kai":
-            return JSONResponse(kai_status())
-    except RuntimeError as exc:
+        if target not in {"gateway", "kai"}:
+            raise HTTPException(status_code=404, detail="Unknown ops target.")
+        result = await _run_admin_ops_tool(
+            request=request,
+            auth_subject=auth_subject,
+            target=target,
+            command_name="status",
+            source="api.admin.ops_status",
+        )
+        return JSONResponse(result)
+    except ToolExecutionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    raise HTTPException(status_code=404, detail="Unknown ops target.")
 
 
-@router.get("/api/admin/ops/{target}/logs", dependencies=[Depends(require_admin_api_auth)])
-async def ops_logs(target: str) -> JSONResponse:
+@router.get("/api/admin/ops/{target}/logs")
+async def ops_logs(target: str, request: Request, auth_subject: str = Depends(require_admin_api_auth)) -> JSONResponse:
     try:
-        if target == "gateway":
-            return JSONResponse(gateway_logs())
-        if target == "kai":
-            return JSONResponse(kai_logs())
-    except RuntimeError as exc:
+        if target not in {"gateway", "kai"}:
+            raise HTTPException(status_code=404, detail="Unknown ops target.")
+        result = await _run_admin_ops_tool(
+            request=request,
+            auth_subject=auth_subject,
+            target=target,
+            command_name="logs",
+            source="api.admin.ops_logs",
+        )
+        return JSONResponse(result)
+    except ToolExecutionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    raise HTTPException(status_code=404, detail="Unknown ops target.")
 
 
-@router.post("/api/admin/ops/{target}/restart", dependencies=[Depends(require_admin_api_auth)])
-async def ops_restart(request: Request, target: str) -> JSONResponse:
-    request.state.backend_called = target == "kai"
+@router.post("/api/admin/ops/{target}/restart")
+async def ops_restart(request: Request, target: str, auth_subject: str = Depends(require_admin_api_auth)) -> JSONResponse:
     try:
-        if target == "gateway":
-            return JSONResponse(restart_gateway())
-        if target == "kai":
-            return JSONResponse(restart_mi50_backend())
-    except RuntimeError as exc:
+        if target not in {"gateway", "kai"}:
+            raise HTTPException(status_code=404, detail="Unknown ops target.")
+        result = await _run_admin_ops_tool(
+            request=request,
+            auth_subject=auth_subject,
+            target=target,
+            command_name="restart",
+            source="api.admin.ops_restart",
+        )
+        return JSONResponse(result)
+    except ToolExecutionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    raise HTTPException(status_code=404, detail="Unknown ops target.")
 
 
-@router.get("/api/admin/ops/{target}/run/{command_name}", dependencies=[Depends(require_admin_api_auth)])
-async def ops_run(request: Request, target: str, command_name: str) -> JSONResponse:
-    request.state.backend_called = target == "kai"
+@router.get("/api/admin/ops/{target}/run/{command_name}")
+async def ops_run(
+    request: Request,
+    target: str,
+    command_name: str,
+    auth_subject: str = Depends(require_admin_api_auth),
+) -> JSONResponse:
     try:
-        return JSONResponse(run_ops_command(target, command_name))
-    except RuntimeError as exc:
+        result = await _run_admin_ops_tool(
+            request=request,
+            auth_subject=auth_subject,
+            target=target,
+            command_name=command_name,
+            source="api.admin.ops_run",
+        )
+        return JSONResponse(result)
+    except ToolExecutionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

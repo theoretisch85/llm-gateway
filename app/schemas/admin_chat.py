@@ -12,6 +12,10 @@ class AdminSessionCreateRequest(BaseModel):
     mode: ChatMode = "auto"
 
 
+class AdminSessionRenameRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=160)
+
+
 class AdminChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
     mode: ChatMode | None = None

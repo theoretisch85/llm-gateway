@@ -10,6 +10,8 @@ from app.api_errors import error_response
 from app.auth import get_admin_session_username, require_admin_api_auth
 from app.config import get_settings
 from app.context_guard import ContextGuardError, fit_messages_to_budget
+from app.core.roles import ActorContext, ROLE_ADMIN
+from app.orchestrator import ToolOrchestrator
 from app.schemas.chat import ChatMessage
 from app.schemas.admin_chat import (
     AdminChatRequest,
@@ -17,6 +19,7 @@ from app.schemas.admin_chat import (
     AdminMemoryOverviewResponse,
     AdminMemorySummaryResponse,
     AdminSessionCreateRequest,
+    AdminSessionRenameRequest,
     AdminSessionResponse,
 )
 from app.services.llamacpp_client import LlamaCppClient, LlamaCppError, LlamaCppTimeoutError
@@ -30,13 +33,14 @@ from app.services.home_assistant_memory import (
     parse_home_assistant_note_instruction,
 )
 from app.services.model_router import ModelRouter
-from app.services.backend_control import OpsActionError, run_ops_command
 from app.services.session_memory import ChatSession, get_session_store
 from app.services.storage_library import get_document_contexts
+from app.tools.executor import ToolExecutionError
 
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["admin-chat"])
+tool_orchestrator = ToolOrchestrator()
 
 
 @router.get("/internal/chat", response_class=HTMLResponse, response_model=None)
@@ -115,12 +119,29 @@ async def reset_session(session_id: str) -> AdminSessionResponse:
     return _serialize_session(session)
 
 
+@router.post("/api/admin/sessions/{session_id}/rename", dependencies=[Depends(require_admin_api_auth)], response_model=AdminSessionResponse)
+async def rename_session(session_id: str, payload: AdminSessionRenameRequest) -> AdminSessionResponse:
+    settings = get_settings()
+    store = get_session_store(settings)
+    clean_title = payload.title.strip()
+    if not clean_title:
+        raise HTTPException(status_code=400, detail="Titel darf nicht leer sein.")
+    session = await store.rename_session(session_id, clean_title)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return _serialize_session(session)
+
+
 @router.post(
     "/api/admin/sessions/{session_id}/chat",
-    dependencies=[Depends(require_admin_api_auth)],
     response_model=None,
 )
-async def admin_chat(payload: AdminChatRequest, session_id: str, request: Request) -> AdminChatResponse | JSONResponse:
+async def admin_chat(
+    payload: AdminChatRequest,
+    session_id: str,
+    request: Request,
+    auth_subject: str = Depends(require_admin_api_auth),
+) -> AdminChatResponse | JSONResponse:
     settings = get_settings()
     store = get_session_store(settings)
     session = await _require_session(store, session_id)
@@ -251,7 +272,12 @@ async def admin_chat(payload: AdminChatRequest, session_id: str, request: Reques
                 route_reason=ha_query_result["route_reason"],
             )
 
-        gateway_ops_result = await _try_handle_gateway_ops_action(payload.message)
+        gateway_ops_result = await _try_handle_gateway_ops_action(
+            settings=settings,
+            message=payload.message,
+            request_id=request.state.request_id,
+            actor_id=auth_subject or "admin",
+        )
         if gateway_ops_result is not None:
             await store.add_message(session_id, "user", payload.message)
             await store.update_route(session_id, "gateway_ops", gateway_ops_result["route_reason"], payload.mode or session.mode)
@@ -315,7 +341,7 @@ async def admin_chat(payload: AdminChatRequest, session_id: str, request: Reques
             error_type="upstream_error",
             code="home_assistant_request_failed",
         )
-    except OpsActionError as exc:
+    except (ToolExecutionError, ValueError) as exc:
         return error_response(
             request_id=request.state.request_id,
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -343,10 +369,14 @@ async def admin_chat(payload: AdminChatRequest, session_id: str, request: Reques
 
 @router.post(
     "/api/admin/sessions/{session_id}/chat/stream",
-    dependencies=[Depends(require_admin_api_auth)],
     response_model=None,
 )
-async def admin_chat_stream(payload: AdminChatRequest, session_id: str, request: Request) -> StreamingResponse | JSONResponse:
+async def admin_chat_stream(
+    payload: AdminChatRequest,
+    session_id: str,
+    request: Request,
+    auth_subject: str = Depends(require_admin_api_auth),
+) -> StreamingResponse | JSONResponse:
     settings = get_settings()
     store = get_session_store(settings)
     session = await _require_session(store, session_id)
@@ -562,7 +592,12 @@ async def admin_chat_stream(payload: AdminChatRequest, session_id: str, request:
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
 
-        gateway_ops_result = await _try_handle_gateway_ops_action(payload.message)
+        gateway_ops_result = await _try_handle_gateway_ops_action(
+            settings=settings,
+            message=payload.message,
+            request_id=request.state.request_id,
+            actor_id=auth_subject or "admin",
+        )
         if gateway_ops_result is not None:
             await store.add_message(session_id, "user", payload.message)
             await store.update_route(session_id, "gateway_ops", gateway_ops_result["route_reason"], payload.mode or session.mode)
@@ -622,7 +657,7 @@ async def admin_chat_stream(payload: AdminChatRequest, session_id: str, request:
             error_type="upstream_error",
             code="home_assistant_request_failed",
         )
-    except OpsActionError as exc:
+    except (ToolExecutionError, ValueError) as exc:
         return error_response(
             request_id=request.state.request_id,
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -834,12 +869,31 @@ def _parse_gateway_ops_action(message: str) -> dict[str, str] | None:
     return None
 
 
-async def _try_handle_gateway_ops_action(message: str) -> dict[str, str] | None:
+async def _try_handle_gateway_ops_action(
+    *,
+    settings,
+    message: str,
+    request_id: str,
+    actor_id: str,
+) -> dict[str, str] | None:
     parsed = _parse_gateway_ops_action(message)
     if parsed is None:
         return None
 
-    result = run_ops_command("gateway", parsed["command_name"])
+    result = await tool_orchestrator.execute_tool(
+        settings=settings,
+        actor=ActorContext(
+            actor_id=actor_id or "admin",
+            role=ROLE_ADMIN,
+            source="api.admin_chat.gateway_ops",
+        ),
+        request_id=request_id,
+        tool_name="gateway.ops",
+        arguments={
+            "target": "gateway",
+            "command": parsed["command_name"],
+        },
+    )
     assistant_text = f"Gateway-Ops ausgefuehrt: {parsed['label']}.\n\n{result.get('output') or 'OK'}"
     return {
         "assistant_text": assistant_text,
@@ -2218,13 +2272,14 @@ def _admin_chat_html() -> str:
                 linear-gradient(180deg,#10151c 0%, var(--bg) 100%);
               color:var(--ink);
             }
-            main { padding:20px; display:grid; grid-template-columns:300px 1fr; gap:18px; min-height:100vh; }
+            main { padding:20px; display:grid; grid-template-columns:minmax(260px, 320px) minmax(0, 1fr); gap:18px; min-height:100vh; }
             .panel {
               position:relative;
               background:linear-gradient(180deg, var(--card-2), var(--card));
               border:1px solid var(--line);
               border-radius:10px;
               padding:44px 18px 18px;
+              min-width:0;
             }
             .panel::before {
               content:"";
@@ -2384,11 +2439,15 @@ def _admin_chat_html() -> str:
               background:#0a0f14;
               color:#d7e3ef;
             }
-            .row { display:grid; grid-template-columns:1fr 180px; gap:12px; }
+            .composer { display:grid; grid-template-columns:minmax(0, 1fr); gap:12px; }
+            .composer-main { min-width:0; }
+            .primary-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
+            .primary-actions button { min-width:120px; }
             .composer-side {
-              display:flex;
-              flex-direction:column;
+              display:grid;
+              grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));
               gap:12px;
+              align-items:start;
             }
             .upload-box {
               border:1px solid var(--line);
@@ -2454,7 +2513,6 @@ def _admin_chat_html() -> str:
             pre { white-space:pre-wrap; word-break:break-word; margin:0; }
             @media (max-width: 980px) {
               main { grid-template-columns:1fr; }
-              .row { grid-template-columns:1fr; }
               .stats { grid-template-columns:1fr; }
             }
           </style>
@@ -2487,11 +2545,19 @@ def _admin_chat_html() -> str:
                 </div>
               </div>
               <div id="messages" class="messages"></div>
-              <div class="row">
-                <label>
-                  <span>Nachricht</span>
-                  <textarea id="prompt" placeholder="Schreibe hier direkt an die AI-Plattform..."></textarea>
-                </label>
+              <div class="composer">
+                <div class="composer-main">
+                  <label>
+                    <span>Nachricht</span>
+                    <textarea id="prompt" placeholder="Schreibe hier direkt an die AI-Plattform..."></textarea>
+                  </label>
+                  <div class="primary-actions">
+                    <button type="button" onclick="sendMessage()">Senden</button>
+                    <button type="button" class="secondary" onclick="renameSession()">Umbenennen</button>
+                    <button type="button" class="secondary" onclick="resetSession()">Reset</button>
+                    <button type="button" class="secondary" onclick="deleteSession()">Loeschen</button>
+                  </div>
+                </div>
                 <div class="composer-side">
                   <div class="upload-box">
                     <div class="stat-label">Datei direkt in den Chat laden</div>
@@ -2520,11 +2586,6 @@ def _admin_chat_html() -> str:
                       <option value="true">Immer einbeziehen</option>
                     </select>
                   </label>
-                  <div class="actions">
-                    <button type="button" onclick="sendMessage()">Senden</button>
-                    <button type="button" class="secondary" onclick="resetSession()">Reset</button>
-                    <button type="button" class="secondary" onclick="deleteSession()">Loeschen</button>
-                  </div>
                 </div>
               </div>
               <div id="status" class="status">Session anlegen und loschatten.</div>
@@ -2569,6 +2630,12 @@ def _admin_chat_html() -> str:
 
             function selectedDocumentIds() {
               return Array.from(documentIdsInput.selectedOptions || []).map((item) => item.value).filter(Boolean);
+            }
+
+            function scrollMessagesToBottom() {
+              requestAnimationFrame(() => {
+                messagesNode.scrollTop = messagesNode.scrollHeight;
+              });
             }
 
             function escapeHtml(value) {
@@ -2659,7 +2726,7 @@ def _admin_chat_html() -> str:
                 `;
                 messagesNode.appendChild(node);
               }
-              messagesNode.scrollTop = messagesNode.scrollHeight;
+              scrollMessagesToBottom();
             }
 
             function renderSession(session) {
@@ -2802,6 +2869,33 @@ def _admin_chat_html() -> str:
               }
             }
 
+            async function renameSession() {
+              if (!currentSessionId) return;
+              const currentTitle = sessionTitle.textContent || "";
+              const nextTitle = window.prompt("Neuer Session-Name:", currentTitle);
+              if (nextTitle === null) return;
+              const cleanTitle = String(nextTitle || "").trim();
+              if (!cleanTitle) {
+                setStatus("Titel darf nicht leer sein.", true);
+                return;
+              }
+
+              try {
+                const res = await fetch(`/api/admin/sessions/${currentSessionId}/rename`, {
+                  method: "POST",
+                  headers: headers(),
+                  body: JSON.stringify({ title: cleanTitle }),
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessageFrom(data, `Umbenennen fehlgeschlagen: ${res.status}`));
+                renderSession(data);
+                await loadSessions();
+                setStatus("Session umbenannt.");
+              } catch (error) {
+                setStatus(error.message, true);
+              }
+            }
+
             async function deleteSession() {
               if (!currentSessionId) return;
               try {
@@ -2880,7 +2974,7 @@ def _admin_chat_html() -> str:
               assistantNode.innerHTML = '<div class="message-header"><div class="message-role">assistant</div></div>';
               assistantNode.appendChild(assistantBody);
               messagesNode.appendChild(assistantNode);
-              messagesNode.scrollTop = messagesNode.scrollHeight;
+              scrollMessagesToBottom();
 
               try {
                 setStatus("Streaming laeuft...");
@@ -2930,6 +3024,7 @@ def _admin_chat_html() -> str:
                     if (delta) {
                       assistantText += delta;
                       assistantBody.innerHTML = renderMessageContent(assistantText);
+                      scrollMessagesToBottom();
                     }
                   }
                 }
