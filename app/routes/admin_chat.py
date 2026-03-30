@@ -10,7 +10,8 @@ from app.api_errors import error_response
 from app.auth import get_admin_session_username, require_admin_api_auth
 from app.config import get_settings
 from app.context_guard import ContextGuardError, fit_messages_to_budget
-from app.core.roles import ActorContext, ROLE_ADMIN
+from app.core.request_context import RequestContext
+from app.core.roles import ROLE_ADMIN
 from app.orchestrator import ToolOrchestrator
 from app.schemas.chat import ChatMessage
 from app.schemas.admin_chat import (
@@ -146,6 +147,12 @@ async def admin_chat(
     store = get_session_store(settings)
     session = await _require_session(store, session_id)
     client = LlamaCppClient(settings)
+    request_context = RequestContext(
+        request_id=request.state.request_id,
+        role=ROLE_ADMIN,
+        principal_id=auth_subject or "admin",
+        source="api.admin_chat",
+    )
 
     try:
         alias_instruction = parse_home_assistant_alias_instruction(payload.message)
@@ -216,7 +223,12 @@ async def admin_chat(
                 route_reason="home_assistant_note_saved",
             )
 
-        ha_intent_result = await _try_handle_home_assistant_intent_stage(settings, payload.message, session=session)
+        ha_intent_result = await _try_handle_home_assistant_intent_stage(
+            settings,
+            payload.message,
+            session=session,
+            request_context=request_context,
+        )
         if ha_intent_result is not None:
             await store.add_message(session_id, "user", payload.message)
             await store.update_route(session_id, "home_assistant", ha_intent_result["route_reason"], payload.mode or session.mode)
@@ -235,7 +247,12 @@ async def admin_chat(
                 route_reason=ha_intent_result["route_reason"],
             )
 
-        ha_action_result = await _try_handle_home_assistant_action(settings, payload.message, session=session)
+        ha_action_result = await _try_handle_home_assistant_action(
+            settings,
+            payload.message,
+            session=session,
+            request_context=request_context,
+        )
         if ha_action_result is not None:
             await store.add_message(session_id, "user", payload.message)
             await store.update_route(session_id, "home_assistant", ha_action_result["route_reason"], payload.mode or session.mode)
@@ -253,7 +270,11 @@ async def admin_chat(
                 route_reason=ha_action_result["route_reason"],
             )
 
-        ha_query_result = await _try_handle_home_assistant_lookup(settings, payload.message)
+        ha_query_result = await _try_handle_home_assistant_lookup(
+            settings,
+            payload.message,
+            request_context=request_context,
+        )
         if ha_query_result is not None:
             await store.add_message(session_id, "user", payload.message)
             await store.update_route(session_id, "home_assistant", ha_query_result["route_reason"], payload.mode or session.mode)
@@ -275,8 +296,7 @@ async def admin_chat(
         gateway_ops_result = await _try_handle_gateway_ops_action(
             settings=settings,
             message=payload.message,
-            request_id=request.state.request_id,
-            actor_id=auth_subject or "admin",
+            request_context=request_context,
         )
         if gateway_ops_result is not None:
             await store.add_message(session_id, "user", payload.message)
@@ -292,6 +312,27 @@ async def admin_chat(
                 assistant_message=_serialize_message(assistant_message),
                 resolved_model="gateway_ops",
                 route_reason=gateway_ops_result["route_reason"],
+            )
+
+        math_result = await _try_handle_math_calculation(
+            settings=settings,
+            message=payload.message,
+            request_context=request_context,
+        )
+        if math_result is not None:
+            await store.add_message(session_id, "user", payload.message)
+            await store.update_route(session_id, "math_service", math_result["route_reason"], payload.mode or session.mode)
+            assistant_message = await store.add_message(
+                session_id,
+                "assistant",
+                math_result["assistant_text"],
+                model_used="math_service",
+            )
+            return AdminChatResponse(
+                session=_serialize_session(await _require_session(store, session_id)),
+                assistant_message=_serialize_message(assistant_message),
+                resolved_model="math_service",
+                route_reason=math_result["route_reason"],
             )
 
         decision, backend_payload = await _prepare_admin_backend_payload(settings, session, payload)
@@ -381,6 +422,12 @@ async def admin_chat_stream(
     store = get_session_store(settings)
     session = await _require_session(store, session_id)
     client = LlamaCppClient(settings)
+    request_context = RequestContext(
+        request_id=request.state.request_id,
+        role=ROLE_ADMIN,
+        principal_id=auth_subject or "admin",
+        source="api.admin_chat.stream",
+    )
 
     try:
         alias_instruction = parse_home_assistant_alias_instruction(payload.message)
@@ -485,7 +532,12 @@ async def admin_chat_stream(
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
 
-        ha_intent_result = await _try_handle_home_assistant_intent_stage(settings, payload.message, session=session)
+        ha_intent_result = await _try_handle_home_assistant_intent_stage(
+            settings,
+            payload.message,
+            session=session,
+            request_context=request_context,
+        )
         if ha_intent_result is not None:
             await store.add_message(session_id, "user", payload.message)
             await store.update_route(session_id, "home_assistant", ha_intent_result["route_reason"], payload.mode or session.mode)
@@ -521,7 +573,12 @@ async def admin_chat_stream(
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
 
-        ha_action_result = await _try_handle_home_assistant_action(settings, payload.message, session=session)
+        ha_action_result = await _try_handle_home_assistant_action(
+            settings,
+            payload.message,
+            session=session,
+            request_context=request_context,
+        )
         if ha_action_result is not None:
             await store.add_message(session_id, "user", payload.message)
             await store.update_route(session_id, "home_assistant", ha_action_result["route_reason"], payload.mode or session.mode)
@@ -556,7 +613,11 @@ async def admin_chat_stream(
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
 
-        ha_query_result = await _try_handle_home_assistant_lookup(settings, payload.message)
+        ha_query_result = await _try_handle_home_assistant_lookup(
+            settings,
+            payload.message,
+            request_context=request_context,
+        )
         if ha_query_result is not None:
             await store.add_message(session_id, "user", payload.message)
             await store.update_route(session_id, "home_assistant", ha_query_result["route_reason"], payload.mode or session.mode)
@@ -595,8 +656,7 @@ async def admin_chat_stream(
         gateway_ops_result = await _try_handle_gateway_ops_action(
             settings=settings,
             message=payload.message,
-            request_id=request.state.request_id,
-            actor_id=auth_subject or "admin",
+            request_context=request_context,
         )
         if gateway_ops_result is not None:
             await store.add_message(session_id, "user", payload.message)
@@ -627,6 +687,44 @@ async def admin_chat_stream(
 
             return StreamingResponse(
                 gateway_ops_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+
+        math_result = await _try_handle_math_calculation(
+            settings=settings,
+            message=payload.message,
+            request_context=request_context,
+        )
+        if math_result is not None:
+            await store.add_message(session_id, "user", payload.message)
+            await store.update_route(session_id, "math_service", math_result["route_reason"], payload.mode or session.mode)
+
+            async def math_stream():
+                confirmation = {
+                    "id": f"chatcmpl-math-{session_id}",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "math_service",
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    "request_id": request.state.request_id,
+                }
+                content = {
+                    **confirmation,
+                    "choices": [{"index": 0, "delta": {"content": math_result["assistant_text"]}, "finish_reason": "stop"}],
+                }
+                yield f"data: {json.dumps(confirmation, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield f"data: {json.dumps(content, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+                await store.add_message(
+                    session_id,
+                    "assistant",
+                    math_result["assistant_text"],
+                    model_used="math_service",
+                )
+
+            return StreamingResponse(
+                math_stream(),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
@@ -873,8 +971,7 @@ async def _try_handle_gateway_ops_action(
     *,
     settings,
     message: str,
-    request_id: str,
-    actor_id: str,
+    request_context: RequestContext,
 ) -> dict[str, str] | None:
     parsed = _parse_gateway_ops_action(message)
     if parsed is None:
@@ -882,12 +979,12 @@ async def _try_handle_gateway_ops_action(
 
     result = await tool_orchestrator.execute_tool(
         settings=settings,
-        actor=ActorContext(
-            actor_id=actor_id or "admin",
-            role=ROLE_ADMIN,
+        context=RequestContext(
+            request_id=request_context.request_id,
+            role=request_context.role,
+            principal_id=request_context.principal_id,
             source="api.admin_chat.gateway_ops",
         ),
-        request_id=request_id,
         tool_name="gateway.ops",
         arguments={
             "target": "gateway",
@@ -898,6 +995,53 @@ async def _try_handle_gateway_ops_action(
     return {
         "assistant_text": assistant_text,
         "route_reason": "gateway_ops_action",
+    }
+
+
+_MATH_EXPRESSION_RE = re.compile(r"^[0-9+\-*/().,%\s]+$")
+
+
+def _parse_math_expression(message: str) -> str | None:
+    text = (message or "").strip()
+    if not text:
+        return None
+
+    lowered = text.lower()
+    for prefix in ("rechne ", "berechne ", "calc ", "calculate "):
+        if lowered.startswith(prefix):
+            expression = text[len(prefix):].strip()
+            return expression or None
+
+    if _MATH_EXPRESSION_RE.fullmatch(text) and re.search(r"[+\-*/%]", text):
+        return text
+    return None
+
+
+async def _try_handle_math_calculation(
+    *,
+    settings,
+    message: str,
+    request_context: RequestContext,
+) -> dict[str, str] | None:
+    expression = _parse_math_expression(message)
+    if expression is None:
+        return None
+
+    result = await tool_orchestrator.execute_tool(
+        settings=settings,
+        context=RequestContext(
+            request_id=request_context.request_id,
+            role=request_context.role,
+            principal_id=request_context.principal_id,
+            source="api.admin_chat.math",
+        ),
+        tool_name="math.calculate",
+        arguments={"expression": expression},
+    )
+    result_value = result.get("result") if isinstance(result, dict) else result
+    return {
+        "assistant_text": f"Ergebnis: {result_value}",
+        "route_reason": "math_calculate",
     }
 
 
@@ -1000,7 +1144,12 @@ async def _load_home_assistant_context_blocks(settings, message: str) -> list[st
     return blocks
 
 
-async def _try_handle_home_assistant_action(settings, message: str, session: ChatSession | None = None) -> dict[str, str] | None:
+async def _try_handle_home_assistant_action(
+    settings,
+    message: str,
+    session: ChatSession | None = None,
+    request_context: RequestContext | None = None,
+) -> dict[str, str] | None:
     follow_up = _parse_home_assistant_follow_up_action(message)
     if follow_up is not None and session is not None:
         result = await _run_home_assistant_session_follow_up(
@@ -1011,6 +1160,7 @@ async def _try_handle_home_assistant_action(settings, message: str, session: Cha
             service_data={},
             route_reason="home_assistant_follow_up_action",
             label="Home Assistant Follow-up ausgefuehrt",
+            request_context=request_context,
         )
         if result is not None:
             return result
@@ -1029,6 +1179,7 @@ async def _try_handle_home_assistant_action(settings, message: str, session: Cha
                 service_data={},
                 route_reason="home_assistant_retry_action",
                 label="Home Assistant erneut ausgefuehrt",
+                request_context=request_context,
             )
             if result is not None:
                 return result
@@ -1047,10 +1198,16 @@ async def _try_handle_home_assistant_action(settings, message: str, session: Cha
         message=message,
         session=session,
         route_reason="home_assistant_action",
+        request_context=request_context,
     )
 
 
-async def _try_handle_home_assistant_intent_stage(settings, message: str, session: ChatSession | None = None) -> dict[str, str] | None:
+async def _try_handle_home_assistant_intent_stage(
+    settings,
+    message: str,
+    session: ChatSession | None = None,
+    request_context: RequestContext | None = None,
+) -> dict[str, str] | None:
     if not _message_might_need_home_assistant_engine(message, session):
         return None
 
@@ -1080,7 +1237,11 @@ async def _try_handle_home_assistant_intent_stage(settings, message: str, sessio
 
     if decision.intent == "ha_query":
         lookup_text = decision.target or message
-        result = await _try_handle_home_assistant_lookup(settings, lookup_text)
+        result = await _try_handle_home_assistant_lookup(
+            settings,
+            lookup_text,
+            request_context=request_context,
+        )
         if result is not None:
             result["backend_called"] = True
         return result
@@ -1097,6 +1258,7 @@ async def _try_handle_home_assistant_intent_stage(settings, message: str, sessio
             service_data={"temperature": decision.temperature} if decision.temperature is not None else {},
             route_reason="home_assistant_intent_action",
             label="Home Assistant intent-basiert ausgefuehrt",
+            request_context=request_context,
         )
         if result is not None:
             result["backend_called"] = True
@@ -1115,6 +1277,7 @@ async def _try_handle_home_assistant_intent_stage(settings, message: str, sessio
         message=message,
         session=session,
         route_reason="home_assistant_intent_action",
+        request_context=request_context,
     )
     if result is not None:
         result["backend_called"] = True
@@ -1128,6 +1291,7 @@ async def _execute_home_assistant_parsed_action(
     message: str,
     session: ChatSession | None,
     route_reason: str,
+    request_context: RequestContext | None,
 ) -> dict[str, str] | None:
     # Both the intent stage and the old heuristic parser end up here so alias
     # learning, validation and execution stay identical.
@@ -1148,6 +1312,7 @@ async def _execute_home_assistant_parsed_action(
             service_data=service_data,
             route_reason="home_assistant_context_action",
             label="Home Assistant kontextbezogen ausgefuehrt",
+            request_context=request_context,
         )
         if result is not None:
             return result
@@ -1159,7 +1324,14 @@ async def _execute_home_assistant_parsed_action(
         ):
             payload = dict(service_data)
             payload["entity_id"] = learned_alias.entity_ids
-            await client.call_service(domain=learned_alias.domain, service=service, entity_id=None, service_data=payload)
+            await _call_home_assistant_service(
+                settings=settings,
+                domain=learned_alias.domain,
+                service=service,
+                entity_id=None,
+                service_data=payload,
+                request_context=request_context,
+            )
             assistant_text = (
                 f"Home Assistant ausgefuehrt ueber gelernten Alias '{learned_alias.alias}': "
                 f"{learned_alias.domain}.{service} fuer {len(learned_alias.entity_ids)} Entities -> "
@@ -1198,7 +1370,14 @@ async def _execute_home_assistant_parsed_action(
         entity_ids = _dedupe_entity_ids([str(item["entity_id"]) for item in resolved_items])
         payload = dict(service_data)
         payload["entity_id"] = entity_ids
-        await client.call_service(domain=domain, service=service, entity_id=None, service_data=payload)
+        await _call_home_assistant_service(
+            settings=settings,
+            domain=domain,
+            service=service,
+            entity_id=None,
+            service_data=payload,
+            request_context=request_context,
+        )
         await _maybe_learn_home_assistant_alias(
             settings,
             alias=normalized_target,
@@ -1248,7 +1427,14 @@ async def _execute_home_assistant_parsed_action(
         entity_ids = [str(item["entity_id"]) for item in resolved_entities]
         payload = dict(service_data)
         payload["entity_id"] = entity_ids
-        await client.call_service(domain=domain, service=service, entity_id=None, service_data=payload)
+        await _call_home_assistant_service(
+            settings=settings,
+            domain=domain,
+            service=service,
+            entity_id=None,
+            service_data=payload,
+            request_context=request_context,
+        )
         await _maybe_learn_home_assistant_alias(
             settings,
             alias=normalized_target,
@@ -1280,7 +1466,14 @@ async def _execute_home_assistant_parsed_action(
             service=service,
         )
         entity_id = resolved["entity_id"]
-        await client.call_service(domain=domain, service=service, entity_id=entity_id, service_data=service_data)
+        await _call_home_assistant_service(
+            settings=settings,
+            domain=domain,
+            service=service,
+            entity_id=entity_id,
+            service_data=service_data,
+            request_context=request_context,
+        )
         await _maybe_learn_home_assistant_alias(
             settings,
             alias=normalized_target,
@@ -1303,13 +1496,31 @@ async def _execute_home_assistant_parsed_action(
     }
 
 
-async def _try_handle_home_assistant_lookup(settings, message: str) -> dict[str, str] | None:
+async def _try_handle_home_assistant_lookup(
+    settings,
+    message: str,
+    request_context: RequestContext | None = None,
+) -> dict[str, str] | None:
     lookup = _parse_home_assistant_lookup_request(message)
     if lookup is None:
         return None
 
-    client = HomeAssistantClient(settings)
-    entities = await client.list_entities(domain=lookup.get("domain"), limit=300)
+    if request_context is None:
+        client = HomeAssistantClient(settings)
+        entities = await client.list_entities(domain=lookup.get("domain"), limit=300)
+    else:
+        entities = await tool_orchestrator.execute_tool(
+            settings=settings,
+            context=RequestContext(
+                request_id=request_context.request_id,
+                role=request_context.role,
+                principal_id=request_context.principal_id,
+                source="api.admin_chat.home_assistant_lookup",
+            ),
+            tool_name="ha.entities",
+            arguments={"domain": lookup.get("domain"), "limit": 300},
+        )
+
     if not entities:
         return {
             "assistant_text": "Home Assistant ist erreichbar, aber es wurden keine passenden Entities gefunden.",
@@ -1357,6 +1568,7 @@ async def _run_home_assistant_session_follow_up(
     service_data: dict[str, object],
     route_reason: str,
     label: str,
+    request_context: RequestContext | None,
 ) -> dict[str, str] | None:
     last_context = _extract_last_home_assistant_action_context(session)
     if last_context is None:
@@ -1374,8 +1586,14 @@ async def _run_home_assistant_session_follow_up(
     )
     payload = dict(service_data)
     payload["entity_id"] = entity_ids
-    client = HomeAssistantClient(settings)
-    await client.call_service(domain=domain, service=service, entity_id=None, service_data=payload)
+    await _call_home_assistant_service(
+        settings=settings,
+        domain=domain,
+        service=service,
+        entity_id=None,
+        service_data=payload,
+        request_context=request_context,
+    )
     return {
         "assistant_text": (
             f"{label}: {domain}.{service} fuer {len(entity_ids)} Entities -> "
@@ -1384,6 +1602,43 @@ async def _run_home_assistant_session_follow_up(
         ),
         "route_reason": route_reason,
     }
+
+
+async def _call_home_assistant_service(
+    *,
+    settings,
+    domain: str,
+    service: str,
+    entity_id: str | None,
+    service_data: dict[str, object],
+    request_context: RequestContext | None,
+) -> dict[str, object]:
+    if request_context is not None:
+        result = await tool_orchestrator.execute_tool(
+            settings=settings,
+            context=RequestContext(
+                request_id=request_context.request_id,
+                role=request_context.role,
+                principal_id=request_context.principal_id,
+                source="api.admin_chat.home_assistant_action",
+            ),
+            tool_name="ha.call",
+            arguments={
+                "domain": domain,
+                "service": service,
+                "entity_id": entity_id,
+                "service_data": service_data,
+            },
+        )
+        return result if isinstance(result, dict) else {"result": result}
+
+    client = HomeAssistantClient(settings)
+    return await client.call_service(
+        domain=domain,
+        service=service,
+        entity_id=entity_id,
+        service_data=service_data,
+    )
 
 
 def _parse_home_assistant_action(message: str) -> dict[str, object] | None:
