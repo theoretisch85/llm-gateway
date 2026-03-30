@@ -7,7 +7,8 @@ from pydantic import BaseModel, Field
 
 from app.auth import require_admin_api_auth, require_device_token
 from app.config import get_settings
-from app.core.roles import ActorContext, ROLE_ADMIN, ROLE_DEVICE
+from app.core.request_context import RequestContext
+from app.core.roles import ROLE_ADMIN, ROLE_DEVICE
 from app.orchestrator import ToolOrchestrator
 from app.services.home_assistant import (
     HomeAssistantClient,
@@ -65,12 +66,12 @@ async def admin_home_assistant_entities(
     try:
         entities = await tool_orchestrator.execute_tool(
             settings=settings,
-            actor=ActorContext(
-                actor_id=auth_subject or "admin",
+            context=RequestContext(
+                request_id=request.state.request_id,
                 role=ROLE_ADMIN,
+                principal_id=auth_subject or "admin",
                 source="api.home_assistant.entities",
             ),
-            request_id=request.state.request_id,
             tool_name="ha.entities",
             arguments={"domain": domain, "limit": limit},
         )
@@ -97,12 +98,12 @@ async def admin_home_assistant_action(
     try:
         result = await tool_orchestrator.execute_tool(
             settings=settings,
-            actor=ActorContext(
-                actor_id=auth_subject or "admin",
+            context=RequestContext(
+                request_id=request.state.request_id,
                 role=ROLE_ADMIN,
+                principal_id=auth_subject or "admin",
                 source="api.home_assistant.action.admin",
             ),
-            request_id=request.state.request_id,
             tool_name="ha.call",
             arguments={
                 "domain": payload.domain,
@@ -129,12 +130,12 @@ async def device_home_assistant_action(payload: HomeAssistantActionRequest, requ
     try:
         result = await tool_orchestrator.execute_tool(
             settings=settings,
-            actor=ActorContext(
-                actor_id="device_token",
+            context=RequestContext(
+                request_id=request.state.request_id,
                 role=ROLE_DEVICE,
+                principal_id="device_token",
                 source="api.home_assistant.action.device",
             ),
-            request_id=request.state.request_id,
             tool_name="ha.call",
             arguments={
                 "domain": payload.domain,

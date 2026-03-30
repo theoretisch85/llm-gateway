@@ -6,7 +6,8 @@ from fastapi.responses import JSONResponse
 from app.api_errors import error_response
 from app.auth import require_mcp_auth
 from app.config import get_settings
-from app.core.roles import ActorContext, normalize_mcp_role
+from app.core.request_context import RequestContext
+from app.core.roles import normalize_mcp_role
 from app.orchestrator import ToolOrchestrator
 from app.schemas.mcp import MCPCallRequest, MCPCallResponse, MCPToolsResponse, MCPTool
 from app.services.home_assistant import HomeAssistantConfigError, HomeAssistantRequestError
@@ -40,17 +41,17 @@ async def call_mcp_tool(
     auth_subject: str = Depends(require_mcp_auth),
 ) -> MCPCallResponse | JSONResponse:
     role = normalize_mcp_role(auth_subject)
-    actor = ActorContext(
-        actor_id=auth_subject or "unknown",
+    context = RequestContext(
+        request_id=request.state.request_id,
         role=role,
+        principal_id=auth_subject or "unknown",
         source="api.mcp",
     )
     settings = get_settings()
     try:
         result = await tool_orchestrator.execute_tool(
             settings=settings,
-            actor=actor,
-            request_id=request.state.request_id,
+            context=context,
             tool_name=payload.tool,
             arguments=payload.arguments,
         )

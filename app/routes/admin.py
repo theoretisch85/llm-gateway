@@ -9,7 +9,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from app.auth import get_admin_session_username, require_admin_api_auth
 from app.config import get_settings
-from app.core.roles import ActorContext, ROLE_ADMIN
+from app.core.request_context import RequestContext
+from app.core.roles import ROLE_ADMIN
 from app.metrics import metrics
 from app.orchestrator import ToolOrchestrator
 from app.services.home_assistant import HomeAssistantClient, HomeAssistantConfigError, HomeAssistantRequestError
@@ -798,12 +799,12 @@ async def _run_admin_ops_tool(
     normalized_command = (command_name or "").strip().lower()
     result = await tool_orchestrator.execute_tool(
         settings=settings,
-        actor=ActorContext(
-            actor_id=auth_subject or "admin",
+        context=RequestContext(
+            request_id=request.state.request_id,
             role=ROLE_ADMIN,
+            principal_id=auth_subject or "admin",
             source=source,
         ),
-        request_id=request.state.request_id,
         tool_name="gateway.ops",
         arguments={
             "target": normalized_target,
