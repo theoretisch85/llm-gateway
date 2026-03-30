@@ -1,5 +1,6 @@
 import logging
 from html import escape
+from pathlib import Path
 from textwrap import dedent
 from urllib.parse import urlencode
 
@@ -988,6 +989,7 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
         "dashboard_db_mode": "-",
         "dashboard_storage_active": "-",
         "dashboard_ha_summary": "-",
+        "dashboard_mcp_skills_value": "0 / 0",
         "database_status": "Datenbankstatus wird geladen...",
         "db_store_mode": "-",
         "db_connected": "-",
@@ -1205,8 +1207,11 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
         data["ha_configured"] = "yes"
         data["ha_connected"] = "no"
     data["dashboard_ha_summary"] = f"{data['ha_configured']} / {data['ha_connected']}"
-    data["mcp_tools_count"] = str(len(get_mcp_tools()))
+    mcp_tools_count = len(get_mcp_tools())
+    skills_count = _count_installed_skills()
+    data["mcp_tools_count"] = str(mcp_tools_count)
     data["mcp_custom_tools_count"] = str(len(list_custom_mcp_tools()))
+    data["dashboard_mcp_skills_value"] = f"{mcp_tools_count} / {skills_count}"
 
     return data
 
@@ -1232,6 +1237,26 @@ def _backend_model_available(models_response: dict, expected_model: str) -> bool
             if isinstance(item, dict) and item.get("name") == expected_model:
                 return True
     return False
+
+
+def _count_installed_skills() -> int:
+    # The admin dashboard should display a stable, read-only count of currently
+    # installed skills without requiring shell commands.
+    skill_roots = [
+        Path("/root/.codex/skills"),
+        Path("~/.codex/skills").expanduser(),
+        Path("/opt/llm-gateway/.codex/skills"),
+    ]
+    found: set[str] = set()
+    for root in skill_roots:
+        try:
+            if not root.exists() or not root.is_dir():
+                continue
+            for skill_file in root.rglob("SKILL.md"):
+                found.add(str(skill_file.parent))
+        except OSError:
+            continue
+    return len(found)
 
 
 def _render_database_profiles_html(profiles: list[dict[str, object]]) -> str:
@@ -1948,6 +1973,11 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                   <div class="muted">VRAM</div>
                   <strong id="gpuVramValue">__GPU_VRAM_VALUE__</strong>
                   <div class="muted">belegt / gesamt</div>
+                </div>
+                <div class="card stat">
+                  <div class="muted">MCP / Skills aktiv</div>
+                  <strong id="dashboardMcpSkillsValue">__DASHBOARD_MCP_SKILLS_VALUE__</strong>
+                  <div class="muted">MCP-Tools / Skills</div>
                 </div>
               </div>
               <div class="two-col" style="margin-top:18px;">
@@ -3594,6 +3624,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__DASHBOARD_DB_MODE__": escape(initial_data.get("dashboard_db_mode", "-")),
         "__DASHBOARD_STORAGE_ACTIVE__": escape(initial_data.get("dashboard_storage_active", "-")),
         "__DASHBOARD_HA_SUMMARY__": escape(initial_data.get("dashboard_ha_summary", "-")),
+        "__DASHBOARD_MCP_SKILLS_VALUE__": escape(initial_data.get("dashboard_mcp_skills_value", "0 / 0")),
         "__DATABASE_STATUS__": escape(initial_data.get("database_status", "-")),
         "__DB_STORE_MODE__": escape(initial_data.get("db_store_mode", "-")),
         "__DB_CONNECTED__": escape(initial_data.get("db_connected", "-")),
