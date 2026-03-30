@@ -4,9 +4,10 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from app.config import Settings
-from app.core.roles import ROLE_ADMIN, ROLE_DEVICE
+from app.core.roles import ROLE_ADMIN, ROLE_DEVICE, ROLE_USER
 from app.services.backend_control import run_ops_command
 from app.services.home_assistant import HomeAssistantClient
+from app.services.math_service import calculate_expression
 from app.services.mcp_custom_tools import delete_custom_mcp_tool, list_custom_mcp_tools, save_custom_mcp_tool
 from app.services.storage_library import get_document_contexts, list_documents
 
@@ -107,6 +108,12 @@ async def _gateway_ops(settings: Settings, args: dict[str, Any]) -> Any:
         raise ValueError(str(exc)) from exc
 
 
+async def _math_calculate(settings: Settings, args: dict[str, Any]) -> Any:
+    _ = settings
+    expression = str(args.get("expression") or "").strip()
+    return calculate_expression(expression)
+
+
 async def _custom_tool_list(settings: Settings, args: dict[str, Any]) -> Any:
     _ = settings, args
     return list_custom_mcp_tools()
@@ -178,6 +185,27 @@ def _builtin_tools() -> list[ToolDefinition]:
             },
             output_schema={"type": "object"},
             handler=_ha_call,
+        ),
+        _tool(
+            name="math.calculate",
+            description="Berechnet deterministisch mathematische Ausdruecke.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string"},
+                },
+                "required": ["expression"],
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string"},
+                    "result": {"type": ["number", "integer"]},
+                },
+                "required": ["expression", "result"],
+            },
+            handler=_math_calculate,
+            allowed_roles=(ROLE_ADMIN, ROLE_DEVICE, ROLE_USER),
         ),
         _tool(
             name="storage.list",
