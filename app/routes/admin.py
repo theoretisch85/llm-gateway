@@ -59,6 +59,8 @@ from app.services.device_profiles import (
     save_device_profile,
 )
 from app.services.llamacpp_client import LlamaCppClient, LlamaCppError, LlamaCppTimeoutError
+from app.services.model_profiles import list_model_profiles
+from app.services.profile_status import ProfileStatusChecker
 from app.services.session_memory import get_session_store
 from app.services.storage_library import (
     activate_storage_profile,
@@ -80,14 +82,17 @@ async def admin_page(request: Request, tab: str = "dashboard") -> HTMLResponse |
     username = get_admin_session_username(request)
     if not username:
         return RedirectResponse(url="/admin/login?next=/internal/admin", status_code=303)
-    active_tab = tab if tab in {"dashboard", "settings", "skills", "chat", "memory", "database", "home-assistant", "storage", "ops", "devices"} else "dashboard"
+    active_tab = tab if tab in {"dashboard", "status", "settings", "skills", "chat", "memory", "database", "home-assistant", "mail", "storage", "ops", "devices"} else "dashboard"
     initial_data = await _build_initial_admin_data(base_url=str(request.base_url).rstrip("/"))
     db_message = request.query_params.get("db_message")
     if db_message:
         initial_data["database_status"] = db_message
     settings_message = request.query_params.get("settings_message")
     if settings_message:
-        initial_data["settings_status"] = settings_message
+        if active_tab == "mail":
+            initial_data["mail_status"] = settings_message
+        else:
+            initial_data["settings_status"] = settings_message
     edit_profile_id = request.query_params.get("edit_profile")
     if active_tab == "settings" and edit_profile_id:
         try:
@@ -151,6 +156,14 @@ async def get_admin_system_summary() -> JSONResponse:
     return JSONResponse(gateway_system_telemetry(), headers={"Cache-Control": "no-store, max-age=0"})
 
 
+@router.get("/api/admin/gateway/status", dependencies=[Depends(require_admin_api_auth)])
+async def get_admin_gateway_status() -> JSONResponse:
+    settings = get_settings()
+    checker = ProfileStatusChecker(settings)
+    status_response = await checker.check_all()
+    return JSONResponse(status_response.model_dump(exclude_none=True), headers={"Cache-Control": "no-store, max-age=0"})
+
+
 def _build_admin_config_values(settings) -> dict[str, str]:
     current = read_runtime_config()
     current.setdefault("LLAMACPP_BASE_URL", settings.llamacpp_base_url)
@@ -182,6 +195,10 @@ def _build_admin_config_values(settings) -> dict[str, str]:
     current.setdefault("VISION_MODEL_NAME", settings.vision_model_name or "")
     current.setdefault("VISION_PROMPT", settings.vision_prompt)
     current.setdefault("VISION_MAX_TOKENS", str(settings.vision_max_tokens))
+    current.setdefault("GMAIL_ENABLED", "true" if settings.gmail_enabled else "false")
+    current.setdefault("GMAIL_CLIENT_SECRET_FILE", settings.gmail_client_secret_file)
+    current.setdefault("GMAIL_TOKEN_FILE", settings.gmail_token_file)
+    current.setdefault("GMAIL_OAUTH_REDIRECT_URI", settings.gmail_oauth_redirect_uri or "")
     current.setdefault("MI50_SSH_HOST", settings.mi50_ssh_host or "")
     current.setdefault("MI50_SSH_USER", settings.mi50_ssh_user or "")
     current.setdefault("MI50_SSH_PORT", str(settings.mi50_ssh_port))
@@ -1020,6 +1037,7 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
         "ha_configured": "-",
         "ha_connected": "-",
         "ha_location": "-",
+        "mail_status": "Gmail-Status wird geladen...",
         "skills_status": "Skills/MCP-Verwaltung ist bereit.",
         "mcp_tools_count": "0",
         "mcp_custom_tools_count": "0",
@@ -1067,7 +1085,22 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
     }
     for key, value in config_values.items():
         data[f"cfg_{key}"] = str(value or "")
+    backend_profiles = list_backend_profiles()
+    device_profiles = list_device_profiles()
+    model_profiles = list_model_profiles(settings, include_disabled=True)
     active_backend_profile = get_active_backend_profile()
+    data["backend_profiles_count"] = str(len(backend_profiles))
+    data["device_profiles_count"] = str(len(device_profiles))
+    data["device_online_count"] = "-"
+    data["device_offline_count"] = "-"
+    data["device_last_seen"] = "-"
+    worker_profile = next((profile for profile in model_profiles if profile.profile_id == "fast" or profile.public_model == "devstral-q3"), None)
+    reviewer_profile = next((profile for profile in model_profiles if profile.profile_id == "reviewer" or profile.public_model == "reviewer"), None)
+    data["settings_worker_model"] = worker_profile.public_model if worker_profile else (settings.fast_model_public_name or settings.public_model_name)
+    data["settings_reviewer_model"] = reviewer_profile.public_model if reviewer_profile else "reviewer"
+    data["ops_gateway_service"] = "llm-gateway"
+    data["ops_worker_service"] = "kai-devstral"
+    data["ops_reviewer_service"] = "kai-reviewer"
     if active_backend_profile:
         data["dashboard_backend_profile"] = str(active_backend_profile.get("name") or "-")
         data["backend_profile_form_id"] = str(active_backend_profile.get("id") or "")
@@ -1084,7 +1117,7 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
         data["backend_profile_form_status_command"] = str(active_backend_profile.get("status_command") or "")
         data["backend_profile_form_logs_command"] = str(active_backend_profile.get("logs_command") or "")
         data["backend_profile_preview"] = _render_backend_profile_preview(active_backend_profile)
-    data["backend_profiles_html"] = _render_backend_profiles_html(list_backend_profiles())
+    data["backend_profiles_html"] = _render_backend_profiles_html(backend_profiles)
 
     active_device_profile = get_active_device_profile()
     if active_device_profile:
@@ -1102,8 +1135,8 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
         data["device_active_token_redacted"] = _redact_device_token(str(active_device_profile.get("device_token") or settings.device_shared_token or ""))
         data["device_bootstrap_preview"] = build_device_install_script(active_device_profile)
         data["device_face_style_name"] = f"gateway_{str(active_device_profile.get('name') or 'kai')}"
-    data["device_profiles_html"] = _render_device_profiles_html(list_device_profiles())
-    data["device_face_profile_options_html"] = _render_device_profile_options_html(list_device_profiles(), str(active_device_profile.get("id") or "") if active_device_profile else "")
+    data["device_profiles_html"] = _render_device_profiles_html(device_profiles)
+    data["device_face_profile_options_html"] = _render_device_profile_options_html(device_profiles, str(active_device_profile.get("id") or "") if active_device_profile else "")
     data["mcp_custom_tools_html"] = _render_mcp_custom_tools_html(list_custom_mcp_tools())
 
     client = LlamaCppClient(settings)
@@ -1127,19 +1160,12 @@ async def _build_initial_admin_data(base_url: str = "") -> dict[str, str]:
         telemetry = gateway_system_telemetry()
         data["header_cpu_usage_value"] = _format_number(telemetry.get("cpu_usage_percent"), "%")
         data["header_cpu_temp_value"] = _format_number(telemetry.get("cpu_temp_c"), " C")
-        data["header_gpu_usage_value"] = _format_number(telemetry.get("gpu_usage_percent"), "%")
-        data["header_gpu_temp_value"] = _format_number(telemetry.get("temperature_c"), " C")
-        data["header_gpu_power_value"] = _format_number(telemetry.get("power_w"), " W")
+        data["header_gpu_usage_value"] = _telemetry_summary_or_number(telemetry, "gpu_summary_usage", "gpu_usage_percent", "%")
+        data["header_gpu_temp_value"] = _telemetry_summary_or_number(telemetry, "gpu_summary_temp", "temperature_c", " C")
+        data["header_gpu_power_value"] = _telemetry_summary_or_number(telemetry, "gpu_summary_power", "power_w", " W")
         data["gpu_temp_value"] = data["header_gpu_temp_value"]
         data["gpu_power_value"] = data["header_gpu_power_value"]
-        if telemetry.get("vram_used_gib") is not None and telemetry.get("vram_total_gib") is not None:
-            percent = telemetry.get("vram_percent")
-            percent_text = f" ({percent}%)" if percent is not None else ""
-            data["gpu_vram_value"] = f"{telemetry['vram_used_gib']} / {telemetry['vram_total_gib']} GiB{percent_text}"
-            data["header_gpu_vram_value"] = f"{percent}%" if percent is not None else "-"
-        elif telemetry.get("vram_percent") is not None:
-            data["gpu_vram_value"] = f"{telemetry['vram_percent']}%"
-            data["header_gpu_vram_value"] = data["gpu_vram_value"]
+        data["gpu_vram_value"], data["header_gpu_vram_value"] = _telemetry_vram_values(telemetry)
     except RuntimeError:
         pass
 
@@ -1221,6 +1247,32 @@ def _format_number(value, suffix: str) -> str:
     if value is None:
         return "-"
     return f"{value}{suffix}"
+
+
+def _telemetry_summary_or_number(telemetry: dict[str, object], summary_key: str, numeric_key: str, suffix: str) -> str:
+    summary = str(telemetry.get(summary_key) or "").strip()
+    if summary:
+        return summary
+    return _format_number(telemetry.get(numeric_key), suffix)
+
+
+def _telemetry_vram_values(telemetry: dict[str, object]) -> tuple[str, str]:
+    summary = str(telemetry.get("gpu_summary_vram") or "").strip()
+    if summary:
+        return summary, summary
+
+    if telemetry.get("vram_used_gib") is not None and telemetry.get("vram_total_gib") is not None:
+        percent = telemetry.get("vram_percent")
+        percent_text = f" ({percent}%)" if percent is not None else ""
+        card_value = f"{telemetry['vram_used_gib']} / {telemetry['vram_total_gib']} GiB{percent_text}"
+        header_value = f"{percent}%" if percent is not None else "-"
+        return card_value, header_value
+
+    if telemetry.get("vram_percent") is not None:
+        text = f"{telemetry['vram_percent']}%"
+        return text, text
+
+    return "-", "-"
 
 
 def _backend_model_available(models_response: dict, expected_model: str) -> bool:
@@ -1305,7 +1357,7 @@ def _render_backend_profiles_html(profiles: list[dict[str, object]]) -> str:
     if not profiles:
         return '<div class="muted">Noch keine KI-Profile gespeichert.</div>'
 
-    items: list[str] = []
+    rows: list[str] = []
     for profile in profiles:
         profile_id = escape(str(profile.get("id") or ""))
         name = escape(str(profile.get("name") or "backend-profile"))
@@ -1313,68 +1365,54 @@ def _render_backend_profiles_html(profiles: list[dict[str, object]]) -> str:
         backend_model = escape(str(profile.get("backend_model_name") or "-"))
         base_url = escape(str(profile.get("base_url") or "-"))
         context_window = escape(str(profile.get("context_window") or "-"))
-        response_reserve = escape(str(profile.get("response_reserve") or "-"))
-        default_max_tokens = escape(str(profile.get("default_max_tokens") or "-"))
-        ngl_layers = escape(str(profile.get("ngl_layers") or "-"))
         service_name = escape(str(profile.get("service_name") or "-"))
-        activate_command = escape(str(profile.get("activate_command") or "-"))
-        status_command = escape(str(profile.get("status_command") or "-"))
-        logs_command = escape(str(profile.get("logs_command") or "-"))
-        badge = '<span class="status" style="display:inline-block;padding:4px 8px;margin:0 0 0 8px;">aktiv</span>' if profile.get("is_active") else ""
+        status_label = "aktiv" if profile.get("is_active") else "bereit"
+        badge_class = "ok" if profile.get("is_active") else "warn"
         actions = []
         if not profile.get("is_active"):
             actions.append(
-                f"""
-                <form method="post" action="/internal/admin/backend-profile/activate-form">
+                f'''<form method="post" action="/internal/admin/backend-profile/activate-form">
                   <input type="hidden" name="profile_id" value="{profile_id}">
                   <button class="secondary" type="submit">Aktivieren</button>
-                </form>
-                """
+                </form>'''
             )
         else:
             actions.append(
-                f"""
-                <form method="post" action="/internal/admin/backend-profile/activate-form">
+                f'''<form method="post" action="/internal/admin/backend-profile/activate-form">
                   <input type="hidden" name="profile_id" value="{profile_id}">
                   <button class="secondary" type="submit">Reset</button>
-                </form>
-                """
+                </form>'''
             )
             actions.append(
-                f"""
-                <form method="post" action="/internal/admin/backend-profile/deactivate-form" onsubmit="return confirm('Aktives Backend-Profil wirklich deaktivieren und den MI50-Service stoppen?');">
+                f'''<form method="post" action="/internal/admin/backend-profile/deactivate-form" onsubmit="return confirm('Aktives Backend-Profil wirklich deaktivieren und den MI50-Service stoppen?');">
                   <input type="hidden" name="profile_id" value="{profile_id}">
                   <button class="secondary" type="submit">Deaktivieren</button>
-                </form>
-                """
+                </form>'''
             )
+        actions.append(f'<a class="secondary" href="/internal/admin?tab=settings&edit_profile={profile_id}">Bearbeiten</a>')
         actions.append(
-            f"""
-            <a class="secondary" href="/internal/admin?tab=settings&edit_profile={profile_id}">Bearbeiten</a>
-            """
-        )
-        actions.append(
-            f"""
-            <form method="post" action="/internal/admin/backend-profile/delete-form" onsubmit="return confirm('Backend-Profil wirklich loeschen?');">
+            f'''<form method="post" action="/internal/admin/backend-profile/delete-form" onsubmit="return confirm('Backend-Profil wirklich loeschen?');">
               <input type="hidden" name="profile_id" value="{profile_id}">
               <button class="secondary" type="submit">Loeschen</button>
-            </form>
-            """
+            </form>'''
         )
-        items.append(
-            f"""
-            <div class="list-card">
-              <h3>{name}{badge}</h3>
-              <div class="list-meta">Public: <code>{public_model}</code> | Backend: <code>{backend_model}</code></div>
-              <div class="list-meta">Base URL: <code>{base_url}</code> | MI50-Service: <code>{service_name}</code></div>
-              <div class="list-meta">Kontext: <code>{context_window}</code> | Reserve: <code>{response_reserve}</code> | Default max: <code>{default_max_tokens}</code> | NGL: <code>{ngl_layers}</code></div>
-              <div class="list-meta">Aktivierung: <code>{activate_command}</code></div>
-              <div class="list-meta">Status: <code>{status_command}</code> | Logs: <code>{logs_command}</code></div>
-              <div class="actions">{''.join(actions)}</div>
-            </div>
-            """
+        rows.append(
+            f'''<tr>
+              <td><strong>{name}</strong></td>
+              <td><code>{public_model}</code></td>
+              <td><code>{backend_model}</code><div class="muted">{service_name}</div></td>
+              <td><span class="badge {badge_class}">{status_label}</span></td>
+              <td><code>{context_window}</code></td>
+              <td><div class="actions compact-actions">{''.join(actions)}</div></td>
+            </tr>
+            <tr class="detail-row"><td colspan="6"><span class="muted">Backend:</span> <code>{base_url}</code></td></tr>'''
         )
-    return "".join(items)
+    return f'''<div style="overflow:auto;">
+        <table class="data-table profile-table">
+          <thead><tr><th>Profil</th><th>Modell</th><th>Backend</th><th>Status</th><th>Kontext</th><th>Aktionen</th></tr></thead>
+          <tbody>{''.join(rows)}</tbody>
+        </table>
+      </div>'''
 
 
 def _render_backend_profile_preview(profile: dict[str, object]) -> str:
@@ -1529,7 +1567,7 @@ def _render_device_profiles_html(profiles: list[dict[str, object]]) -> str:
     if not profiles:
         return '<div class="muted">Noch keine Device-Profile gespeichert.</div>'
 
-    items: list[str] = []
+    rows: list[str] = []
     for profile in profiles:
         profile_id = escape(str(profile.get("id") or ""))
         name = escape(str(profile.get("name") or "Pi Device"))
@@ -1539,68 +1577,59 @@ def _render_device_profiles_html(profiles: list[dict[str, object]]) -> str:
         ssh_host = escape(raw_ssh_host or "-")
         ssh_user = escape(raw_ssh_user or "-")
         ssh_port = escape(str(profile.get("ssh_port") or "22"))
-        remote_dir = escape(str(profile.get("remote_dir") or "~/kai-pi"))
-        token_redacted = escape(str(profile.get("device_token_redacted") or "-"))
-        ssh_auth_mode = escape(str(profile.get("ssh_auth_mode") or "key"))
         bootstrap_ready = bool(raw_ssh_host and raw_ssh_user)
-        badge = '<span class="status" style="display:inline-block;padding:4px 8px;margin:0 0 0 8px;">aktiv</span>' if profile.get("is_active") else ""
+        status_label = "aktiv" if profile.get("is_active") else ("bereit" if bootstrap_ready else "unvollstaendig")
+        badge_class = "ok" if profile.get("is_active") else "warn"
         actions = []
         if not profile.get("is_active"):
             actions.append(
-                f"""
-                <form method="post" action="/internal/admin/device/activate-form">
+                f'''<form method="post" action="/internal/admin/device/activate-form">
                   <input type="hidden" name="profile_id" value="{profile_id}">
                   <button class="secondary" type="submit">Aktivieren</button>
-                </form>
-                """
+                </form>'''
             )
         actions.append(f'<a class="secondary" href="/internal/admin?tab=devices&edit_device={profile_id}">Bearbeiten</a>')
         if bootstrap_ready:
             actions.append(
-                f"""
-                <form method="post" action="/internal/admin/device/connect-form" onsubmit="return confirm('Gateway-URL und Device-Token jetzt per SSH auf den Kai-Pi schreiben und kai.service neu starten?');">
+                f'''<form method="post" action="/internal/admin/device/connect-form" onsubmit="return confirm('Gateway-URL und Device-Token jetzt per SSH auf den Kai-Pi schreiben und kai.service neu starten?');">
                   <input type="hidden" name="profile_id" value="{profile_id}">
-                  <button class="primary" type="submit">Verbinden / .env sync</button>
-                </form>
-                """
+                  <button class="primary" type="submit">Verbinden</button>
+                </form>'''
             )
-        if bootstrap_ready:
             actions.append(
-                f"""
-                <form method="post" action="/internal/admin/device/probe-form">
+                f'''<form method="post" action="/internal/admin/device/probe-form">
                   <input type="hidden" name="profile_id" value="{profile_id}">
                   <button class="secondary" type="submit">Pruefen</button>
-                </form>
-                """
+                </form>'''
             )
-        if bootstrap_ready:
             actions.append(
-                f"""
-                <form method="post" action="/internal/admin/device/install-form" onsubmit="return confirm('Roher Pi fuer dieses Profil jetzt ueber SSH installieren?');">
+                f'''<form method="post" action="/internal/admin/device/install-form" onsubmit="return confirm('Roher Pi fuer dieses Profil jetzt ueber SSH installieren?');">
                   <input type="hidden" name="profile_id" value="{profile_id}">
-                  <button class="primary" type="submit">PI installieren</button>
-                </form>
-                """
+                  <button class="secondary" type="submit">Installieren</button>
+                </form>'''
             )
         actions.append(
-            f"""
-            <form method="post" action="/internal/admin/device/delete-form" onsubmit="return confirm('Device-Profil wirklich loeschen?');">
+            f'''<form method="post" action="/internal/admin/device/delete-form" onsubmit="return confirm('Device-Profil wirklich loeschen?');">
               <input type="hidden" name="profile_id" value="{profile_id}">
               <button class="secondary" type="submit">Loeschen</button>
-            </form>
-            """
+            </form>'''
         )
-        items.append(
-            f"""
-            <div class="list-card">
-              <h3>{name}{badge}</h3>
-              <div class="list-meta">Gateway: <code>{gateway_base_url}</code> | Token: <code>{token_redacted}</code></div>
-              <div class="list-meta">SSH: <code>{ssh_user}@{ssh_host}:{ssh_port}</code> | Auth: <code>{ssh_auth_mode}</code> | Ziel: <code>{remote_dir}</code>{'' if bootstrap_ready else ' | nur Direktverbindung, kein Bootstrap'}</div>
-              <div class="actions">{''.join(actions)}</div>
-            </div>
-            """
+        rows.append(
+            f'''<tr>
+              <td><strong>{name}</strong></td>
+              <td><code>{ssh_host}</code><div class="muted">{ssh_user}:{ssh_port}</div></td>
+              <td><span class="badge {badge_class}">{status_label}</span></td>
+              <td><code>{gateway_base_url}</code></td>
+              <td><span class="muted">-</span></td>
+              <td><div class="actions compact-actions">{''.join(actions)}</div></td>
+            </tr>'''
         )
-    return "".join(items)
+    return f'''<div style="overflow:auto;">
+        <table class="data-table profile-table">
+          <thead><tr><th>Name</th><th>IP / SSH</th><th>Status</th><th>Gateway</th><th>Letzte Verbindung</th><th>Aktionen</th></tr></thead>
+          <tbody>{''.join(rows)}</tbody>
+        </table>
+      </div>'''
 
 
 def _render_device_profile_options_html(profiles: list[dict[str, object]], active_profile_id: str) -> str:
@@ -1629,14 +1658,14 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
             :root {
               --bg:#0b0f14;
               --bg-deep:#06080c;
-              --card:#11161d;
-              --card-2:#161c24;
+              --card:#10151c;
+              --card-2:#151b24;
               --ink:#d8e4ef;
               --muted:#7f92a3;
               --line:#2b3744;
-              --accent:#8be28b;
+              --accent:#74e4b2;
               --accent-2:#67c1ff;
-              --accent-soft:rgba(139,226,139,.10);
+              --accent-soft:rgba(116,228,178,.10);
               --warn-soft:rgba(255,196,94,.12);
               --err-soft:rgba(255,107,107,.12);
               --chrome:#1b232d;
@@ -1647,7 +1676,8 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
               color:var(--ink);
               background:
-                linear-gradient(180deg, #10151c 0%, var(--bg) 45%, var(--bg-deep) 100%);
+                radial-gradient(circle at top left, rgba(103,193,255,.09), transparent 34vw),
+                linear-gradient(180deg, #10141b 0%, var(--bg) 45%, var(--bg-deep) 100%);
               min-height:100vh;
             }
             body::before {
@@ -1661,33 +1691,64 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               background-size:24px 24px;
               mask-image:linear-gradient(180deg, rgba(0,0,0,.7), rgba(0,0,0,.15));
             }
-            header {
+            .admin-shell {
+              position:relative;
+              z-index:1;
+              min-height:100vh;
+              display:grid;
+              grid-template-columns:260px minmax(0, 1fr);
+            }
+            .sidebar {
+              position:sticky;
+              top:0;
+              height:100vh;
+              display:flex;
+              flex-direction:column;
+              gap:18px;
+              padding:18px 14px;
+              overflow:auto;
+              background:rgba(8,12,17,.96);
+              border-right:1px solid var(--line);
+              backdrop-filter:blur(10px);
+              box-shadow:16px 0 50px rgba(0,0,0,.22);
+            }
+            .workbench { min-width:0; }
+            .topbar {
               position:sticky;
               top:0;
               z-index:10;
+              min-height:66px;
+              display:flex;
+              align-items:center;
+              justify-content:space-between;
+              gap:16px;
+              padding:10px 22px;
               background:rgba(9,12,16,.92);
               backdrop-filter:blur(10px);
               border-bottom:1px solid var(--line);
+              box-shadow:0 14px 34px rgba(0,0,0,.14);
             }
-            .nav {
-              max-width:1320px;
-              margin:0 auto;
-              padding:14px 20px;
-              display:grid;
-              gap:12px;
-            }
-            .nav-main {
+            .topbar-title {
               display:flex;
-              gap:14px;
-              align-items:center;
-              justify-content:space-between;
-              flex-wrap:wrap;
+              flex-direction:column;
+              gap:3px;
+              min-width:150px;
+            }
+            .topbar-title strong {
+              color:var(--accent);
+              letter-spacing:.12em;
+              text-transform:uppercase;
+            }
+            .topbar-title span {
+              color:var(--muted);
+              font-size:.78rem;
             }
             .brand-stack {
               display:flex;
               flex-direction:column;
-              gap:8px;
-              min-width:260px;
+              gap:6px;
+              padding:4px 4px 10px;
+              border-bottom:1px solid var(--line);
             }
             .brand {
               font-size:1.05rem;
@@ -1696,10 +1757,16 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               text-transform:uppercase;
               color:var(--accent);
             }
+            .sidebar-subtitle {
+              font-size:.78rem;
+              letter-spacing:.08em;
+              text-transform:uppercase;
+            }
             .header-telemetry {
               display:flex;
               gap:8px;
               flex-wrap:wrap;
+              justify-content:flex-end;
             }
             .telemetry-chip {
               min-width:72px;
@@ -1722,58 +1789,63 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               color:var(--accent);
               font-size:.86rem;
               font-weight:700;
-              line-height:1.05;
+              line-height:1.15;
+              white-space:pre-line;
             }
-            .nav-buttons { display:flex; gap:10px; flex-wrap:wrap; }
-            .nav-buttons a, .nav-buttons button, .nav form button, button, select, input, textarea {
+            .nav-buttons {
+              display:flex;
+              flex-direction:column;
+              gap:8px;
+            }
+            .nav-buttons a, .nav-buttons button, .userbox form button, button, select, input, textarea {
               font:inherit;
             }
-            .nav-buttons a, .nav-buttons button, .nav form button, button.primary, button.secondary {
+            .nav-buttons a, .nav-buttons button, .userbox form button, button.primary, button.secondary {
               border:1px solid var(--line);
               border-radius:8px;
-              padding:10px 14px;
+              padding:10px 12px;
               cursor:pointer;
               text-transform:uppercase;
               letter-spacing:.06em;
               text-decoration:none;
             }
-            .nav-buttons a, .nav-buttons button, .nav form button, button.secondary {
-              background:var(--chrome);
+            .nav-buttons a, .nav-buttons button, .userbox form button, button.secondary {
+              background:rgba(27,35,45,.72);
               color:var(--ink);
             }
             .nav-buttons a.active, .nav-buttons button.active, button.primary {
-              background:#1b2a1f;
+              background:linear-gradient(135deg, rgba(116,228,178,.16), rgba(103,193,255,.08));
               color:var(--accent);
-              border-color:#2e5131;
+              border-color:rgba(116,228,178,.46);
             }
-            .userbox { display:flex; gap:10px; align-items:center; color:var(--muted); }
-            main { max-width:1320px; margin:0 auto; padding:24px 20px 56px; }
+            .nav-buttons a {
+              width:100%;
+              text-align:left;
+            }
+            .userbox {
+              display:flex;
+              flex-direction:column;
+              gap:10px;
+              align-items:flex-start;
+              margin-top:auto;
+              padding:14px 4px 2px;
+              border-top:1px solid var(--line);
+              color:var(--muted);
+            }
+            main { max-width:1440px; margin:0 auto; padding:24px 22px 56px; }
             .panel { display:none; }
             .panel.active { display:block; }
             .hero, .card {
               position:relative;
-              background:linear-gradient(180deg, var(--card-2), var(--card));
+              background:linear-gradient(180deg, rgba(21,27,36,.96), rgba(16,21,28,.96));
               border:1px solid var(--line);
-              border-radius:10px;
+              border-radius:8px;
               box-shadow:none;
             }
             .hero::before, .card::before {
-              content:"";
-              position:absolute;
-              top:0;
-              left:0;
-              right:0;
-              height:28px;
-              pointer-events:none;
-              border-bottom:1px solid var(--line);
-              border-radius:10px 10px 0 0;
-              background:
-                radial-gradient(circle at 16px 14px, #ff5f56 0 4px, transparent 5px),
-                radial-gradient(circle at 34px 14px, #ffbd2e 0 4px, transparent 5px),
-                radial-gradient(circle at 52px 14px, #27c93f 0 4px, transparent 5px),
-                linear-gradient(180deg, #1a222b, #161d26);
+              display:none;
             }
-            .hero { padding:44px 22px 22px; margin-bottom:20px; }
+            .hero { padding:24px 22px; margin-bottom:20px; }
             .hero h1 {
               margin:0 0 8px;
               font-size:1.75rem;
@@ -1782,7 +1854,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
             }
             .hero p, .muted { color:var(--muted); line-height:1.45; }
             .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:16px; margin-top:18px; }
-            .card { padding:44px 18px 18px; }
+            .card { padding:18px; }
             .stat strong {
               display:block;
               font-size:1.4rem;
@@ -1852,6 +1924,229 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               margin-bottom:8px;
               line-height:1.45;
             }
+            .data-table {
+              width:100%;
+              border-collapse:collapse;
+              min-width:760px;
+            }
+            .data-table th, .data-table td {
+              border-bottom:1px solid var(--line);
+              padding:10px 12px;
+              text-align:left;
+              vertical-align:top;
+            }
+            .data-table th {
+              color:var(--muted);
+              font-size:12px;
+              letter-spacing:.08em;
+              text-transform:uppercase;
+            }
+            .badge {
+              display:inline-flex;
+              align-items:center;
+              border-radius:999px;
+              padding:4px 9px;
+              font-size:12px;
+              font-weight:800;
+            }
+            .badge.ok { background:#dff5e7; color:#12351f; }
+            .badge.warn { background:#f9dddd; color:#942f2f; }
+            .dashboard-compact {
+              display:none;
+            }
+            .dashboard-compact.active {
+              display:block;
+            }
+            .dashboard-grid {
+              display:grid;
+              gap:10px;
+            }
+            .primary-status-grid {
+              grid-template-columns:repeat(6, minmax(0, 1fr));
+            }
+            .admin-status-grid {
+              grid-template-columns:repeat(4, minmax(0, 1fr));
+              margin-top:10px;
+            }
+            .admin-status-grid .compact-stat {
+              min-height:86px;
+            }
+            .admin-section-card {
+              margin-top:10px;
+            }
+            .admin-console pre {
+              margin:0;
+            }
+            .telemetry-grid {
+              grid-template-columns:repeat(4, minmax(0, 1fr));
+              margin-top:10px;
+            }
+            .compact-stat {
+              min-height:104px;
+              padding:12px;
+              border-radius:5px;
+            }
+            .compact-stat strong {
+              margin-top:8px;
+              font-size:1.05rem;
+              line-height:1.15;
+              overflow:hidden;
+              text-overflow:ellipsis;
+              white-space:nowrap;
+            }
+            #gpuTempValue, #gpuPowerValue, #gpuVramValue {
+              white-space:pre-line;
+              text-overflow:clip;
+            }
+            .model-card strong {
+              font-size:.95rem;
+            }
+            .stat-head {
+              display:flex;
+              align-items:center;
+              justify-content:space-between;
+              gap:8px;
+              color:var(--muted);
+              font-size:.78rem;
+              letter-spacing:.08em;
+              text-transform:uppercase;
+            }
+            .metric-row {
+              display:flex;
+              align-items:center;
+              justify-content:space-between;
+              gap:8px;
+              margin-top:7px;
+              color:var(--muted);
+              font-size:.78rem;
+            }
+            .metric-row code {
+              color:var(--ink);
+              font-size:.78rem;
+              overflow:hidden;
+              text-overflow:ellipsis;
+              white-space:nowrap;
+            }
+            .compact-links {
+              margin-top:10px;
+              padding:12px;
+              border-radius:5px;
+            }
+            .compact-actions {
+              margin-top:10px;
+              gap:8px;
+            }
+            .compact-actions a {
+              padding:7px 10px;
+              border-radius:5px;
+              font-size:.78rem;
+            }
+            .dashboard-compact .badge {
+              border-radius:4px;
+              padding:3px 6px;
+              font-size:.66rem;
+            }
+            .dashboard-compact .card {
+              border-radius:5px;
+            }
+            .panel:not(#dashboard):not(#status) .hero {
+              padding:12px 14px;
+              margin-bottom:10px;
+              border-radius:5px;
+            }
+            .panel:not(#dashboard):not(#status) .hero h1 {
+              margin:0;
+              font-size:1rem;
+              letter-spacing:.10em;
+            }
+            .panel:not(#dashboard):not(#status) .hero p {
+              display:none;
+            }
+            .panel:not(#dashboard):not(#status) .hero .status {
+              margin-top:8px;
+              padding:7px 9px;
+              border-radius:5px;
+              font-size:.82rem;
+            }
+            .panel:not(#dashboard):not(#status) .card {
+              padding:12px;
+              border-radius:5px;
+            }
+            .panel:not(#dashboard):not(#status) .grid {
+              grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+              gap:10px;
+              margin-top:10px;
+            }
+            .panel:not(#dashboard):not(#status) .two-col {
+              gap:10px;
+              margin-top:10px !important;
+            }
+            .panel:not(#dashboard):not(#status) h2 {
+              margin:0 0 10px;
+              font-size:.9rem;
+              letter-spacing:.08em;
+              text-transform:uppercase;
+              color:var(--accent);
+            }
+            .panel:not(#dashboard):not(#status) label {
+              margin-bottom:9px;
+            }
+            .panel:not(#dashboard):not(#status) label span {
+              margin-bottom:4px;
+              font-size:.72rem;
+            }
+            .panel:not(#dashboard):not(#status) input,
+            .panel:not(#dashboard):not(#status) select,
+            .panel:not(#dashboard):not(#status) textarea {
+              border-radius:5px;
+              padding:8px 9px;
+              font-size:.82rem;
+            }
+            .panel:not(#dashboard):not(#status) textarea {
+              min-height:96px;
+            }
+            .panel:not(#dashboard):not(#status) .actions {
+              margin-top:8px;
+              gap:8px;
+            }
+            .panel:not(#dashboard):not(#status) .actions a,
+            .panel:not(#dashboard):not(#status) .actions button,
+            .panel:not(#dashboard):not(#status) button.secondary,
+            .panel:not(#dashboard):not(#status) button.primary {
+              border-radius:5px;
+              padding:7px 10px;
+              font-size:.78rem;
+            }
+            .panel:not(#dashboard):not(#status) .stat strong {
+              font-size:1.05rem;
+            }
+            .panel:not(#dashboard):not(#status) .list-stack {
+              gap:8px;
+              margin-top:8px;
+            }
+            .panel:not(#dashboard):not(#status) .list-card {
+              border-radius:5px;
+              padding:10px;
+            }
+            .advanced-card {
+              padding:0 !important;
+              overflow:hidden;
+            }
+            .advanced-card > summary {
+              cursor:pointer;
+              padding:12px;
+              color:var(--accent);
+              font-weight:800;
+              letter-spacing:.08em;
+              text-transform:uppercase;
+              border-bottom:1px solid transparent;
+            }
+            .advanced-card[open] > summary {
+              border-bottom-color:var(--line);
+            }
+            .advanced-card-body {
+              padding:12px;
+            }
             .list-card pre {
               margin-top:8px;
               padding:10px;
@@ -1883,152 +2178,178 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               border:1px solid var(--line);
             }
             @media (max-width:1000px) {
+              .admin-shell { grid-template-columns:1fr; }
+              .sidebar {
+                position:relative;
+                height:auto;
+                padding:14px;
+              }
+              .nav-buttons {
+                flex-direction:row;
+                overflow-x:auto;
+                padding-bottom:4px;
+              }
+              .nav-buttons a {
+                width:auto;
+                white-space:nowrap;
+              }
+              .userbox {
+                flex-direction:row;
+                align-items:center;
+                margin-top:0;
+              }
+              .topbar {
+                position:sticky;
+                align-items:flex-start;
+                flex-direction:column;
+              }
+              .header-telemetry { justify-content:flex-start; }
               .two-col { grid-template-columns:1fr; }
-              .nav-main { flex-direction:column; align-items:flex-start; }
             }
           </style>
         </head>
         <body>
-          <header>
-            <div class="nav">
-              <div class="nav-main">
-                <div class="brand-stack">
-                  <div class="brand">llm-gateway Admin Hub</div>
-                  <div class="header-telemetry">
-                    <div class="telemetry-chip"><span class="chip-label">CPU</span><span id="headerCpuUsageValue" class="chip-value">__HEADER_CPU_USAGE_VALUE__</span></div>
-                    <div class="telemetry-chip"><span class="chip-label">CPU Temp</span><span id="headerCpuTempValue" class="chip-value">__HEADER_CPU_TEMP_VALUE__</span></div>
-                    <div class="telemetry-chip"><span class="chip-label">GPU Use</span><span id="headerGpuUsageValue" class="chip-value">__HEADER_GPU_USAGE_VALUE__</span></div>
-                    <div class="telemetry-chip"><span class="chip-label">GPU Temp</span><span id="headerGpuTempValue" class="chip-value">__HEADER_GPU_TEMP_VALUE__</span></div>
-                    <div class="telemetry-chip"><span class="chip-label">GPU Pwr</span><span id="headerGpuPowerValue" class="chip-value">__HEADER_GPU_POWER_VALUE__</span></div>
-                    <div class="telemetry-chip"><span class="chip-label">VRAM</span><span id="headerGpuVramValue" class="chip-value">__HEADER_GPU_VRAM_VALUE__</span></div>
-                  </div>
-                </div>
-                <div class="nav-buttons">
-                  <a class="__NAV_DASHBOARD__" href="/internal/admin?tab=dashboard">Dashboard</a>
-                  <a class="__NAV_SETTINGS__" href="/internal/admin?tab=settings">Settings</a>
-                  <a class="__NAV_SKILLS__" href="/internal/admin?tab=skills">Skills / MCP</a>
-                  <a class="__NAV_CHAT__" href="/internal/admin?tab=chat">Chat</a>
-                  <a class="__NAV_MEMORY__" href="/internal/admin?tab=memory">Memory</a>
-                  <a class="__NAV_DATABASE__" href="/internal/admin?tab=database">Database</a>
-                  <a class="__NAV_HOME_ASSISTANT__" href="/internal/admin?tab=home-assistant">Home Assistant</a>
-                  <a class="__NAV_STORAGE__" href="/internal/admin?tab=storage">Storage</a>
-                  <a class="__NAV_OPS__" href="/internal/admin?tab=ops">Ops</a>
-                  <a class="__NAV_DEVICES__" href="/internal/admin?tab=devices">Pi / Devices</a>
-                </div>
-                <div class="userbox">
-                  <span>eingeloggt als __USERNAME__</span>
-                  <form method="post" action="/admin/logout"><button type="submit">Logout</button></form>
-                </div>
+          <div class="admin-shell">
+            <aside class="sidebar">
+              <div class="brand-stack">
+                <div class="brand">llm-gateway</div>
+                <div class="muted sidebar-subtitle">Kai Admin Workspace</div>
               </div>
-            </div>
-          </header>
-          <main>
-            <section id="dashboard" class="panel __PANEL_DASHBOARD__">
-              <div class="hero">
-                <h1>Betriebsueberblick</h1>
-                <p>Hier siehst du nur den laufenden Zustand der Plattform: Gateway, Kai, GPU, Requests, aktive Modelle, Datenbank und Storage. Konfiguration liegt im neuen Settings-Tab.</p>
-                <div id="dashboardStatus" class="status">__DASHBOARD_STATUS__</div>
+              <nav class="nav-buttons" aria-label="Admin navigation">
+                <a class="__NAV_DASHBOARD__" href="/internal/admin?tab=dashboard">Dashboard</a>
+                <a class="__NAV_STATUS__" href="/internal/admin?tab=status">Status</a>
+                <a class="__NAV_CHAT__" href="/internal/admin?tab=chat">Chat</a>
+                <a class="__NAV_MAIL__" href="/internal/admin?tab=mail">Mail</a>
+                <a class="__NAV_HOME_ASSISTANT__" href="/internal/admin?tab=home-assistant">Home Assistant</a>
+                <a class="__NAV_MEMORY__" href="/internal/admin?tab=memory">Memory</a>
+                <a class="__NAV_STORAGE__" href="/internal/admin?tab=storage">Storage</a>
+                <a class="__NAV_SKILLS__" href="/internal/admin?tab=skills">Skills / MCP</a>
+                <a class="__NAV_DATABASE__" href="/internal/admin?tab=database">Database</a>
+                <a class="__NAV_OPS__" href="/internal/admin?tab=ops">Ops</a>
+                <a class="__NAV_DEVICES__" href="/internal/admin?tab=devices">Pi / Devices</a>
+                <a class="__NAV_SETTINGS__" href="/internal/admin?tab=settings">Settings</a>
+              </nav>
+              <div class="userbox">
+                <span>eingeloggt als __USERNAME__</span>
+                <form method="post" action="/admin/logout"><button type="submit">Logout</button></form>
               </div>
-              <div class="grid">
-                <div class="card stat">
-                  <div class="muted">Gateway</div>
+            </aside>
+            <div class="workbench">
+              <header class="topbar">
+                <div class="topbar-title">
+                  <strong>System Monitor</strong>
+                  <span>Gateway / MI50 / Kai</span>
+                </div>
+                <div class="header-telemetry">
+                  <div class="telemetry-chip"><span class="chip-label">CPU</span><span id="headerCpuUsageValue" class="chip-value">__HEADER_CPU_USAGE_VALUE__</span></div>
+                  <div class="telemetry-chip"><span class="chip-label">CPU Temp</span><span id="headerCpuTempValue" class="chip-value">__HEADER_CPU_TEMP_VALUE__</span></div>
+                  <div class="telemetry-chip"><span class="chip-label">GPU Use</span><span id="headerGpuUsageValue" class="chip-value">__HEADER_GPU_USAGE_VALUE__</span></div>
+                  <div class="telemetry-chip"><span class="chip-label">GPU Temp</span><span id="headerGpuTempValue" class="chip-value">__HEADER_GPU_TEMP_VALUE__</span></div>
+                  <div class="telemetry-chip"><span class="chip-label">GPU Pwr</span><span id="headerGpuPowerValue" class="chip-value">__HEADER_GPU_POWER_VALUE__</span></div>
+                  <div class="telemetry-chip"><span class="chip-label">VRAM</span><span id="headerGpuVramValue" class="chip-value">__HEADER_GPU_VRAM_VALUE__</span></div>
+                </div>
+              </header>
+              <main>
+            <section id="dashboard" class="panel __PANEL_DASHBOARD__ dashboard-compact">
+              <div class="dashboard-grid primary-status-grid">
+                <div class="card stat compact-stat">
+                  <div class="stat-head"><span>Gateway</span><span id="gatewayStateBadge" class="badge warn">checking</span></div>
                   <strong id="gatewayState">__GATEWAY_STATE__</strong>
                   <div id="gatewayInfo" class="muted">__GATEWAY_INFO__</div>
                 </div>
-                <div class="card stat">
-                  <div class="muted">Kai / MI50</div>
-                  <strong id="backendState">__BACKEND_STATE__</strong>
-                  <div id="backendInfo" class="muted">__BACKEND_INFO__</div>
+                <div class="card stat compact-stat model-card">
+                  <div class="stat-head"><span>Worker</span><span id="workerStatusBadge" class="badge warn">checking</span></div>
+                  <strong id="workerModelValue">-</strong>
+                  <div class="metric-row"><span>Status</span><code id="workerStatusValue">-</code></div>
+                  <div class="metric-row"><span>Latenz</span><code id="workerLatencyValue">-</code></div>
                 </div>
-                <div class="card stat">
-                  <div class="muted">Requests</div>
+                <div class="card stat compact-stat model-card">
+                  <div class="stat-head"><span>Reviewer</span><span id="reviewerStatusBadge" class="badge warn">checking</span></div>
+                  <strong id="reviewerModelValue">-</strong>
+                  <div class="metric-row"><span>Status</span><code id="reviewerStatusValue">-</code></div>
+                  <div class="metric-row"><span>Latenz</span><code id="reviewerLatencyValue">-</code></div>
+                </div>
+                <div class="card stat compact-stat">
+                  <div class="stat-head"><span>Pipeline</span><span id="pipelineStatusBadge" class="badge warn">checking</span></div>
+                  <strong id="pipelineStateValue">-</strong>
+                  <div class="muted">reviewed-chat</div>
+                </div>
+                <div class="card stat compact-stat">
+                  <div class="stat-head"><span>Requests</span></div>
                   <strong id="requestsValue">__REQUESTS_VALUE__</strong>
-                  <div class="muted">seit Prozessstart</div>
+                  <div class="metric-row"><span>Backend</span><code id="backendCallsValue">__BACKEND_CALLS_VALUE__</code></div>
                 </div>
-                <div class="card stat">
-                  <div class="muted">Backend Calls</div>
-                  <strong id="backendCallsValue">__BACKEND_CALLS_VALUE__</strong>
-                  <div class="muted">inkl. Health Checks</div>
-                </div>
-                <div class="card stat">
-                  <div class="muted">Uptime</div>
+                <div class="card stat compact-stat">
+                  <div class="stat-head"><span>Uptime</span></div>
                   <strong id="uptimeValue">__UPTIME_VALUE__</strong>
-                  <div class="muted">seit Prozessstart</div>
-                </div>
-                <div class="card stat">
-                  <div class="muted">Avg Request</div>
-                  <strong id="avgRequestValue">__AVG_REQUEST_VALUE__</strong>
-                  <div class="muted">mittlere Dauer</div>
-                </div>
-                <div class="card stat">
-                  <div class="muted">GPU Temp</div>
-                  <strong id="gpuTempValue">__GPU_TEMP_VALUE__</strong>
-                  <div class="muted">MI50 edge temp</div>
-                </div>
-                <div class="card stat">
-                  <div class="muted">GPU Power</div>
-                  <strong id="gpuPowerValue">__GPU_POWER_VALUE__</strong>
-                  <div class="muted">rocm-smi watt</div>
-                </div>
-                <div class="card stat">
-                  <div class="muted">VRAM</div>
-                  <strong id="gpuVramValue">__GPU_VRAM_VALUE__</strong>
-                  <div class="muted">belegt / gesamt</div>
-                </div>
-                <div class="card stat">
-                  <div class="muted">MCP / Skills aktiv</div>
-                  <strong id="dashboardMcpSkillsValue">__DASHBOARD_MCP_SKILLS_VALUE__</strong>
-                  <div class="muted">MCP-Tools / Skills</div>
+                  <div class="metric-row"><span>Avg</span><code id="avgRequestValue">__AVG_REQUEST_VALUE__</code></div>
                 </div>
               </div>
-              <div class="two-col" style="margin-top:18px;">
-                <div class="card">
-                  <h2>Aktiver Plattform-Stack</h2>
-                  <div class="list-stack">
-                    <div class="list-card">
-                      <h3>Modelle und Routing</h3>
-                      <div class="list-meta">Aktives KI-Profil: <code id="dashboardBackendProfile">__DASHBOARD_BACKEND_PROFILE__</code></div>
-                      <div class="list-meta">Public Model: <code id="dashboardPublicModel">__DASHBOARD_PUBLIC_MODEL__</code></div>
-                      <div class="list-meta">Backend Model: <code id="dashboardBackendModel">__DASHBOARD_BACKEND_MODEL__</code></div>
-                      <div class="list-meta">Admin Default Mode: <code id="dashboardAdminMode">__DASHBOARD_ADMIN_MODE__</code></div>
-                      <div class="list-meta">Routing Schwellwerte: <code id="dashboardRoutingThresholds">__DASHBOARD_ROUTING_THRESHOLDS__</code></div>
-                    </div>
-                    <div class="list-card">
-                      <h3>Kontext und Limits</h3>
-                      <div class="list-meta">Backend URL: <code id="dashboardBackendBaseUrl">__DASHBOARD_BACKEND_BASE_URL__</code></div>
-                      <div class="list-meta">Context Window: <code id="dashboardContextWindow">__DASHBOARD_CONTEXT_WINDOW__</code></div>
-                      <div class="list-meta">Response Reserve: <code id="dashboardResponseReserve">__DASHBOARD_RESPONSE_RESERVE__</code></div>
-                      <div class="list-meta">Default max_tokens: <code id="dashboardDefaultMaxTokens">__DASHBOARD_DEFAULT_MAX_TOKENS__</code></div>
-                    </div>
-                    <div class="list-card">
-                      <h3>Persistenz und Integrationen</h3>
-                      <div class="list-meta">Database / Memory: <code id="dashboardDbMode">__DASHBOARD_DB_MODE__</code></div>
-                      <div class="list-meta">Storage aktiv: <code id="dashboardStorageActive">__DASHBOARD_STORAGE_ACTIVE__</code></div>
-                      <div class="list-meta">Home Assistant: <code id="dashboardHaSummary">__DASHBOARD_HA_SUMMARY__</code></div>
-                    </div>
-                  </div>
+
+              <div class="dashboard-grid telemetry-grid">
+                <div class="card stat compact-stat">
+                  <div class="muted">GPU Temp</div>
+                  <strong id="gpuTempValue">__GPU_TEMP_VALUE__</strong>
                 </div>
-                <div class="card">
-                  <h2>Schnellzugriff</h2>
-                  <p class="muted">Das Dashboard soll dich direkt zu den produktiven Bereichen bringen, nicht mit Konfig-Feldern erschlagen.</p>
-                  <div class="actions">
-                    <a class="secondary" href="/internal/admin?tab=chat">Zum Chat</a>
-                    <a class="secondary" href="/internal/admin?tab=memory">Memory</a>
-                    <a class="secondary" href="/internal/admin?tab=storage">Storage</a>
-                    <a class="secondary" href="/internal/admin?tab=database">Database</a>
-                    <a class="secondary" href="/internal/admin?tab=ops">Ops</a>
-                    <a class="secondary" href="/internal/admin?tab=settings">Settings</a>
+                <div class="card stat compact-stat">
+                  <div class="muted">GPU Power</div>
+                  <strong id="gpuPowerValue">__GPU_POWER_VALUE__</strong>
+                </div>
+                <div class="card stat compact-stat">
+                  <div class="muted">VRAM</div>
+                  <strong id="gpuVramValue">__GPU_VRAM_VALUE__</strong>
+                </div>
+                <div class="card stat compact-stat">
+                  <div class="muted">MCP / Skills</div>
+                  <strong id="dashboardMcpSkillsValue">__DASHBOARD_MCP_SKILLS_VALUE__</strong>
+                </div>
+              </div>
+
+              <div class="card compact-links">
+                <div class="stat-head"><span>Schnellzugriff</span><span id="dashboardErrorValue" class="muted">-</span></div>
+                <div class="actions compact-actions">
+                  <a class="secondary" href="/internal/admin?tab=chat">Chat</a>
+                  <a class="secondary" href="/internal/admin?tab=status">Status</a>
+                  <a class="secondary" href="/internal/admin?tab=memory">Memory</a>
+                  <a class="secondary" href="/internal/admin?tab=mail">Mail</a>
+                  <a class="secondary" href="/internal/admin?tab=storage">Storage</a>
+                  <a class="secondary" href="/internal/admin?tab=database">Database</a>
+                  <a class="secondary" href="/internal/admin?tab=ops">Ops</a>
+                  <a class="secondary" href="/internal/admin?tab=settings">Settings</a>
+                </div>
+              </div>
+            </section>
+
+            <section id="status" class="panel __PANEL_STATUS__">
+              <div class="hero">
+                <h1>Gateway Status</h1>
+                <p>Live-Status der konfigurierten Modellprofile ueber <code>/v1/status</code>. Es werden nur HTTP-Healthchecks gegen die Backends ausgefuehrt.</p>
+                <div id="gatewayStatusMessage" class="status">Status wird geladen...</div>
+              </div>
+              <div class="card" style="margin-top:18px;">
+                <div class="actions" style="justify-content:space-between;align-items:center;">
+                  <div>
+                    <h2 style="margin:0;">Modellprofile</h2>
+                    <p class="muted" style="margin:6px 0 0;">Gateway: <strong id="gatewayStatusValue">-</strong></p>
                   </div>
-                  <div class="list-stack" style="margin-top:16px;">
-                    <div class="list-card">
-                      <h3>Wofuer das Dashboard jetzt da ist</h3>
-                      <div class="list-meta">Betriebsueberblick, GPU-Telemetrie, Modellzustand, Request-Last und schneller Sprung in die Arbeitsbereiche.</div>
-                    </div>
-                    <div class="list-card">
-                      <h3>Was bewusst ausgelagert wurde</h3>
-                      <div class="list-meta">Gateway-/Routing-Settings, Continue YAML und technische Grundkonfiguration liegen jetzt im eigenen Settings-Tab.</div>
-                    </div>
-                  </div>
+                  <button class="secondary" type="button" onclick="loadGatewayStatus()">Status neu laden</button>
+                </div>
+                <div style="overflow:auto;margin-top:16px;">
+                  <table class="data-table">
+                    <thead>
+                      <tr>
+                        <th>Profil</th>
+                        <th>Display Name</th>
+                        <th>Modell</th>
+                        <th>Base URL</th>
+                        <th>Status</th>
+                        <th>Latenz</th>
+                      </tr>
+                    </thead>
+                    <tbody id="gatewayStatusProfiles">
+                      <tr><td colspan="6" class="muted">Status wird geladen...</td></tr>
+                    </tbody>
+                  </table>
                 </div>
               </div>
             </section>
@@ -2036,43 +2357,75 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
             <section id="settings" class="panel __PANEL_SETTINGS__">
               <div class="hero">
                 <h1>Settings / Gateway</h1>
-                <p>Hier liegen die schreibbaren Plattform-Settings. Ganz oben stehen bewusst die KI-Profile, weil du darueber im Alltag Modell, Service und Umschaltung steuerst. Rohere Gateway-Felder und Legacy-Kompatibilitaet sind darunter kompakter einsortiert.</p>
+                <p>Modellprofile und Gateway-Settings in einer kompakten Admin-Ansicht.</p>
                 <div id="settingsStatus" class="status">__SETTINGS_STATUS__</div>
               </div>
-              <div class="two-col" style="margin-top:18px;">
-                <div class="card">
-                  <h2>KI-Profile / MI50-Services</h2>
-                  <form method="post" action="/internal/admin/backend-profile/save-form">
-                    <input type="hidden" name="BACKEND_PROFILE_ID" value="__BACKEND_PROFILE_FORM_ID__">
-                    <label><span>BACKEND_PROFILE_NAME</span><input name="BACKEND_PROFILE_NAME" value="__BACKEND_PROFILE_FORM_NAME__" placeholder="z. B. devstral, qwen-coder"></label>
-                    <label><span>PROFILE_PUBLIC_MODEL_NAME</span><input name="PROFILE_PUBLIC_MODEL_NAME" value="__BACKEND_PROFILE_FORM_PUBLIC_MODEL_NAME__" placeholder="z. B. devstral-q3 oder qwen-coder"></label>
-                    <label><span>PROFILE_BACKEND_MODEL_NAME</span><input name="PROFILE_BACKEND_MODEL_NAME" value="__BACKEND_PROFILE_FORM_BACKEND_MODEL_NAME__" placeholder="z. B. Devstral-Small-2-24B-Instruct-2512-Q3_K_M.gguf"></label>
-                    <label><span>PROFILE_BASE_URL</span><input name="PROFILE_BASE_URL" value="__BACKEND_PROFILE_FORM_BASE_URL__" placeholder="z. B. http://192.168.40.111:8080"></label>
-                    <label><span>PROFILE_CONTEXT_WINDOW</span><input name="PROFILE_CONTEXT_WINDOW" value="__BACKEND_PROFILE_FORM_CONTEXT_WINDOW__" placeholder="z. B. 8192 oder 16384"></label>
-                    <label><span>PROFILE_RESPONSE_RESERVE</span><input name="PROFILE_RESPONSE_RESERVE" value="__BACKEND_PROFILE_FORM_RESPONSE_RESERVE__" placeholder="z. B. 2048"></label>
-                    <label><span>PROFILE_DEFAULT_MAX_TOKENS</span><input name="PROFILE_DEFAULT_MAX_TOKENS" value="__BACKEND_PROFILE_FORM_DEFAULT_MAX_TOKENS__" placeholder="z. B. 1024"></label>
-                    <label><span>PROFILE_MI50_NGL optional</span><input name="PROFILE_MI50_NGL" value="__BACKEND_PROFILE_FORM_NGL_LAYERS__" placeholder="z. B. 0, 20 oder 40"></label>
-                    <label><span>PROFILE_MI50_SERVICE_NAME</span><input name="PROFILE_MI50_SERVICE_NAME" value="__BACKEND_PROFILE_FORM_SERVICE_NAME__" placeholder="z. B. kai-devstral oder kai-qwen"></label>
-                    <label style="grid-column:1/-1;"><span>PROFILE_MI50_ACTIVATE_COMMAND optional</span><input name="PROFILE_MI50_ACTIVATE_COMMAND" value="__BACKEND_PROFILE_FORM_ACTIVATE_COMMAND__" placeholder="z. B. ~/switch-kai.sh devstral oder sudo -n systemctl restart kai-devstral"></label>
-                    <label style="grid-column:1/-1;"><span>PROFILE_MI50_STATUS_COMMAND optional</span><input name="PROFILE_MI50_STATUS_COMMAND" value="__BACKEND_PROFILE_FORM_STATUS_COMMAND__" placeholder="z. B. systemctl status kai-devstral --no-pager"></label>
-                    <label style="grid-column:1/-1;"><span>PROFILE_MI50_LOGS_COMMAND optional</span><input name="PROFILE_MI50_LOGS_COMMAND" value="__BACKEND_PROFILE_FORM_LOGS_COMMAND__" placeholder="z. B. journalctl -u kai-devstral -n 80 --no-pager"></label>
-                    <div class="actions">
-                      <button class="primary" type="submit">Profil speichern</button>
-                      <a class="secondary" href="/internal/admin?tab=settings">Neu / Formular leeren</a>
-                    </div>
-                  </form>
-                  <p class="muted" style="margin-top:12px;">Gedacht fuer deinen Ein-GPU-Alltag: mehrere KI-Services auf der MI50 anlegen, aber immer nur einen aktiv haben. Beim Aktivieren eines Profils stellt der Gateway das Modell-Mapping um und startet den passenden Service auf der MI50. Wenn `sudo systemctl ...` nicht ohne Passwort geht, hinterlegst du hier stattdessen ein eigenes Wrapper-Kommando wie `~/switch-kai.sh qwen`. Ein gesetztes <code>NGL</code> wird beim Aktivieren als <code>KAI_NGL</code> an den Remote-Befehl weitergereicht oder kann ueber <code>{ngl}</code> direkt in einem Kommando-Template benutzt werden.</p>
+
+              <div class="dashboard-grid admin-status-grid">
+                <div class="card stat compact-stat">
+                  <div class="muted">Profile</div>
+                  <strong>__BACKEND_PROFILES_COUNT__</strong>
+                  <div class="muted">gespeichert</div>
                 </div>
-                <div class="card">
-                  <h2>Gespeicherte KI-Profile</h2>
-                  <div id="backendProfilesList" class="list-stack">__BACKEND_PROFILES_HTML__</div>
-                  <label style="margin-top:12px;"><span>Profil-Ansicht</span><textarea readonly>__BACKEND_PROFILE_PREVIEW__</textarea></label>
+                <div class="card stat compact-stat">
+                  <div class="muted">Aktives Profil</div>
+                  <strong>__DASHBOARD_BACKEND_PROFILE__</strong>
+                  <div class="muted">Gateway Routing</div>
+                </div>
+                <div class="card stat compact-stat">
+                  <div class="muted">Worker Modell</div>
+                  <strong>__SETTINGS_WORKER_MODEL__</strong>
+                  <div class="muted">fast / devstral</div>
+                </div>
+                <div class="card stat compact-stat">
+                  <div class="muted">Reviewer Modell</div>
+                  <strong>__SETTINGS_REVIEWER_MODEL__</strong>
+                  <div class="muted">review pipeline</div>
                 </div>
               </div>
-              <div class="two-col" style="margin-top:18px;">
-                <div class="card">
-                  <h2>Basis-Settings</h2>
-                  <p class="muted">Das hier sind die Felder, die du im Alltag wirklich brauchst: aktuelles Backend, sichtbarer Modellname, Kontext-/Token-Grenzen und die SSH-Strecke zur MI50.</p>
+
+              <div class="card admin-section-card">
+                <div class="stat-head"><span>Modellprofile</span><span class="muted">Tabelle</span></div>
+                <div id="backendProfilesList" class="list-stack">__BACKEND_PROFILES_HTML__</div>
+              </div>
+
+              <details class="card advanced-card admin-section-card">
+                <summary>Erweiterte Profildetails</summary>
+                <div class="advanced-card-body">
+                  <div class="two-col">
+                    <div>
+                      <h2>Profil bearbeiten</h2>
+                      <form method="post" action="/internal/admin/backend-profile/save-form">
+                        <input type="hidden" name="BACKEND_PROFILE_ID" value="__BACKEND_PROFILE_FORM_ID__">
+                        <label><span>BACKEND_PROFILE_NAME</span><input name="BACKEND_PROFILE_NAME" value="__BACKEND_PROFILE_FORM_NAME__" placeholder="z. B. devstral, qwen-coder"></label>
+                        <label><span>PROFILE_PUBLIC_MODEL_NAME</span><input name="PROFILE_PUBLIC_MODEL_NAME" value="__BACKEND_PROFILE_FORM_PUBLIC_MODEL_NAME__" placeholder="z. B. devstral-q3 oder qwen-coder"></label>
+                        <label><span>PROFILE_BACKEND_MODEL_NAME</span><input name="PROFILE_BACKEND_MODEL_NAME" value="__BACKEND_PROFILE_FORM_BACKEND_MODEL_NAME__" placeholder="z. B. Devstral-Small-2-24B-Instruct-2512-Q3_K_M.gguf"></label>
+                        <label><span>PROFILE_BASE_URL</span><input name="PROFILE_BASE_URL" value="__BACKEND_PROFILE_FORM_BASE_URL__" placeholder="z. B. http://192.168.40.111:8080"></label>
+                        <label><span>PROFILE_CONTEXT_WINDOW</span><input name="PROFILE_CONTEXT_WINDOW" value="__BACKEND_PROFILE_FORM_CONTEXT_WINDOW__" placeholder="z. B. 8192 oder 16384"></label>
+                        <label><span>PROFILE_RESPONSE_RESERVE</span><input name="PROFILE_RESPONSE_RESERVE" value="__BACKEND_PROFILE_FORM_RESPONSE_RESERVE__" placeholder="z. B. 2048"></label>
+                        <label><span>PROFILE_DEFAULT_MAX_TOKENS</span><input name="PROFILE_DEFAULT_MAX_TOKENS" value="__BACKEND_PROFILE_FORM_DEFAULT_MAX_TOKENS__" placeholder="z. B. 1024"></label>
+                        <label><span>PROFILE_MI50_NGL optional</span><input name="PROFILE_MI50_NGL" value="__BACKEND_PROFILE_FORM_NGL_LAYERS__" placeholder="z. B. 0, 20 oder 40"></label>
+                        <label><span>PROFILE_MI50_SERVICE_NAME</span><input name="PROFILE_MI50_SERVICE_NAME" value="__BACKEND_PROFILE_FORM_SERVICE_NAME__" placeholder="z. B. kai-devstral oder kai-qwen"></label>
+                        <label style="grid-column:1/-1;"><span>PROFILE_MI50_ACTIVATE_COMMAND optional</span><input name="PROFILE_MI50_ACTIVATE_COMMAND" value="__BACKEND_PROFILE_FORM_ACTIVATE_COMMAND__" placeholder="z. B. ~/switch-kai.sh devstral oder sudo -n systemctl restart kai-devstral"></label>
+                        <label style="grid-column:1/-1;"><span>PROFILE_MI50_STATUS_COMMAND optional</span><input name="PROFILE_MI50_STATUS_COMMAND" value="__BACKEND_PROFILE_FORM_STATUS_COMMAND__" placeholder="z. B. systemctl status kai-devstral --no-pager"></label>
+                        <label style="grid-column:1/-1;"><span>PROFILE_MI50_LOGS_COMMAND optional</span><input name="PROFILE_MI50_LOGS_COMMAND" value="__BACKEND_PROFILE_FORM_LOGS_COMMAND__" placeholder="z. B. journalctl -u kai-devstral -n 80 --no-pager"></label>
+                        <div class="actions compact-actions">
+                          <button class="primary" type="submit">Profil speichern</button>
+                          <a class="secondary" href="/internal/admin?tab=settings">Neu / leeren</a>
+                        </div>
+                      </form>
+                    </div>
+                    <div>
+                      <h2>Ausgewaehltes Profil</h2>
+                      <label><span>Profil-Ansicht</span><textarea readonly>__BACKEND_PROFILE_PREVIEW__</textarea></label>
+                    </div>
+                  </div>
+                </div>
+              </details>
+
+              <details class="card advanced-card admin-section-card">
+                <summary>Erweiterte Gateway-Settings</summary>
+                <div class="advanced-card-body">
                   <form onsubmit="saveConfig(event)">
                     <div class="grid">
                       <label><span>LLAMACPP_BASE_URL</span><input id="LLAMACPP_BASE_URL" value="__CFG_LLAMACPP_BASE_URL__"></label>
@@ -2087,8 +2440,8 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                       <label><span>MI50_SSH_PORT</span><input id="MI50_SSH_PORT" value="__CFG_MI50_SSH_PORT__"></label>
                       <label><span>GATEWAY_LOCAL_ROOT_PREFIX</span><input id="GATEWAY_LOCAL_ROOT_PREFIX" value="__CFG_GATEWAY_LOCAL_ROOT_PREFIX__"></label>
                     </div>
-                    <details style="margin-top:18px;">
-                      <summary style="cursor:pointer;font-weight:700;">Erweiterte Modell- und Routing-Settings</summary>
+                    <details style="margin-top:14px;">
+                      <summary style="cursor:pointer;font-weight:700;">Routing / Fast-Deep</summary>
                       <div class="grid" style="margin-top:14px;">
                         <label><span>FAST_MODEL_PUBLIC_NAME</span><input id="FAST_MODEL_PUBLIC_NAME" value="__CFG_FAST_MODEL_PUBLIC_NAME__"></label>
                         <label><span>FAST_MODEL_BACKEND_NAME</span><input id="FAST_MODEL_BACKEND_NAME" value="__CFG_FAST_MODEL_BACKEND_NAME__"></label>
@@ -2102,7 +2455,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                       </div>
                     </details>
                     <details style="margin-top:14px;">
-                      <summary style="cursor:pointer;font-weight:700;">MI50 Remote-Kommandos und Telemetrie</summary>
+                      <summary style="cursor:pointer;font-weight:700;">MI50 Remote-Kommandos</summary>
                       <div class="grid" style="margin-top:14px;">
                         <label style="grid-column:1/-1;"><span>MI50_RESTART_COMMAND</span><input id="MI50_RESTART_COMMAND" value="__CFG_MI50_RESTART_COMMAND__"></label>
                         <label style="grid-column:1/-1;"><span>MI50_STATUS_COMMAND</span><input id="MI50_STATUS_COMMAND" value="__CFG_MI50_STATUS_COMMAND__"></label>
@@ -2111,38 +2464,28 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                       </div>
                     </details>
                     <details style="margin-top:14px;">
-                      <summary style="cursor:pointer;font-weight:700;">Vision / Bildanalyse</summary>
+                      <summary style="cursor:pointer;font-weight:700;">Vision / Gmail / Continue</summary>
                       <div class="grid" style="margin-top:14px;">
                         <label><span>VISION_BASE_URL</span><input id="VISION_BASE_URL" value="__CFG_VISION_BASE_URL__" placeholder="http://127.0.0.1:8081"></label>
                         <label><span>VISION_MODEL_NAME</span><input id="VISION_MODEL_NAME" value="__CFG_VISION_MODEL_NAME__" placeholder="qwen2.5-vl"></label>
                         <label><span>VISION_MAX_TOKENS</span><input id="VISION_MAX_TOKENS" value="__CFG_VISION_MAX_TOKENS__"></label>
                         <label style="grid-column:1/-1;"><span>VISION_PROMPT</span><input id="VISION_PROMPT" value="__CFG_VISION_PROMPT__"></label>
+                        <label><span>GMAIL_ENABLED</span><input id="GMAIL_ENABLED" value="__CFG_GMAIL_ENABLED__" placeholder="true oder false"></label>
+                        <label style="grid-column:1/-1;"><span>GMAIL_CLIENT_SECRET_FILE</span><input id="GMAIL_CLIENT_SECRET_FILE" value="__CFG_GMAIL_CLIENT_SECRET_FILE__" placeholder="/opt/llm-gateway/.runtime/gmail_credentials.json"></label>
+                        <label style="grid-column:1/-1;"><span>GMAIL_TOKEN_FILE</span><input id="GMAIL_TOKEN_FILE" value="__CFG_GMAIL_TOKEN_FILE__" placeholder="/opt/llm-gateway/.runtime/gmail_token.json"></label>
+                        <label style="grid-column:1/-1;"><span>GMAIL_OAUTH_REDIRECT_URI</span><input id="GMAIL_OAUTH_REDIRECT_URI" value="__CFG_GMAIL_OAUTH_REDIRECT_URI__" placeholder="https://dein-gateway.example/api/admin/mail/oauth/callback"></label>
                       </div>
+                      <div class="actions compact-actions">
+                        <button class="secondary" type="button" onclick="loadContinueConfig()">Continue YAML laden</button>
+                      </div>
+                      <label style="margin-top:12px;"><span>Continue YAML</span><textarea id="continueYaml" readonly></textarea></label>
                     </details>
-                    <div class="actions">
-                      <button class="primary" type="button" onclick="saveConfig({ preventDefault() {} })">Basis-Settings speichern</button>
+                    <div class="actions compact-actions">
+                      <button class="primary" type="button" onclick="saveConfig({ preventDefault() {} })">Gateway-Settings speichern</button>
                     </div>
                   </form>
                 </div>
-                <div class="card">
-                  <h2>Continue / Client-Anbindung</h2>
-                  <p class="muted">Continue bleibt hier schnell erreichbar. Database, Storage und Home Assistant haben eigene Tabs, damit die Settings nicht wieder in einen chaotischen Alles-Editor kippen.</p>
-                  <div class="actions">
-                    <button class="secondary" type="button" onclick="loadContinueConfig()">Continue YAML laden</button>
-                  </div>
-                  <label style="margin-top:12px;"><span>Continue YAML</span><textarea id="continueYaml" readonly></textarea></label>
-                  <div class="list-stack" style="margin-top:16px;">
-                    <div class="list-card">
-                      <h3>Was hier bewusst nicht mehr oben steht</h3>
-                      <div class="list-meta">Fast/Deep-Kompatibilitaet, Remote-Kommandos und feinere Routing-Regeln sind nicht weg, aber in die erweiterten Bereiche geschoben.</div>
-                    </div>
-                    <div class="list-card">
-                      <h3>Faustregel fuer den Alltag</h3>
-                      <div class="list-meta">Meist reichen aktives KI-Profil, sichtbarer Modellname, Kontextfenster, Default max tokens und die SSH-Strecke zur MI50.</div>
-                    </div>
-                  </div>
-                </div>
-              </div>
+              </details>
             </section>
 
             <section id="memory" class="panel __PANEL_MEMORY__">
@@ -2332,6 +2675,96 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               </div>
             </section>
 
+            <section id="mail" class="panel __PANEL_MAIL__">
+              <div class="hero">
+                <h1>Mail / Gmail</h1>
+                <p>Gmail V1 liest Nachrichten readonly, zeigt Unsubscribe-Hinweise und kann aktuelle Mails ueber dein lokales LLM klassifizieren. Loeschen und Abmelden bleiben fuer spaetere kontrollierte Schritte vorbereitet.</p>
+                <div id="mailStatus" class="status">__MAIL_STATUS__</div>
+              </div>
+              <div class="two-col">
+                <div class="card">
+                  <h2>Verbindung</h2>
+                  <div class="grid">
+                    <div class="card stat">
+                      <div class="muted">Enabled</div>
+                      <strong id="mailEnabled">-</strong>
+                      <div class="muted">GMAIL_ENABLED</div>
+                    </div>
+                    <div class="card stat">
+                      <div class="muted">Configured</div>
+                      <strong id="mailConfigured">-</strong>
+                      <div class="muted">OAuth JSON vorhanden</div>
+                    </div>
+                    <div class="card stat">
+                      <div class="muted">Connected</div>
+                      <strong id="mailConnected">-</strong>
+                      <div class="muted">Token aktiv</div>
+                    </div>
+                    <div class="card stat">
+                      <div class="muted">Account</div>
+                      <strong id="mailAddress">-</strong>
+                      <div class="muted">verbundenes Gmail</div>
+                    </div>
+                  </div>
+                  <div class="actions">
+                    <button class="secondary" type="button" onclick="loadMailStatus()">Status laden</button>
+                    <a class="secondary" href="/api/admin/mail/oauth/start?next=%2Finternal%2Fadmin%3Ftab%3Dmail">Gmail verbinden</a>
+                    <button class="secondary" type="button" onclick="disconnectGmail()">Trennen</button>
+                  </div>
+                  <label style="margin-top:12px;"><span>Redirect URI</span><input id="mailRedirectUri" placeholder="https://dein-gateway.example/api/admin/mail/oauth/callback"></label>
+                  <label><span>OAuth Client JSON Pfad</span><input id="mailClientSecretFile" placeholder="/opt/llm-gateway/.runtime/gmail_credentials.json"></label>
+                  <label><span>Token Pfad</span><input id="mailTokenFile" placeholder="/opt/llm-gateway/.runtime/gmail_token.json"></label>
+                  <label><span>Gmail aktiv</span>
+                    <select id="mailGmailEnabled">
+                      <option value="false">false</option>
+                      <option value="true">true</option>
+                    </select>
+                  </label>
+                  <div class="actions">
+                    <button class="primary" type="button" onclick="saveMailConfig()">Mail-Settings speichern</button>
+                  </div>
+                  <form method="post" action="/internal/admin/mail/credentials/upload" enctype="multipart/form-data" style="margin-top:14px;">
+                    <input type="hidden" name="next_url" value="/internal/admin?tab=mail">
+                    <label><span>Google OAuth Client JSON hochladen</span><input type="file" name="credentials_file" accept=".json,application/json" required></label>
+                    <div class="actions">
+                      <button class="secondary" type="submit">Credentials speichern</button>
+                    </div>
+                  </form>
+                </div>
+                <div class="card">
+                  <h2>Mails laden</h2>
+                  <div class="grid">
+                    <label><span>Limit</span><input id="mailLimit" value="20" inputmode="numeric"></label>
+                    <label><span>Gmail Query</span><input id="mailQuery" placeholder="z. B. newer_than:7d -category:social"></label>
+                    <label><span>Labels optional</span><input id="mailLabelIds" placeholder="INBOX,CATEGORY_PROMOTIONS"></label>
+                    <label><span>Spam/Trash mitladen</span>
+                      <select id="mailIncludeSpamTrash">
+                        <option value="false">false</option>
+                        <option value="true">true</option>
+                      </select>
+                    </label>
+                    <label><span>KI-Klassifizierung</span>
+                      <select id="mailClassify">
+                        <option value="false">false</option>
+                        <option value="true">true</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div class="actions">
+                    <button class="primary" type="button" onclick="loadMailMessages()">Mails laden</button>
+                    <button class="secondary" type="button" onclick="loadMailMessages(true)">Mit KI klassifizieren</button>
+                  </div>
+                  <div class="list-stack" id="mailMessagesList" style="margin-top:14px;">
+                    <div class="muted">Noch keine Mails geladen.</div>
+                  </div>
+                </div>
+              </div>
+              <div class="card" style="margin-top:18px;">
+                <h2>Mail-Detail</h2>
+                <label><span>Ausgewaehlte Nachricht</span><textarea id="mailDetailView" readonly>Noch keine Mail ausgewaehlt.</textarea></label>
+              </div>
+            </section>
+
             <section id="storage" class="panel __PANEL_STORAGE__">
               <div class="hero">
                 <h1>Storage / Dokumente</h1>
@@ -2487,10 +2920,35 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
             <section id="ops" class="panel __PANEL_OPS__">
               <div class="hero">
                 <h1>Ops Konsole</h1>
-                <p>Kein freies Root-Webterminal. Stattdessen eine sichere Terminal-V1 mit Status, Logs, Restart und freigegebenen Preset-Befehlen fuer Gateway, Kai und kuratierte lokale Tool-Installationen.</p>
+                <p>Kompakte Service-Aktionen fuer Gateway und Modell-Hosts.</p>
               </div>
-              <div class="card">
-                <div class="actions">
+
+              <div class="dashboard-grid admin-status-grid">
+                <div class="card stat compact-stat">
+                  <div class="muted">Gateway Service</div>
+                  <strong>__OPS_GATEWAY_SERVICE__</strong>
+                  <div class="muted">systemd</div>
+                </div>
+                <div class="card stat compact-stat">
+                  <div class="muted">Worker Service</div>
+                  <strong>__OPS_WORKER_SERVICE__</strong>
+                  <div class="muted">GPU0 / 8080</div>
+                </div>
+                <div class="card stat compact-stat">
+                  <div class="muted">Reviewer Service</div>
+                  <strong>__OPS_REVIEWER_SERVICE__</strong>
+                  <div class="muted">GPU1 / 8081</div>
+                </div>
+                <div class="card stat compact-stat">
+                  <div class="muted">Pipeline Status</div>
+                  <strong>reviewed-chat</strong>
+                  <div class="muted">max. 1 parallel</div>
+                </div>
+              </div>
+
+              <div class="card admin-section-card">
+                <div class="stat-head"><span>Aktionen</span><span class="muted">Status / Logs / Restart / Presets</span></div>
+                <div class="actions compact-actions">
                   <select id="opsTarget">
                     <option value="gateway">gateway</option>
                     <option value="kai">kai</option>
@@ -2516,21 +2974,65 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                   <button class="secondary" type="button" onclick="opsAction('status')">Status</button>
                   <button class="secondary" type="button" onclick="opsAction('logs')">Logs</button>
                   <button class="primary" type="button" onclick="opsAction('restart')">Restart</button>
-                  <button class="secondary" type="button" onclick="runPresetCommand()">Preset ausfuehren</button>
-                </div>
-                <div id="opsStatus" class="status">Waehle ein Ziel und eine Aktion.</div>
-                <div class="card" style="margin-top:14px; background:#fcfaf4;">
-                  <pre id="opsOutput">Noch keine Ausgabe.</pre>
+                  <button class="secondary" type="button" onclick="runPresetCommand()">Preset</button>
                 </div>
               </div>
+
+              <details class="card advanced-card admin-section-card">
+                <summary>Letzte Ausgabe</summary>
+                <div class="advanced-card-body admin-console">
+                  <div id="opsStatus" class="status">Waehle ein Ziel und eine Aktion.</div>
+                  <pre id="opsOutput">Noch keine Ausgabe.</pre>
+                </div>
+              </details>
             </section>
 
             <section id="devices" class="panel __PANEL_DEVICES__">
               <div class="hero">
                 <h1>Pi / Devices</h1>
-                <p>Hier verbindest du fertige Kai-Pis schnell ueber Gateway-URL, Token und optional SSH. Fuer einen laufenden Kai-Pi reichen praktisch Host, User, Port und auf Wunsch ein Passwort.</p>
+                <p>Geraeteuebersicht zuerst, SSH- und Bootstrap-Details eingeklappt.</p>
                 <div id="deviceStatus" class="status">__DEVICE_STATUS__</div>
               </div>
+
+              <div class="dashboard-grid admin-status-grid">
+                <div class="card stat compact-stat">
+                  <div class="muted">Geraete gesamt</div>
+                  <strong>__DEVICE_PROFILES_COUNT__</strong>
+                  <div class="muted">Profile</div>
+                </div>
+                <div class="card stat compact-stat">
+                  <div class="muted">Online</div>
+                  <strong>__DEVICE_ONLINE_COUNT__</strong>
+                  <div class="muted">Live-Status</div>
+                </div>
+                <div class="card stat compact-stat">
+                  <div class="muted">Offline</div>
+                  <strong>__DEVICE_OFFLINE_COUNT__</strong>
+                  <div class="muted">Live-Status</div>
+                </div>
+                <div class="card stat compact-stat">
+                  <div class="muted">Letzte Verbindung</div>
+                  <strong>__DEVICE_LAST_SEEN__</strong>
+                  <div class="muted">Device API</div>
+                </div>
+              </div>
+
+              <div class="card admin-section-card">
+                <div class="stat-head"><span>Gespeicherte Geraete</span><span class="muted">Tabelle</span></div>
+                <div class="list-stack">__DEVICE_PROFILES_HTML__</div>
+              </div>
+
+              <div class="card admin-section-card">
+                <div class="stat-head"><span>Aktionen</span><span class="muted">Verbinden / Pruefen / Installieren pro Geraet</span></div>
+                <div class="actions compact-actions">
+                  <a class="secondary" href="/internal/admin?tab=devices">Neues Profil</a>
+                  <span class="muted">Die konkreten Aktionen stehen in der Geraetetabelle.</span>
+                </div>
+              </div>
+
+              <details class="card advanced-card admin-section-card">
+                <summary>Erweiterte Einstellungen</summary>
+                <div class="advanced-card-body">
               <div class="two-col">
                 <div class="card">
                   <h2>Kai-Pi Schnell verbinden</h2>
@@ -2670,14 +3172,17 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                   </label>
                 </div>
                 <div class="card">
-                  <h2>Gespeicherte Pi-Profile</h2>
-                  <div class="list-stack">__DEVICE_PROFILES_HTML__</div>
+                  <h2>Bootstrap / Token</h2>
                   <label style="margin-top:14px;"><span>Pi-Install-Skript</span><textarea readonly>__DEVICE_BOOTSTRAP_PREVIEW__</textarea></label>
-                  <p class="muted" style="margin-top:12px;">Der Button <code>PI installieren</code> fuehrt dieses Script serverseitig ueber SSH aus. Damit kannst du auch einen rohen Pi ohne bestehendes Kai-Setup direkt vom Gateway aus vorbereiten.</p>
+                  <p class="muted" style="margin-top:12px;">Der Button <code>PI installieren</code> aus der Geraetetabelle fuehrt dieses Script serverseitig ueber SSH aus.</p>
                 </div>
               </div>
+                </div>
+              </details>
             </section>
-          </main>
+              </main>
+            </div>
+          </div>
           <script>
             window.currentConfig = {};
             const configFields = [
@@ -2706,6 +3211,10 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               "VISION_MODEL_NAME",
               "VISION_PROMPT",
               "VISION_MAX_TOKENS",
+              "GMAIL_ENABLED",
+              "GMAIL_CLIENT_SECRET_FILE",
+              "GMAIL_TOKEN_FILE",
+              "GMAIL_OAUTH_REDIRECT_URI",
               "MI50_SSH_HOST",
               "MI50_SSH_USER",
               "MI50_SSH_PORT",
@@ -2771,6 +3280,89 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               node.textContent = message;
               node.style.background = error ? "#f9dddd" : "#dff5e7";
               node.style.color = error ? "#942f2f" : "#16231b";
+            }
+
+            function normalizeAdminTabs() {
+              const skip = new Set(["dashboard", "status", "chat"]);
+              for (const panel of document.querySelectorAll("main > section.panel")) {
+                if (skip.has(panel.id)) continue;
+                panel.classList.add("normalized-admin-tab");
+                const cards = Array.from(panel.querySelectorAll(":scope > .card, :scope > .two-col > .card"));
+                for (const card of cards) {
+                  if (card.dataset.normalized === "1") continue;
+                  const hasForm = Boolean(card.querySelector("form, input:not([readonly]), select, textarea:not([readonly])"));
+                  const hasStats = Boolean(card.querySelector(".card.stat"));
+                  const hasList = Boolean(card.querySelector(".list-stack, .data-table"));
+                  if (!hasForm || hasStats || hasList || card.closest("details")) {
+                    card.dataset.normalized = "1";
+                    continue;
+                  }
+
+                  const title = card.querySelector("h2") ? card.querySelector("h2").textContent.trim() : "Erweiterte Einstellungen";
+                  const details = document.createElement("details");
+                  details.className = `${card.className} advanced-card`;
+                  const summary = document.createElement("summary");
+                  summary.textContent = title || "Erweiterte Einstellungen";
+                  const body = document.createElement("div");
+                  body.className = "advanced-card-body";
+                  while (card.firstChild) body.appendChild(card.firstChild);
+                  const innerTitle = body.querySelector("h2");
+                  if (innerTitle) innerTitle.remove();
+                  details.appendChild(summary);
+                  details.appendChild(body);
+                  details.dataset.normalized = "1";
+                  card.replaceWith(document.createComment("advanced settings moved"));
+                  panel.appendChild(details);
+                }
+              }
+            }
+
+            function setGatewayStatusMessage(message, error = false) {
+              const node = document.getElementById("gatewayStatusMessage");
+              if (!node) return;
+              node.textContent = message;
+              node.style.background = error ? "#f9dddd" : "#dff5e7";
+              node.style.color = error ? "#942f2f" : "#16231b";
+            }
+
+            function renderGatewayStatusProfiles(profiles) {
+              const node = document.getElementById("gatewayStatusProfiles");
+              if (!node) return;
+              if (!Array.isArray(profiles) || profiles.length === 0) {
+                node.innerHTML = '<tr><td colspan="6" class="muted">Keine aktiven Modellprofile gefunden.</td></tr>';
+                return;
+              }
+              node.innerHTML = profiles.map((profile) => {
+                const online = profile.status === "online";
+                const latency = profile.latency_ms == null ? "-" : `${profile.latency_ms} ms`;
+                return `
+                  <tr>
+                    <td><code>${escapeHtml(profile.profile_id || "-")}</code></td>
+                    <td>${escapeHtml(profile.display_name || "-")}</td>
+                    <td><code>${escapeHtml(profile.model || profile.configured_model || "-")}</code></td>
+                    <td><code>${escapeHtml(profile.base_url || "-")}</code></td>
+                    <td><span class="badge ${online ? "ok" : "warn"}">${escapeHtml(profile.status || "offline")}</span></td>
+                    <td>${escapeHtml(latency)}</td>
+                  </tr>
+                `;
+              }).join("");
+            }
+
+            async function loadGatewayStatus() {
+              try {
+                setGatewayStatusMessage("Gateway-Status wird geladen...");
+                const res = await fetch("/api/admin/gateway/status");
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessage(data, `Status fehlgeschlagen: ${res.status}`));
+                setText("gatewayStatusValue", nestedValue(data, ["gateway", "status"], "-"));
+                renderGatewayStatusProfiles(data.profiles || []);
+                const offlineCount = (data.profiles || []).filter((profile) => profile.status !== "online").length;
+                setGatewayStatusMessage(offlineCount ? `${offlineCount} Profil(e) offline.` : "Alle aktiven Profile online.", offlineCount > 0);
+              } catch (error) {
+                setText("gatewayStatusValue", "error");
+                renderGatewayStatusProfiles([]);
+                setGatewayStatusMessage(error.message, true);
+              }
             }
 
             function setSettingsStatus(message, error = false) {
@@ -2966,44 +3558,106 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               return `${secs}s`;
             }
 
-            function updateDashboardConfigFacts(config) {
-              if (!config) return;
-              setText("dashboardPublicModel", valueOr(config.PUBLIC_MODEL_NAME, "-"));
-              setText("dashboardBackendModel", valueOr(config.BACKEND_MODEL_NAME, "-"));
-              setText("dashboardAdminMode", valueOr(config.ADMIN_DEFAULT_MODE, "-"));
-              setText("dashboardBackendBaseUrl", valueOr(config.LLAMACPP_BASE_URL, "-"));
-              setText("dashboardContextWindow", valueOr(config.BACKEND_CONTEXT_WINDOW, "-"));
-              setText("dashboardResponseReserve", valueOr(config.CONTEXT_RESPONSE_RESERVE, "-"));
-              setText("dashboardDefaultMaxTokens", valueOr(config.DEFAULT_MAX_TOKENS, "-"));
-              setText(
-                "dashboardRoutingThresholds",
-                `${valueOr(config.ROUTING_LENGTH_THRESHOLD, "-")} Zeichen / ${valueOr(config.ROUTING_HISTORY_THRESHOLD, "-")} Nachrichten`,
-              );
+            function setBadge(id, label, ok = false) {
+              const node = document.getElementById(id);
+              if (!node) return;
+              node.textContent = label;
+              node.className = `badge ${ok ? "ok" : "warn"}`;
+            }
+
+            function findProfile(profiles, ids) {
+              if (!Array.isArray(profiles)) return null;
+              return profiles.find((profile) => ids.includes(profile.profile_id) || ids.includes(profile.configured_model) || ids.includes(profile.model));
+            }
+
+            function updateModelStatusCards(statusData) {
+              const profiles = (statusData && statusData.profiles) || [];
+              const worker = findProfile(profiles, ["fast", "devstral-q3"]);
+              const reviewer = findProfile(profiles, ["reviewer"]);
+
+              updateOneModelCard("worker", worker);
+              updateOneModelCard("reviewer", reviewer);
+
+              const gatewayOnline = nestedValue(statusData, ["gateway", "status"], "-") === "online";
+              setBadge("gatewayStateBadge", gatewayOnline ? "online" : "offline", gatewayOnline);
+              const pipelineReady = Boolean(worker && reviewer && worker.status === "online" && reviewer.status === "online");
+              setText("pipelineStateValue", pipelineReady ? "ready" : "degraded");
+              setBadge("pipelineStatusBadge", pipelineReady ? "ready" : "check", pipelineReady);
+            }
+
+            function updateOneModelCard(prefix, profile) {
+              const online = profile && profile.status === "online";
+              setText(`${prefix}ModelValue`, profile ? valueOr(profile.configured_model || profile.model, "-") : "-");
+              setText(`${prefix}StatusValue`, profile ? valueOr(profile.status, "-") : "missing");
+              setText(`${prefix}LatencyValue`, profile && profile.latency_ms != null ? `${profile.latency_ms} ms` : "-");
+              setBadge(`${prefix}StatusBadge`, online ? "online" : "offline", online);
             }
 
             let headerTelemetryLoading = false;
 
+            function formatTelemetryNumber(value) {
+              const num = Number(value);
+              if (!Number.isFinite(num)) return null;
+              return num.toFixed(1).replace(/\\.0$/, "");
+            }
+
+            function stackGpuSummary(value) {
+              let text = String(value || "").trim();
+              const lineBreak = String.fromCharCode(10);
+              for (const separator of ["/", "|", ";"]) {
+                text = text.split(`${separator}G`).join(`${lineBreak}G`);
+                text = text.split(`${separator} G`).join(`${lineBreak}G`);
+                text = text.split(` ${separator}G`).join(`${lineBreak}G`);
+                text = text.split(` ${separator} G`).join(`${lineBreak}G`);
+              }
+              return text;
+            }
+
+            function formatTelemetryValue(data, summaryKey, numericKey, suffix) {
+              const summary = data && typeof data[summaryKey] === "string" ? stackGpuSummary(data[summaryKey]) : "";
+              if (summary) return summary;
+              if (!data || data[numericKey] == null) return "n/a";
+              const numberText = formatTelemetryNumber(data[numericKey]);
+              return numberText != null ? `${numberText}${suffix}` : "n/a";
+            }
+
+            function formatTelemetryVram(data) {
+              const summary = data && typeof data.gpu_summary_vram === "string" ? stackGpuSummary(data.gpu_summary_vram) : "";
+              if (summary) {
+                return { header: summary, card: summary };
+              }
+              if (data && data.vram_used_gib != null && data.vram_total_gib != null) {
+                const usedText = formatTelemetryNumber(data.vram_used_gib);
+                const totalText = formatTelemetryNumber(data.vram_total_gib);
+                const percentText = data.vram_percent != null ? `${formatTelemetryNumber(data.vram_percent)}%` : "?";
+                if (usedText != null && totalText != null) {
+                  return {
+                    header: percentText,
+                    card: `${usedText} / ${totalText} GiB (${percentText})`,
+                  };
+                }
+              }
+              if (data && data.vram_percent != null) {
+                const percentText = formatTelemetryNumber(data.vram_percent);
+                if (percentText != null) {
+                  return { header: `${percentText}%`, card: `${percentText}%` };
+                }
+              }
+              return { header: "n/a", card: "n/a" };
+            }
+
             function updateHeaderTelemetryView(data) {
               setText("headerCpuUsageValue", data && data.cpu_usage_percent != null ? `${Number(data.cpu_usage_percent).toFixed(1)}%` : "n/a");
               setText("headerCpuTempValue", data && data.cpu_temp_c != null ? `${Number(data.cpu_temp_c).toFixed(1)} C` : "n/a");
-              setText("headerGpuUsageValue", data && data.gpu_usage_percent != null ? `${Number(data.gpu_usage_percent).toFixed(1)}%` : "n/a");
-              setText("headerGpuTempValue", data && data.temperature_c != null ? `${Number(data.temperature_c).toFixed(1)} C` : "n/a");
-              setText("headerGpuPowerValue", data && data.power_w != null ? `${Number(data.power_w).toFixed(1)} W` : "n/a");
+              setText("headerGpuUsageValue", formatTelemetryValue(data, "gpu_summary_usage", "gpu_usage_percent", "%"));
+              setText("headerGpuTempValue", formatTelemetryValue(data, "gpu_summary_temp", "temperature_c", " C"));
+              setText("headerGpuPowerValue", formatTelemetryValue(data, "gpu_summary_power", "power_w", " W"));
 
-              let vramText = "n/a";
-              if (data && data.vram_used_gib != null && data.vram_total_gib != null) {
-                const percentText = data.vram_percent != null ? `${Number(data.vram_percent).toFixed(1)}%` : "?";
-                vramText = percentText;
-                setText("gpuVramValue", `${Number(data.vram_used_gib).toFixed(1)} / ${Number(data.vram_total_gib).toFixed(1)} GiB (${percentText})`);
-              } else if (data && data.vram_percent != null) {
-                vramText = `${Number(data.vram_percent).toFixed(1)}%`;
-                setText("gpuVramValue", vramText);
-              } else {
-                setText("gpuVramValue", "n/a");
-              }
-              setText("headerGpuVramValue", vramText);
-              setText("gpuTempValue", data && data.temperature_c != null ? `${Number(data.temperature_c).toFixed(1)} C` : "n/a");
-              setText("gpuPowerValue", data && data.power_w != null ? `${Number(data.power_w).toFixed(1)} W` : "n/a");
+              const vramValues = formatTelemetryVram(data);
+              setText("headerGpuVramValue", vramValues.header);
+              setText("gpuVramValue", vramValues.card);
+              setText("gpuTempValue", formatTelemetryValue(data, "gpu_summary_temp", "temperature_c", " C"));
+              setText("gpuPowerValue", formatTelemetryValue(data, "gpu_summary_power", "power_w", " W"));
             }
 
             async function loadHeaderTelemetry() {
@@ -3029,30 +3683,29 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
             async function loadDashboard() {
               const issues = [];
               try {
-                const [healthResult, metricsResult] = await Promise.allSettled([
+                const [healthResult, metricsResult, statusResult] = await Promise.allSettled([
                   fetch("/internal/health"),
                   fetch("/internal/metrics"),
+                  fetch("/api/admin/gateway/status"),
                 ]);
 
                 if (healthResult.status === "fulfilled") {
                   const healthRes = healthResult.value;
                   const health = await healthRes.json();
                   if (healthRes.ok) {
-                    setText("gatewayState", nestedValue(health, ["gateway", "status"], "-"));
-                    setText("gatewayInfo", "Gateway antwortet");
-                    setText("backendState", nestedValue(health, ["backend", "status"], "-"));
-                    setText(
-                      "backendInfo",
-                      valueOr(nestedValue(health, ["backend", "model"], "-"), "-") + " @ " + valueOr(nestedValue(health, ["backend", "base_url"], "-"), "-"),
-                    );
+                    const gatewayStatus = nestedValue(health, ["gateway", "status"], "-");
+                    setText("gatewayState", gatewayStatus);
+                    setText("gatewayInfo", "API bereit");
+                    setBadge("gatewayStateBadge", gatewayStatus === "ok" || gatewayStatus === "online" ? "online" : "check", gatewayStatus === "ok" || gatewayStatus === "online");
                   } else {
                     issues.push(errorMessage(health, `Health ${healthRes.status}`));
-                    setText("gatewayState", nestedValue(health, ["gateway", "status"], "error"));
-                    setText("backendState", nestedValue(health, ["backend", "status"], "error"));
-                    setText("backendInfo", valueOr(nestedValue(health, ["backend", "message"], "-"), "-"));
+                    setText("gatewayState", "error");
+                    setText("gatewayInfo", valueOr(nestedValue(health, ["backend", "message"], "-"), "-"));
+                    setBadge("gatewayStateBadge", "error", false);
                   }
                 } else {
                   issues.push("Health nicht erreichbar");
+                  setBadge("gatewayStateBadge", "error", false);
                 }
 
                 if (metricsResult.status === "fulfilled") {
@@ -3070,14 +3723,24 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                   issues.push("Metrics nicht erreichbar");
                 }
 
-                updateDashboardConfigFacts(window.currentConfig || {});
-                if (issues.length) {
-                  setDashboardStatus(`Teilweise geladen: ${issues.join(" | ")}`, true);
+                if (statusResult.status === "fulfilled") {
+                  const statusRes = statusResult.value;
+                  const statusData = await statusRes.json();
+                  if (statusRes.ok) {
+                    updateModelStatusCards(statusData);
+                  } else {
+                    issues.push(errorMessage(statusData, `Status ${statusRes.status}`));
+                    updateModelStatusCards(null);
+                  }
                 } else {
-                  setDashboardStatus("Dashboard geladen.");
+                  issues.push("Profilstatus nicht erreichbar");
+                  updateModelStatusCards(null);
                 }
+
+                setText("dashboardErrorValue", issues.length ? `${issues.length} Fehler` : "keine Fehler");
               } catch (error) {
-                setDashboardStatus(error.message, true);
+                setText("dashboardErrorValue", error.message);
+                setBadge("gatewayStateBadge", "error", false);
               }
             }
 
@@ -3307,6 +3970,168 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               }
             }
 
+            function setMailStatus(message, error = false) {
+              const node = document.getElementById("mailStatus");
+              if (!node) return;
+              node.textContent = message;
+              node.style.background = error ? "#f9dddd" : "#dff5e7";
+              node.style.color = error ? "#942f2f" : "#16231b";
+            }
+
+            function syncMailConfigFields(config) {
+              if (!config) return;
+              setValue("mailGmailEnabled", valueOr(config.GMAIL_ENABLED, "false"));
+              setValue("mailClientSecretFile", valueOr(config.GMAIL_CLIENT_SECRET_FILE, ""));
+              setValue("mailTokenFile", valueOr(config.GMAIL_TOKEN_FILE, ""));
+              setValue("mailRedirectUri", valueOr(config.GMAIL_OAUTH_REDIRECT_URI, ""));
+            }
+
+            function updateMailStatusView(data) {
+              setText("mailEnabled", data.enabled ? "yes" : "no");
+              setText("mailConfigured", data.configured ? "yes" : "no");
+              setText("mailConnected", data.connected ? "yes" : "no");
+              setText("mailAddress", data.email_address || "-");
+              if (data.redirect_uri && !document.getElementById("mailRedirectUri").value.trim()) {
+                setValue("mailRedirectUri", data.redirect_uri);
+              }
+              if (data.client_secret_file && !document.getElementById("mailClientSecretFile").value.trim()) {
+                setValue("mailClientSecretFile", data.client_secret_file);
+              }
+              if (data.token_file && !document.getElementById("mailTokenFile").value.trim()) {
+                setValue("mailTokenFile", data.token_file);
+              }
+            }
+
+            async function loadMailStatus() {
+              try {
+                const res = await fetch("/api/admin/mail/status");
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessage(data, `Mail-Status fehlgeschlagen: ${res.status}`));
+                updateMailStatusView(data);
+                setMailStatus(data.message || "Gmail-Status geladen.", data.enabled && !data.connected);
+              } catch (error) {
+                setMailStatus(error.message, true);
+              }
+            }
+
+            async function saveMailConfig() {
+              try {
+                setMailStatus("Mail-Settings werden gespeichert...");
+                const payload = collectConfigPayload();
+                payload.GMAIL_ENABLED = document.getElementById("mailGmailEnabled").value.trim() || "false";
+                payload.GMAIL_CLIENT_SECRET_FILE = document.getElementById("mailClientSecretFile").value.trim();
+                payload.GMAIL_TOKEN_FILE = document.getElementById("mailTokenFile").value.trim();
+                payload.GMAIL_OAUTH_REDIRECT_URI = document.getElementById("mailRedirectUri").value.trim();
+                const data = await persistConfig(payload);
+                syncMailConfigFields(data);
+                await loadSettings();
+                await loadMailStatus();
+                setMailStatus("Mail-Settings gespeichert.");
+              } catch (error) {
+                setMailStatus(error.message, true);
+              }
+            }
+
+            async function disconnectGmail() {
+              if (!window.confirm("Gmail-Verbindung wirklich trennen?")) return;
+              try {
+                setMailStatus("Gmail-Verbindung wird getrennt...");
+                const res = await fetch("/api/admin/mail/disconnect", { method: "POST" });
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessage(data, `Gmail trennen fehlgeschlagen: ${res.status}`));
+                await loadMailStatus();
+                setMailStatus(data.message || "Gmail getrennt.");
+              } catch (error) {
+                setMailStatus(error.message, true);
+              }
+            }
+
+            function mailClassificationText(item) {
+              const classification = item.classification || {};
+              const category = classification.category || "";
+              const importance = classification.importance || "";
+              const action = classification.recommended_action || "";
+              const parts = [category, importance, action].filter(Boolean);
+              return parts.length ? parts.join(" | ") : "nicht klassifiziert";
+            }
+
+            function renderMailMessages(items) {
+              const node = document.getElementById("mailMessagesList");
+              if (!node) return;
+              if (!items || items.length === 0) {
+                node.innerHTML = '<div class="muted">Keine Mails gefunden.</div>';
+                return;
+              }
+              node.innerHTML = items.map((item) => {
+                const subject = item.subject || "(ohne Betreff)";
+                const from = item.from || "-";
+                const date = item.received_at || item.date || "-";
+                const unsubscribe = item.unsubscribe_available ? "yes" : "no";
+                return `
+                  <div class="list-card">
+                    <h3>${escapeHtml(subject)}</h3>
+                    <div class="list-meta">Von: ${escapeHtml(from)}</div>
+                    <div class="list-meta">Datum: ${escapeHtml(formatTimestamp(date))} | Unsubscribe: <code>${escapeHtml(unsubscribe)}</code></div>
+                    <div class="list-meta">KI: <code>${escapeHtml(mailClassificationText(item))}</code></div>
+                    <div class="list-meta">${escapeHtml(item.snippet || "")}</div>
+                    <div class="actions">
+                      <button class="secondary" type="button" onclick="loadMailMessage('${escapeHtml(item.id || "")}')">Details</button>
+                    </div>
+                  </div>`;
+              }).join("");
+            }
+
+            async function loadMailMessages(forceClassify = false) {
+              try {
+                const limit = document.getElementById("mailLimit").value.trim() || "20";
+                const query = document.getElementById("mailQuery").value.trim();
+                const labels = document.getElementById("mailLabelIds").value.trim();
+                const includeSpamTrash = document.getElementById("mailIncludeSpamTrash").value === "true";
+                const classify = forceClassify || document.getElementById("mailClassify").value === "true";
+                const params = new URLSearchParams({
+                  limit,
+                  include_spam_trash: includeSpamTrash ? "true" : "false",
+                  classify: classify ? "true" : "false",
+                });
+                if (query) params.set("q", query);
+                if (labels) params.set("label_ids", labels);
+                setMailStatus(classify ? "Mails werden geladen und klassifiziert..." : "Mails werden geladen...");
+                const res = await fetch(`/api/admin/mail/messages?${params.toString()}`);
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessage(data, `Mails laden fehlgeschlagen: ${res.status}`));
+                renderMailMessages(data.messages || []);
+                const suffix = data.classification_model ? ` Klassifiziert mit ${data.classification_model}.` : "";
+                setMailStatus(`${data.count || 0} Mails geladen.${suffix}`);
+              } catch (error) {
+                setMailStatus(error.message, true);
+              }
+            }
+
+            async function loadMailMessage(messageId) {
+              const id = String(messageId || "").trim();
+              if (!id) return;
+              try {
+                setMailStatus("Mail-Details werden geladen...");
+                const res = await fetch(`/api/admin/mail/messages/${encodeURIComponent(id)}`);
+                const data = await res.json();
+                if (!res.ok) throw new Error(errorMessage(data, `Mail-Details fehlgeschlagen: ${res.status}`));
+                const lines = [
+                  `Subject: ${data.subject || "(ohne Betreff)"}`,
+                  `From: ${data.from || "-"}`,
+                  `To: ${data.to || "-"}`,
+                  `Date: ${data.date || data.received_at || "-"}`,
+                  `List-Id: ${data.list_id || "-"}`,
+                  `List-Unsubscribe: ${data.list_unsubscribe || "-"}`,
+                  "",
+                  data.body_text || data.snippet || "Kein Textinhalt verfuegbar.",
+                ];
+                setValue("mailDetailView", lines.join("\\n"));
+                setMailStatus("Mail-Details geladen.");
+              } catch (error) {
+                setMailStatus(error.message, true);
+              }
+            }
+
             function collectConfigPayload() {
               const payload = {};
               const currentConfig = window.currentConfig || {};
@@ -3330,6 +4155,9 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               payload.MI50_LOGS_COMMAND = payload.MI50_LOGS_COMMAND || "journalctl -u kai -n 80 --no-pager";
               payload.MI50_ROCM_SMI_COMMAND = payload.MI50_ROCM_SMI_COMMAND || "rocm-smi --showtemp --showpower --showmemuse --json";
               payload.HOME_ASSISTANT_TIMEOUT_SECONDS = payload.HOME_ASSISTANT_TIMEOUT_SECONDS || "10.0";
+              payload.GMAIL_ENABLED = payload.GMAIL_ENABLED || "false";
+              payload.GMAIL_CLIENT_SECRET_FILE = payload.GMAIL_CLIENT_SECRET_FILE || "/opt/llm-gateway/.runtime/gmail_credentials.json";
+              payload.GMAIL_TOKEN_FILE = payload.GMAIL_TOKEN_FILE || "/opt/llm-gateway/.runtime/gmail_token.json";
               return payload;
             }
 
@@ -3416,6 +4244,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                 await loadSettings();
                 await loadDatabaseStatus();
                 await loadHomeAssistantStatus();
+                await loadMailStatus();
                 setSettingsStatus("Gespeichert. Neue Werte gelten fuer neue Requests.");
               } catch (error) {
                 setSettingsStatus(error.message, true);
@@ -3482,6 +4311,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
                   if (node) node.value = data[key] || "";
                 }
                 updateDashboardConfigFacts(data);
+                syncMailConfigFields(data);
                 setSettingsStatus("Settings geladen.");
               } catch (error) {
                 setSettingsStatus(error.message, true);
@@ -3553,7 +4383,9 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
               }
             }
 
+            normalizeAdminTabs();
             loadDashboard();
+            loadGatewayStatus();
             loadHeaderTelemetry();
             window.setInterval(loadHeaderTelemetry, 500);
             loadSettings();
@@ -3561,6 +4393,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
             loadDatabaseStatus();
             loadStorageOverview();
             loadHomeAssistantStatus();
+            loadMailStatus();
             loadContinueConfig();
             loadOpsCatalog();
             loadCustomMcpTools();
@@ -3574,22 +4407,26 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
     replacements = {
         "__USERNAME__": escape(username),
         "__NAV_DASHBOARD__": "active" if active_tab == "dashboard" else "",
+        "__NAV_STATUS__": "active" if active_tab == "status" else "",
         "__NAV_SETTINGS__": "active" if active_tab == "settings" else "",
         "__NAV_SKILLS__": "active" if active_tab == "skills" else "",
         "__NAV_CHAT__": "active" if active_tab == "chat" else "",
         "__NAV_MEMORY__": "active" if active_tab == "memory" else "",
         "__NAV_DATABASE__": "active" if active_tab == "database" else "",
         "__NAV_HOME_ASSISTANT__": "active" if active_tab == "home-assistant" else "",
+        "__NAV_MAIL__": "active" if active_tab == "mail" else "",
         "__NAV_STORAGE__": "active" if active_tab == "storage" else "",
         "__NAV_OPS__": "active" if active_tab == "ops" else "",
         "__NAV_DEVICES__": "active" if active_tab == "devices" else "",
         "__PANEL_DASHBOARD__": "active" if active_tab == "dashboard" else "",
+        "__PANEL_STATUS__": "active" if active_tab == "status" else "",
         "__PANEL_SETTINGS__": "active" if active_tab == "settings" else "",
         "__PANEL_SKILLS__": "active" if active_tab == "skills" else "",
         "__PANEL_CHAT__": "active" if active_tab == "chat" else "",
         "__PANEL_MEMORY__": "active" if active_tab == "memory" else "",
         "__PANEL_DATABASE__": "active" if active_tab == "database" else "",
         "__PANEL_HOME_ASSISTANT__": "active" if active_tab == "home-assistant" else "",
+        "__PANEL_MAIL__": "active" if active_tab == "mail" else "",
         "__PANEL_STORAGE__": "active" if active_tab == "storage" else "",
         "__PANEL_OPS__": "active" if active_tab == "ops" else "",
         "__PANEL_DEVICES__": "active" if active_tab == "devices" else "",
@@ -3625,6 +4462,7 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__DASHBOARD_DB_MODE__": escape(initial_data.get("dashboard_db_mode", "-")),
         "__DASHBOARD_STORAGE_ACTIVE__": escape(initial_data.get("dashboard_storage_active", "-")),
         "__DASHBOARD_HA_SUMMARY__": escape(initial_data.get("dashboard_ha_summary", "-")),
+        "__MAIL_STATUS__": escape(initial_data.get("mail_status", "-")),
         "__DASHBOARD_MCP_SKILLS_VALUE__": escape(initial_data.get("dashboard_mcp_skills_value", "0 / 0")),
         "__DATABASE_STATUS__": escape(initial_data.get("database_status", "-")),
         "__DB_STORE_MODE__": escape(initial_data.get("db_store_mode", "-")),
@@ -3655,6 +4493,10 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__MCP_CUSTOM_TOOLS_COUNT__": escape(initial_data.get("mcp_custom_tools_count", "0")),
         "__MCP_CUSTOM_TOOLS_HTML__": initial_data.get("mcp_custom_tools_html", '<div class="muted">Noch keine Custom-MCP-Tools gespeichert.</div>'),
         "__DEVICE_STATUS__": escape(initial_data.get("device_status", "-")),
+        "__DEVICE_PROFILES_COUNT__": escape(initial_data.get("device_profiles_count", "0")),
+        "__DEVICE_ONLINE_COUNT__": escape(initial_data.get("device_online_count", "-")),
+        "__DEVICE_OFFLINE_COUNT__": escape(initial_data.get("device_offline_count", "-")),
+        "__DEVICE_LAST_SEEN__": escape(initial_data.get("device_last_seen", "-")),
         "__DEVICE_PROFILES_HTML__": initial_data.get("device_profiles_html", ""),
         "__DEVICE_PROFILE_FORM_ID__": escape(initial_data.get("device_profile_form_id", "")),
         "__DEVICE_PROFILE_FORM_NAME__": escape(initial_data.get("device_profile_form_name", "")),
@@ -3683,6 +4525,12 @@ def _admin_html(username: str, active_tab: str, initial_data: dict[str, str]) ->
         "__HA_CONFIGURED__": escape(initial_data.get("ha_configured", "-")),
         "__HA_CONNECTED__": escape(initial_data.get("ha_connected", "-")),
         "__HA_LOCATION__": escape(initial_data.get("ha_location", "-")),
+        "__BACKEND_PROFILES_COUNT__": escape(initial_data.get("backend_profiles_count", "0")),
+        "__SETTINGS_WORKER_MODEL__": escape(initial_data.get("settings_worker_model", "-")),
+        "__SETTINGS_REVIEWER_MODEL__": escape(initial_data.get("settings_reviewer_model", "-")),
+        "__OPS_GATEWAY_SERVICE__": escape(initial_data.get("ops_gateway_service", "llm-gateway")),
+        "__OPS_WORKER_SERVICE__": escape(initial_data.get("ops_worker_service", "kai-devstral")),
+        "__OPS_REVIEWER_SERVICE__": escape(initial_data.get("ops_reviewer_service", "kai-reviewer")),
         "__BACKEND_PROFILES_HTML__": initial_data.get("backend_profiles_html", ""),
         "__BACKEND_PROFILE_FORM_ID__": escape(initial_data.get("backend_profile_form_id", "")),
         "__BACKEND_PROFILE_FORM_NAME__": escape(initial_data.get("backend_profile_form_name", "")),

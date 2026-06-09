@@ -24,6 +24,7 @@ from app.schemas.admin_chat import (
     AdminSessionResponse,
 )
 from app.services.llamacpp_client import LlamaCppClient, LlamaCppError, LlamaCppTimeoutError
+from app.services.calm_news import CalmNewsConfigError, CalmNewsRequestError
 from app.services.home_assistant import HomeAssistantClient, HomeAssistantConfigError, HomeAssistantRequestError
 from app.services.home_assistant_intent import classify_home_assistant_intent
 from app.services.home_assistant_memory import (
@@ -155,6 +156,29 @@ async def admin_chat(
     )
 
     try:
+        explicit_tool_result = await _try_handle_explicit_tool_call(
+            settings=settings,
+            message=payload.message,
+            request_context=request_context,
+        )
+        if explicit_tool_result is not None:
+            await store.add_message(session_id, "user", payload.message)
+            await store.update_route(session_id, "tool", explicit_tool_result["route_reason"], payload.mode or session.mode)
+            if explicit_tool_result.get("backend_called"):
+                request.state.backend_called = True
+            assistant_message = await store.add_message(
+                session_id,
+                "assistant",
+                explicit_tool_result["assistant_text"],
+                model_used="tool",
+            )
+            return AdminChatResponse(
+                session=_serialize_session(await _require_session(store, session_id)),
+                assistant_message=_serialize_message(assistant_message),
+                resolved_model="tool",
+                route_reason=explicit_tool_result["route_reason"],
+            )
+
         alias_instruction = parse_home_assistant_alias_instruction(payload.message)
         if alias_instruction:
             alias, entity_ids = alias_instruction
@@ -293,6 +317,29 @@ async def admin_chat(
                 route_reason=ha_query_result["route_reason"],
             )
 
+        news_update_result = await _try_handle_news_update_action(
+            settings=settings,
+            message=payload.message,
+            request_context=request_context,
+        )
+        if news_update_result is not None:
+            await store.add_message(session_id, "user", payload.message)
+            await store.update_route(session_id, "tool", news_update_result["route_reason"], payload.mode or session.mode)
+            if news_update_result.get("backend_called"):
+                request.state.backend_called = True
+            assistant_message = await store.add_message(
+                session_id,
+                "assistant",
+                news_update_result["assistant_text"],
+                model_used="tool",
+            )
+            return AdminChatResponse(
+                session=_serialize_session(await _require_session(store, session_id)),
+                assistant_message=_serialize_message(assistant_message),
+                resolved_model="tool",
+                route_reason=news_update_result["route_reason"],
+            )
+
         gateway_ops_result = await _try_handle_gateway_ops_action(
             settings=settings,
             message=payload.message,
@@ -382,6 +429,27 @@ async def admin_chat(
             error_type="upstream_error",
             code="home_assistant_request_failed",
         )
+    except CalmNewsConfigError as exc:
+        return error_response(
+            request_id=request.state.request_id,
+            status_code=exc.status_code,
+            message=exc.message,
+            error_type="service_unavailable",
+            code=exc.code,
+            headers={"X-Upstream-Service": "calm_news"},
+        )
+    except CalmNewsRequestError as exc:
+        headers = {"X-Upstream-Service": "calm_news"}
+        if exc.upstream_request_id:
+            headers["X-Upstream-Request-ID"] = exc.upstream_request_id
+        return error_response(
+            request_id=request.state.request_id,
+            status_code=exc.status_code,
+            message=exc.message,
+            error_type="upstream_error",
+            code=exc.code,
+            headers=headers,
+        )
     except (ToolExecutionError, ValueError) as exc:
         return error_response(
             request_id=request.state.request_id,
@@ -430,6 +498,46 @@ async def admin_chat_stream(
     )
 
     try:
+        explicit_tool_result = await _try_handle_explicit_tool_call(
+            settings=settings,
+            message=payload.message,
+            request_context=request_context,
+        )
+        if explicit_tool_result is not None:
+            await store.add_message(session_id, "user", payload.message)
+            await store.update_route(session_id, "tool", explicit_tool_result["route_reason"], payload.mode or session.mode)
+            if explicit_tool_result.get("backend_called"):
+                request.state.backend_called = True
+
+            async def explicit_tool_stream():
+                payload_start = {
+                    "id": f"chatcmpl-tool-{session_id}",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "tool",
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    "request_id": request.state.request_id,
+                }
+                payload_content = {
+                    **payload_start,
+                    "choices": [{"index": 0, "delta": {"content": explicit_tool_result["assistant_text"]}, "finish_reason": "stop"}],
+                }
+                yield f"data: {json.dumps(payload_start, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield f"data: {json.dumps(payload_content, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+                await store.add_message(
+                    session_id,
+                    "assistant",
+                    explicit_tool_result["assistant_text"],
+                    model_used="tool",
+                )
+
+            return StreamingResponse(
+                explicit_tool_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+
         alias_instruction = parse_home_assistant_alias_instruction(payload.message)
         if alias_instruction:
             alias, entity_ids = alias_instruction
@@ -653,6 +761,46 @@ async def admin_chat_stream(
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
 
+        news_update_result = await _try_handle_news_update_action(
+            settings=settings,
+            message=payload.message,
+            request_context=request_context,
+        )
+        if news_update_result is not None:
+            await store.add_message(session_id, "user", payload.message)
+            await store.update_route(session_id, "tool", news_update_result["route_reason"], payload.mode or session.mode)
+            if news_update_result.get("backend_called"):
+                request.state.backend_called = True
+
+            async def news_update_stream():
+                payload_start = {
+                    "id": f"chatcmpl-tool-{session_id}",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "tool",
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    "request_id": request.state.request_id,
+                }
+                payload_content = {
+                    **payload_start,
+                    "choices": [{"index": 0, "delta": {"content": news_update_result["assistant_text"]}, "finish_reason": "stop"}],
+                }
+                yield f"data: {json.dumps(payload_start, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield f"data: {json.dumps(payload_content, ensure_ascii=False)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+                await store.add_message(
+                    session_id,
+                    "assistant",
+                    news_update_result["assistant_text"],
+                    model_used="tool",
+                )
+
+            return StreamingResponse(
+                news_update_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+
         gateway_ops_result = await _try_handle_gateway_ops_action(
             settings=settings,
             message=payload.message,
@@ -754,6 +902,27 @@ async def admin_chat_stream(
             message=exc.message,
             error_type="upstream_error",
             code="home_assistant_request_failed",
+        )
+    except CalmNewsConfigError as exc:
+        return error_response(
+            request_id=request.state.request_id,
+            status_code=exc.status_code,
+            message=exc.message,
+            error_type="service_unavailable",
+            code=exc.code,
+            headers={"X-Upstream-Service": "calm_news"},
+        )
+    except CalmNewsRequestError as exc:
+        headers = {"X-Upstream-Service": "calm_news"}
+        if exc.upstream_request_id:
+            headers["X-Upstream-Request-ID"] = exc.upstream_request_id
+        return error_response(
+            request_id=request.state.request_id,
+            status_code=exc.status_code,
+            message=exc.message,
+            error_type="upstream_error",
+            code=exc.code,
+            headers=headers,
         )
     except (ToolExecutionError, ValueError) as exc:
         return error_response(
@@ -965,6 +1134,99 @@ def _parse_gateway_ops_action(message: str) -> dict[str, str] | None:
         if alias in normalized:
             return {"command_name": command_name, "label": f"{alias} installieren"}
     return None
+
+
+def _explicit_tool_name(message: str) -> str | None:
+    text = (message or "").strip().lower()
+    if not text:
+        return None
+    tools = [item["name"] for item in tool_orchestrator.list_tools_for_role(ROLE_ADMIN)]
+    if not tools:
+        return None
+
+    best_match: tuple[int, str] | None = None
+    for name in tools:
+        lowered_name = name.lower()
+        for match in re.finditer(rf"(?<![a-z0-9_.-]){re.escape(lowered_name)}(?![a-z0-9_.-])", text):
+            if _is_negated_mention(text, match.start()):
+                continue
+            candidate = (match.start(), name)
+            if best_match is None or candidate[0] < best_match[0] or (candidate[0] == best_match[0] and len(candidate[1]) > len(best_match[1])):
+                best_match = candidate
+            break
+
+    return best_match[1] if best_match else None
+
+
+def _is_negated_mention(text: str, start_index: int) -> bool:
+    window = text[max(0, start_index - 16):start_index]
+    return bool(re.search(r"(?:nicht|not|no|kein|keine)\s*$", window))
+
+
+async def _try_handle_explicit_tool_call(
+    *,
+    settings,
+    message: str,
+    request_context: RequestContext,
+) -> dict[str, str] | None:
+    tool_name = _explicit_tool_name(message)
+    if tool_name is None:
+        return None
+
+    result = await tool_orchestrator.execute_tool(
+        settings=settings,
+        context=RequestContext(
+            request_id=request_context.request_id,
+            role=request_context.role,
+            principal_id=request_context.principal_id,
+            source="api.admin_chat.explicit_tool",
+        ),
+        tool_name=tool_name,
+        arguments={},
+    )
+    assistant_text = f"Tool ausgefuehrt: {tool_name}.\n\n{json.dumps(result, ensure_ascii=False)}"
+    return {
+        "assistant_text": assistant_text,
+        "route_reason": "explicit_tool",
+        "backend_called": True,
+    }
+
+
+def _message_requests_news_update(message: str) -> bool:
+    normalized = _normalize_gateway_ops_text(message)
+    if not normalized:
+        return False
+    if "news" not in normalized and "nachrichten" not in normalized:
+        return False
+    return any(term in normalized for term in ("aktualisiere", "aktualisieren", "update", "refresh", "neu laden", "einlesen", "ingest"))
+
+
+async def _try_handle_news_update_action(
+    *,
+    settings,
+    message: str,
+    request_context: RequestContext,
+) -> dict[str, str] | None:
+    if not _message_requests_news_update(message):
+        return None
+
+    result = await tool_orchestrator.execute_tool(
+        settings=settings,
+        context=RequestContext(
+            request_id=request_context.request_id,
+            role=request_context.role,
+            principal_id=request_context.principal_id,
+            source="api.admin_chat.news_update",
+        ),
+        tool_name="news.trigger_ingest",
+        arguments={},
+    )
+    assistant_text = f"News-Ingest gestartet.\n\n{json.dumps(result, ensure_ascii=False)}"
+    return {
+        "assistant_text": assistant_text,
+        "route_reason": "news_update_intent",
+        "backend_called": True,
+    }
 
 
 async def _try_handle_gateway_ops_action(

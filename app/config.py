@@ -4,6 +4,8 @@ from functools import lru_cache
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.services.model_profiles import ModelProfileNotFoundError, list_model_profiles, resolve_model_profile
+
 
 @dataclass(frozen=True)
 class ModelTarget:
@@ -82,6 +84,9 @@ class Settings(BaseSettings):
         default="light.,switch.,climate.,script.",
         alias="HOME_ASSISTANT_ALLOWED_ENTITY_PREFIXES",
     )
+    calm_news_enabled: bool = Field(default=False, alias="CALM_NEWS_ENABLED")
+    calm_news_base_url: str | None = Field(default=None, alias="CALM_NEWS_BASE_URL")
+    calm_news_timeout_seconds: float = Field(default=20.0, alias="CALM_NEWS_TIMEOUT")
     vision_base_url: str | None = Field(default=None, alias="VISION_BASE_URL")
     vision_model_name: str | None = Field(default=None, alias="VISION_MODEL_NAME")
     vision_prompt: str = Field(
@@ -89,6 +94,10 @@ class Settings(BaseSettings):
         alias="VISION_PROMPT",
     )
     vision_max_tokens: int = Field(default=256, alias="VISION_MAX_TOKENS")
+    gmail_enabled: bool = Field(default=False, alias="GMAIL_ENABLED")
+    gmail_client_secret_file: str = Field(default="/opt/llm-gateway/.runtime/gmail_credentials.json", alias="GMAIL_CLIENT_SECRET_FILE")
+    gmail_token_file: str = Field(default="/opt/llm-gateway/.runtime/gmail_token.json", alias="GMAIL_TOKEN_FILE")
+    gmail_oauth_redirect_uri: str | None = Field(default=None, alias="GMAIL_OAUTH_REDIRECT_URI")
     mi50_ssh_host: str | None = Field(default=None, alias="MI50_SSH_HOST")
     mi50_ssh_user: str | None = Field(default=None, alias="MI50_SSH_USER")
     mi50_ssh_port: int = Field(default=22, alias="MI50_SSH_PORT")
@@ -125,6 +134,20 @@ class Settings(BaseSettings):
 
     @property
     def listed_models(self) -> list[ModelTarget]:
+        models: list[ModelTarget] = []
+        for profile in list_model_profiles(self):
+            models.append(
+                ModelTarget(
+                    role=profile.profile_id,
+                    public_name=profile.public_model,
+                    backend_name=profile.backend_model,
+                    base_url=profile.base_url,
+                )
+            )
+        return models
+
+    @property
+    def legacy_listed_models(self) -> list[ModelTarget]:
         models = [self.effective_fast_model]
         deep_model = self.effective_deep_model
         if deep_model.public_name and deep_model.backend_name and deep_model.public_name != self.effective_fast_model.public_name:
@@ -154,7 +177,18 @@ class Settings(BaseSettings):
         return (self.vision_base_url or self.llamacpp_base_url).rstrip("/")
 
     def resolve_target_for_public_model(self, model_name: str) -> ModelTarget:
-        for target in self.listed_models:
+        try:
+            profile = resolve_model_profile(self, model_name)
+            return ModelTarget(
+                role=profile.profile_id,
+                public_name=profile.public_model,
+                backend_name=profile.backend_model,
+                base_url=profile.base_url,
+            )
+        except ModelProfileNotFoundError:
+            pass
+
+        for target in self.legacy_listed_models:
             if target.public_name == model_name:
                 return target
         return ModelTarget(
@@ -169,6 +203,9 @@ class Settings(BaseSettings):
 
     def map_backend_to_public_model(self, model_name: str) -> str:
         for target in self.listed_models:
+            if model_name == target.backend_name:
+                return target.public_name
+        for target in self.legacy_listed_models:
             if model_name == target.backend_name:
                 return target.public_name
         return model_name
