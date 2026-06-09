@@ -3,7 +3,7 @@
 Self-hosted LLM Gateway mit OpenAI-kompatibler API, frei definierbaren Modellprofilen, Worker/Reviewer-Pipeline, Status-Monitoring, Admin-Konsole, MCP/Skills, Home Assistant, Gmail-Integration und Memory/Storage-Funktionen. Das Gateway fuehrt keine Inferenz selbst aus, sondern routet kontrolliert an externe `llama.cpp`-Backends wie `fast`/`devstral-q3` und `reviewer`.
 
 <p align="center">
-  <img src="docs/admin-hub-preview.svg" alt="llm-gateway compact admin console preview" width="1100">
+  <img src="docs/admin-hub-preview.png" alt="llm-gateway admin console preview" width="1100">
 </p>
 
 <p align="center">
