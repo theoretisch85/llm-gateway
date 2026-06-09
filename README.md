@@ -10,6 +10,14 @@ Self-hosted LLM Gateway mit OpenAI-kompatibler API, frei definierbaren Modellpro
   Kompakte Admin-Konsole mit linker Navigation, System-Monitor, Worker/Reviewer-Status, Pipeline, GPU0/GPU1-Telemetrie, Modellprofilen und Schnellzugriffen.
 </p>
 
+<p align="center">
+  <img src="docs/admin-console-layout.svg" alt="llm-gateway admin UI layout diagram" width="1100">
+</p>
+
+<p align="center">
+  Designprinzip: Statuskarten zuerst, dann Tabellen, kompakte Aktionen und technische Details nur eingeklappt.
+</p>
+
 ## Aktueller Fokus
 
 - OpenAI-kompatible `/v1` API fuer lokale Clients und OpenWebUI.

@@ -1,0 +1,120 @@
+<svg width="1600" height="760" viewBox="0 0 1600 760" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">llm-gateway compact admin layout</title>
+  <desc id="desc">Design diagram of the updated llm-gateway admin UI with sidebar navigation, top telemetry header, status cards, tables, actions, and collapsible advanced settings.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1600" y2="760" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#060A0F"/>
+      <stop offset="0.58" stop-color="#0B1118"/>
+      <stop offset="1" stop-color="#05070A"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#111923"/>
+      <stop offset="1" stop-color="#0B1118"/>
+    </linearGradient>
+    <linearGradient id="active" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#123A30"/>
+      <stop offset="1" stop-color="#0D241E"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" stroke="#16202B" stroke-width="1" opacity="0.65"/>
+    </pattern>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <style>
+      .mono{font-family:ui-monospace,SFMono-Regular,Consolas,'Liberation Mono',monospace;}
+      .brand{fill:#74E4B2;font-size:23px;font-weight:900;letter-spacing:5px;}
+      .sub{fill:#7F92A3;font-size:13px;letter-spacing:2px;font-weight:700;}
+      .nav{fill:#C9D5E0;font-size:15px;font-weight:800;letter-spacing:2px;}
+      .label{fill:#8194A7;font-size:13px;font-weight:800;letter-spacing:1.6px;}
+      .value{fill:#74E4B2;font-size:22px;font-weight:900;}
+      .muted{fill:#8194A7;font-size:13px;}
+      .head{fill:#D9E5F0;font-size:18px;font-weight:900;letter-spacing:2px;}
+      .mini{fill:#74E4B2;font-size:12px;font-weight:900;letter-spacing:1.3px;}
+      .chip{fill:#74E4B2;font-size:14px;font-weight:900;}
+      .table{fill:#C9D5E0;font-size:14px;font-weight:700;}
+    </style>
+  </defs>
+
+  <rect width="1600" height="760" fill="url(#bg)"/>
+  <rect width="1600" height="760" fill="url(#grid)" opacity="0.7"/>
+  <circle cx="1380" cy="86" r="150" fill="#74E4B2" opacity="0.08" filter="url(#soft)"/>
+
+  <rect x="0" y="0" width="232" height="760" fill="#070C11" stroke="#233142"/>
+  <text x="24" y="38" class="mono brand">LLM-GATEWAY</text>
+  <text x="24" y="66" class="mono sub">KAI ADMIN WORKSPACE</text>
+  <line x1="0" y1="96" x2="232" y2="96" stroke="#253446"/>
+
+  <g class="mono">
+    <rect x="16" y="124" width="200" height="34" rx="5" fill="url(#active)" stroke="#3C846A"/>
+    <text x="30" y="146" class="nav" fill="#74E4B2">DASHBOARD</text>
+    <rect x="16" y="168" width="200" height="34" rx="5" fill="#111923" stroke="#283849"/><text x="30" y="190" class="nav">STATUS</text>
+    <rect x="16" y="212" width="200" height="34" rx="5" fill="#111923" stroke="#283849"/><text x="30" y="234" class="nav">CHAT</text>
+    <rect x="16" y="256" width="200" height="34" rx="5" fill="#111923" stroke="#283849"/><text x="30" y="278" class="nav">MAIL</text>
+    <rect x="16" y="300" width="200" height="34" rx="5" fill="#111923" stroke="#283849"/><text x="30" y="322" class="nav">HOME ASSISTANT</text>
+    <rect x="16" y="344" width="200" height="34" rx="5" fill="#111923" stroke="#283849"/><text x="30" y="366" class="nav">MEMORY</text>
+    <rect x="16" y="388" width="200" height="34" rx="5" fill="#111923" stroke="#283849"/><text x="30" y="410" class="nav">STORAGE</text>
+    <rect x="16" y="432" width="200" height="34" rx="5" fill="#111923" stroke="#283849"/><text x="30" y="454" class="nav">SKILLS / MCP</text>
+    <rect x="16" y="476" width="200" height="34" rx="5" fill="#111923" stroke="#283849"/><text x="30" y="498" class="nav">DATABASE</text>
+    <rect x="16" y="520" width="200" height="34" rx="5" fill="#111923" stroke="#283849"/><text x="30" y="542" class="nav">OPS</text>
+    <rect x="16" y="564" width="200" height="34" rx="5" fill="#111923" stroke="#283849"/><text x="30" y="586" class="nav">PI / DEVICES</text>
+    <rect x="16" y="608" width="200" height="34" rx="5" fill="#111923" stroke="#283849"/><text x="30" y="630" class="nav">SETTINGS</text>
+  </g>
+
+  <rect x="232" y="0" width="1368" height="70" fill="#0B1118" stroke="#263544"/>
+  <text x="262" y="29" class="mono" fill="#74E4B2" font-size="19" font-weight="900" letter-spacing="4">SYSTEM MONITOR</text>
+  <text x="262" y="51" class="mono sub">Gateway / MI50 / Kai</text>
+  <g class="mono">
+    <rect x="1060" y="11" width="82" height="38" rx="6" fill="#101722" stroke="#2A3A4C"/><text x="1070" y="25" class="muted" font-size="10">CPU</text><text x="1070" y="43" class="chip">30.3%</text>
+    <rect x="1152" y="11" width="92" height="38" rx="6" fill="#101722" stroke="#2A3A4C"/><text x="1162" y="25" class="muted" font-size="10">CPU TEMP</text><text x="1162" y="43" class="chip">50.0 C</text>
+    <rect x="1254" y="11" width="118" height="38" rx="6" fill="#101722" stroke="#2A3A4C"/><text x="1264" y="25" class="muted" font-size="10">GPU USE</text><text x="1264" y="43" class="chip">G0 0% / G1 0%</text>
+    <rect x="1382" y="11" width="126" height="38" rx="6" fill="#101722" stroke="#2A3A4C"/><text x="1392" y="25" class="muted" font-size="10">GPU TEMP</text><text x="1392" y="43" class="chip">G0 36C / G1 34C</text>
+  </g>
+
+  <g class="mono" transform="translate(262 104)">
+    <text x="0" y="0" class="head">1. STATUSKARTEN</text>
+    <g transform="translate(0 24)">
+      <rect width="190" height="92" rx="5" fill="url(#card)" stroke="#2A3A4C"/><text x="14" y="26" class="label">Gateway</text><text x="14" y="57" class="value">ok</text><text x="14" y="78" class="muted">API online</text>
+      <rect x="206" width="190" height="92" rx="5" fill="url(#card)" stroke="#2A3A4C"/><text x="220" y="26" class="label">Worker</text><text x="220" y="57" class="value">devstral-q3</text><text x="220" y="78" class="muted">GPU0 / 8080</text>
+      <rect x="412" width="190" height="92" rx="5" fill="url(#card)" stroke="#2A3A4C"/><text x="426" y="26" class="label">Reviewer</text><text x="426" y="57" class="value">reviewer</text><text x="426" y="78" class="muted">GPU1 / 8081</text>
+      <rect x="618" width="190" height="92" rx="5" fill="url(#card)" stroke="#2A3A4C"/><text x="632" y="26" class="label">Pipeline</text><text x="632" y="57" class="value">ready</text><text x="632" y="78" class="muted">reviewed-chat</text>
+      <rect x="824" width="190" height="92" rx="5" fill="url(#card)" stroke="#2A3A4C"/><text x="838" y="26" class="label">Requests</text><text x="838" y="57" class="value">19</text><text x="838" y="78" class="muted">Backend 6</text>
+      <rect x="1030" width="190" height="92" rx="5" fill="url(#card)" stroke="#2A3A4C"/><text x="1044" y="26" class="label">Uptime</text><text x="1044" y="57" class="value">104.37</text><text x="1044" y="78" class="muted">Avg 238 ms</text>
+    </g>
+  </g>
+
+  <g class="mono" transform="translate(262 246)">
+    <text x="0" y="0" class="head">2. TABELLEN / LISTENANSICHTEN</text>
+    <rect x="0" y="24" width="1220" height="174" rx="5" fill="#0A0F15" stroke="#2A3A4C"/>
+    <text x="18" y="58" class="label">Profil</text><text x="280" y="58" class="label">Modell</text><text x="548" y="58" class="label">Backend</text><text x="812" y="58" class="label">Status</text><text x="1012" y="58" class="label">Latenz</text>
+    <line x1="18" y1="78" x2="1202" y2="78" stroke="#253446"/>
+    <text x="18" y="112" class="table">fast</text><text x="280" y="112" class="table">devstral-q3</text><text x="548" y="112" class="muted">GPU0 :8080</text><text x="812" y="112" class="value" font-size="18">online</text><text x="1012" y="112" class="muted">120 ms</text>
+    <line x1="18" y1="130" x2="1202" y2="130" stroke="#182331"/>
+    <text x="18" y="164" class="table">reviewer</text><text x="280" y="164" class="table">reviewer</text><text x="548" y="164" class="muted">GPU1 :8081</text><text x="812" y="164" class="value" font-size="18">online</text><text x="1012" y="164" class="muted">140 ms</text>
+  </g>
+
+  <g class="mono" transform="translate(262 490)">
+    <text x="0" y="0" class="head">3. AKTIONEN</text>
+    <rect x="0" y="24" width="1220" height="66" rx="5" fill="url(#card)" stroke="#2A3A4C"/>
+    <text x="18" y="50" class="label">Schnellzugriff</text>
+    <g font-size="13" font-weight="900" letter-spacing="1.2">
+      <rect x="18" y="56" width="64" height="24" rx="4" fill="#172130" stroke="#2A3A4C"/><text x="30" y="73" fill="#D9E5F0">CHAT</text>
+      <rect x="92" y="56" width="78" height="24" rx="4" fill="#172130" stroke="#2A3A4C"/><text x="104" y="73" fill="#D9E5F0">STATUS</text>
+      <rect x="180" y="56" width="80" height="24" rx="4" fill="#172130" stroke="#2A3A4C"/><text x="192" y="73" fill="#D9E5F0">MEMORY</text>
+      <rect x="270" y="56" width="58" height="24" rx="4" fill="#172130" stroke="#2A3A4C"/><text x="282" y="73" fill="#D9E5F0">MAIL</text>
+      <rect x="338" y="56" width="88" height="24" rx="4" fill="#172130" stroke="#2A3A4C"/><text x="350" y="73" fill="#D9E5F0">STORAGE</text>
+      <rect x="436" y="56" width="100" height="24" rx="4" fill="#172130" stroke="#2A3A4C"/><text x="448" y="73" fill="#D9E5F0">DATABASE</text>
+      <rect x="546" y="56" width="48" height="24" rx="4" fill="#172130" stroke="#2A3A4C"/><text x="558" y="73" fill="#D9E5F0">OPS</text>
+      <rect x="604" y="56" width="90" height="24" rx="4" fill="#172130" stroke="#2A3A4C"/><text x="616" y="73" fill="#D9E5F0">SETTINGS</text>
+    </g>
+  </g>
+
+  <g class="mono" transform="translate(262 636)">
+    <text x="0" y="0" class="head">4. ERWEITERTE EINSTELLUNGEN</text>
+    <rect x="0" y="24" width="1220" height="54" rx="5" fill="#0A0F15" stroke="#2A3A4C"/>
+    <text x="18" y="58" class="mini">▼ ERWEITERTE PROFILDETAILS</text>
+    <text x="360" y="58" class="muted">Base URL · Service Name · Logs · Aktivierungsbefehle · Kontextwerte</text>
+  </g>
+</svg>
+
