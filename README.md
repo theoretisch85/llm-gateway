@@ -1,14 +1,23 @@
 # llm-gateway
 
-Ein lokaler OpenAI-kompatibler Orchestrator fuer VS Code Clients, der Requests an einen externen `llama.cpp`-Server weiterleitet. Der aktuelle Standardbetrieb ist `devstral-q3`, optional mit umschaltbaren MI50-Profilen wie `Qwen`.
+Self-hosted LLM Gateway mit OpenAI-kompatibler API, frei definierbaren Modellprofilen, Worker/Reviewer-Pipeline, Status-Monitoring, Admin-Konsole, MCP/Skills, Home Assistant, Gmail-Integration und Memory/Storage-Funktionen. Das Gateway fuehrt keine Inferenz selbst aus, sondern routet kontrolliert an externe `llama.cpp`-Backends wie `fast`/`devstral-q3` und `reviewer`.
 
 <p align="center">
-  <img src="docs/admin-hub-preview.png" alt="llm-gateway admin hub preview" width="1100">
+  <img src="docs/admin-hub-preview.svg" alt="llm-gateway compact admin console preview" width="1100">
 </p>
 
 <p align="center">
-  Linux-styliger Admin-Hub mit Dashboard, Profilumschaltung, Skills/MCP, Chat, Memory, Database, Storage, Home Assistant und Ops.
+  Kompakte Admin-Konsole mit linker Navigation, System-Monitor, Worker/Reviewer-Status, Pipeline, GPU0/GPU1-Telemetrie, Modellprofilen und Schnellzugriffen.
 </p>
+
+## Aktueller Fokus
+
+- OpenAI-kompatible `/v1` API fuer lokale Clients und OpenWebUI.
+- Runtime-Modellprofile ueber `.runtime/model_profiles.json` mit Rueckfall auf bestehende fast/deep-Logik.
+- Zwei lokale MI50-Profile: Worker auf GPU0 und Reviewer auf GPU1.
+- Minimaler reviewed-chat Pipeline-Endpunkt mit Concurrency-Limit.
+- Live-Status fuer Gateway und aktive Modellprofile ueber `/v1/status`.
+- Admin UI im kompakten Dashboard/Status-Stil fuer Betrieb, Profile, Mail, Devices, Ops und Settings.
 
 ## Praxis-Setup
 
