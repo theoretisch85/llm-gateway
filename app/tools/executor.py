@@ -6,7 +6,9 @@ from typing import Any
 
 from app.audit.tool_audit import audit_tool_execution
 from app.config import Settings
-from app.tools.registry import find_registered_tool, is_role_allowed
+from app.tools.policies import is_tool_allowed_for_role
+from app.tools.registry import find_registered_tool
+from app.tools.validators import sanitize_tool_arguments, validate_tool_arguments
 
 
 class ToolExecutionError(RuntimeError):
@@ -38,9 +40,17 @@ class ToolPermissionError(ToolExecutionError):
 @dataclass(frozen=True)
 class ToolExecutionContext:
     request_id: str
-    actor_id: str
-    actor_role: str
+    role: str
+    principal_id: str
     source: str
+
+    @property
+    def actor_id(self) -> str:
+        return self.principal_id
+
+    @property
+    def actor_role(self) -> str:
+        return self.role
 
 
 class ToolExecutor:
@@ -56,12 +66,19 @@ class ToolExecutor:
         if tool is None:
             raise ToolNotFoundError(tool_name)
 
-        if not is_role_allowed(tool, context.actor_role):
-            raise ToolPermissionError(tool_name, context.actor_role)
+        if not is_tool_allowed_for_role(role=context.role, allowed_roles=tool.allowed_roles):
+            raise ToolPermissionError(tool_name, context.role)
+
+        validated_arguments = validate_tool_arguments(
+            tool_name=tool.name,
+            args=arguments,
+            settings=settings,
+        )
+        sanitized_arguments = sanitize_tool_arguments(validated_arguments)
 
         started_at = time.perf_counter()
         try:
-            result = await tool.handler(settings, arguments)
+            result = await tool.handler(settings, validated_arguments)
         except Exception as exc:
             audit_tool_execution(
                 request_id=context.request_id,
@@ -69,7 +86,7 @@ class ToolExecutor:
                 actor_role=context.actor_role,
                 source=context.source,
                 tool_name=tool.name,
-                arguments=arguments,
+                arguments=sanitized_arguments,
                 duration_ms=(time.perf_counter() - started_at) * 1000,
                 ok=False,
                 error=exc,
@@ -82,7 +99,7 @@ class ToolExecutor:
             actor_role=context.actor_role,
             source=context.source,
             tool_name=tool.name,
-            arguments=arguments,
+            arguments=sanitized_arguments,
             duration_ms=(time.perf_counter() - started_at) * 1000,
             ok=True,
             result=result,

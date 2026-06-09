@@ -4,9 +4,12 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from app.config import Settings
-from app.core.roles import ROLE_ADMIN, ROLE_DEVICE
+from app.core.roles import ROLE_ADMIN, ROLE_DEVICE, ROLE_USER
 from app.services.backend_control import run_ops_command
+from app.services.calm_news import CalmNewsClient
+from app.services.gmail import GmailClient, classify_gmail_messages
 from app.services.home_assistant import HomeAssistantClient
+from app.services.math_service import calculate_expression
 from app.services.mcp_custom_tools import delete_custom_mcp_tool, list_custom_mcp_tools, save_custom_mcp_tool
 from app.services.storage_library import get_document_contexts, list_documents
 
@@ -72,6 +75,59 @@ async def _ha_call(settings: Settings, args: dict[str, Any]) -> Any:
     )
 
 
+async def _news_get_latest(settings: Settings, args: dict[str, Any]) -> Any:
+    client = CalmNewsClient(settings)
+    return await client.get_latest(params=_news_query_params(args))
+
+
+async def _news_get_calm(settings: Settings, args: dict[str, Any]) -> Any:
+    client = CalmNewsClient(settings)
+    return await client.get_calm(params=_news_query_params(args))
+
+
+async def _news_get_positive(settings: Settings, args: dict[str, Any]) -> Any:
+    client = CalmNewsClient(settings)
+    return await client.get_positive(params=_news_query_params(args))
+
+
+async def _news_get_relevant(settings: Settings, args: dict[str, Any]) -> Any:
+    client = CalmNewsClient(settings)
+    return await client.get_relevant(params=_news_query_params(args))
+
+
+async def _news_get_article(settings: Settings, args: dict[str, Any]) -> Any:
+    article_id = str(args.get("id") or args.get("article_id") or "").strip()
+    client = CalmNewsClient(settings)
+    return await client.get_article(article_id, params=_news_query_params(args))
+
+
+async def _news_get_system_status(settings: Settings, args: dict[str, Any]) -> Any:
+    _ = args
+    client = CalmNewsClient(settings)
+    return await client.get_system_status()
+
+
+async def _news_get_sources(settings: Settings, args: dict[str, Any]) -> Any:
+    client = CalmNewsClient(settings)
+    return await client.get_sources(params=_news_query_params(args, include_filters=False, include_source=True))
+
+
+async def _news_trigger_ingest(settings: Settings, args: dict[str, Any]) -> Any:
+    client = CalmNewsClient(settings)
+    return await client.trigger_ingest(params=_news_query_params(args, include_filters=False, include_source=True))
+
+
+async def _news_get_last_ingest(settings: Settings, args: dict[str, Any]) -> Any:
+    client = CalmNewsClient(settings)
+    return await client.get_last_ingest(params=_news_query_params(args, include_filters=False, include_source=True))
+
+
+async def _news_set_source_status(settings: Settings, args: dict[str, Any]) -> Any:
+    source_id = str(args.get("id") or args.get("source_id") or "").strip()
+    client = CalmNewsClient(settings)
+    return await client.set_source_status(source_id, payload=_news_source_payload(args))
+
+
 async def _storage_list(settings: Settings, args: dict[str, Any]) -> Any:
     limit = int(args.get("limit") or 30)
     return await list_documents(settings, limit=limit)
@@ -105,6 +161,57 @@ async def _gateway_ops(settings: Settings, args: dict[str, Any]) -> Any:
         return run_ops_command(target, command)
     except RuntimeError as exc:
         raise ValueError(str(exc)) from exc
+
+
+async def _mail_list_recent(settings: Settings, args: dict[str, Any]) -> Any:
+    client = GmailClient(settings)
+    label_ids = args.get("label_ids") or []
+    if isinstance(label_ids, str):
+        parsed_labels = [item.strip() for item in label_ids.split(",") if item.strip()]
+    elif isinstance(label_ids, list):
+        parsed_labels = [str(item).strip() for item in label_ids if str(item).strip()]
+    else:
+        parsed_labels = []
+    return await client.list_recent(
+        limit=int(args.get("limit") or 20),
+        query=str(args.get("q") or "").strip() or None,
+        label_ids=parsed_labels,
+        include_spam_trash=bool(args.get("include_spam_trash")),
+    )
+
+
+async def _mail_get_message(settings: Settings, args: dict[str, Any]) -> Any:
+    client = GmailClient(settings)
+    return await client.get_message(str(args.get("message_id") or args.get("id") or "").strip())
+
+
+async def _mail_classify_recent(settings: Settings, args: dict[str, Any]) -> Any:
+    client = GmailClient(settings)
+    label_ids = args.get("label_ids") or []
+    if isinstance(label_ids, str):
+        parsed_labels = [item.strip() for item in label_ids.split(",") if item.strip()]
+    elif isinstance(label_ids, list):
+        parsed_labels = [str(item).strip() for item in label_ids if str(item).strip()]
+    else:
+        parsed_labels = []
+    recent = await client.list_recent(
+        limit=int(args.get("limit") or 12),
+        query=str(args.get("q") or "").strip() or None,
+        label_ids=parsed_labels,
+        include_spam_trash=bool(args.get("include_spam_trash")),
+    )
+    classified = await classify_gmail_messages(settings, recent.get("messages") or [])
+    return {
+        **recent,
+        "messages": classified.get("messages") or [],
+        "classification_model": classified.get("model") or settings.effective_fast_model.public_name,
+    }
+
+
+async def _math_calculate(settings: Settings, args: dict[str, Any]) -> Any:
+    _ = settings
+    expression = str(args.get("expression") or "").strip()
+    return calculate_expression(expression)
 
 
 async def _custom_tool_list(settings: Settings, args: dict[str, Any]) -> Any:
@@ -154,6 +261,57 @@ def _custom_ops_tool_handler(target: str, command: str) -> ToolHandler:
     return _handler
 
 
+def _news_query_params(
+    args: dict[str, Any],
+    *,
+    include_filters: bool = True,
+    include_source: bool = True,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+
+    if args.get("limit") is not None:
+        params["limit"] = int(args["limit"])
+    if args.get("tone") is not None:
+        params["tone"] = str(args["tone"]).strip()
+    if include_source and args.get("source") is not None:
+        params["source"] = str(args["source"]).strip()
+    if include_filters and args.get("min_relevance") is not None:
+        params["min_relevance"] = int(args["min_relevance"])
+    if include_filters and args.get("max_stress") is not None:
+        params["max_stress"] = int(args["max_stress"])
+
+    return {key: value for key, value in params.items() if value != ""}
+
+
+def _news_source_payload(args: dict[str, Any]) -> dict[str, Any]:
+    raw_payload = args.get("payload")
+    if isinstance(raw_payload, dict) and raw_payload:
+        return raw_payload
+
+    payload: dict[str, Any] = {}
+    if "enabled" in args and args.get("enabled") is not None:
+        payload["enabled"] = _coerce_bool(args.get("enabled"))
+    if "status" in args and args.get("status") is not None:
+        payload["status"] = str(args.get("status")).strip()
+
+    payload = {key: value for key, value in payload.items() if value != ""}
+    if not payload:
+        raise ValueError("payload oder enabled/status ist erforderlich.")
+    return payload
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    raise ValueError("enabled muss true oder false sein.")
+
+
 def _builtin_tools() -> list[ToolDefinition]:
     return [
         _tool(
@@ -178,6 +336,212 @@ def _builtin_tools() -> list[ToolDefinition]:
             },
             output_schema={"type": "object"},
             handler=_ha_call,
+        ),
+        _tool(
+            name="news.get_latest",
+            description="Laedt die neuesten calm_news-Eintraege ueber den Gateway.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer"},
+                    "tone": {"type": "string"},
+                    "source": {"type": "string"},
+                    "min_relevance": {"type": "integer"},
+                    "max_stress": {"type": "integer"},
+                },
+            },
+            output_schema={"type": "object"},
+            handler=_news_get_latest,
+        ),
+        _tool(
+            name="news.get_calm",
+            description="Laedt calm kuratierte Nachrichten aus calm_news ueber den Gateway.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer"},
+                    "tone": {"type": "string"},
+                    "source": {"type": "string"},
+                    "min_relevance": {"type": "integer"},
+                    "max_stress": {"type": "integer"},
+                },
+            },
+            output_schema={"type": "object"},
+            handler=_news_get_calm,
+        ),
+        _tool(
+            name="news.get_positive",
+            description="Laedt positive Nachrichten aus calm_news ueber den Gateway.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer"},
+                    "tone": {"type": "string"},
+                    "source": {"type": "string"},
+                    "min_relevance": {"type": "integer"},
+                    "max_stress": {"type": "integer"},
+                },
+            },
+            output_schema={"type": "object"},
+            handler=_news_get_positive,
+        ),
+        _tool(
+            name="news.get_relevant",
+            description="Laedt relevante Nachrichten aus calm_news ueber den Gateway.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer"},
+                    "tone": {"type": "string"},
+                    "source": {"type": "string"},
+                    "min_relevance": {"type": "integer"},
+                    "max_stress": {"type": "integer"},
+                },
+            },
+            output_schema={"type": "object"},
+            handler=_news_get_relevant,
+        ),
+        _tool(
+            name="news.get_article",
+            description="Laedt einen einzelnen calm_news-Artikel ueber seine ID.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "tone": {"type": "string"},
+                },
+                "required": ["id"],
+            },
+            output_schema={"type": "object"},
+            handler=_news_get_article,
+        ),
+        _tool(
+            name="news.get_system_status",
+            description="Laedt den Systemstatus der calm_news-App.",
+            input_schema={"type": "object", "properties": {}},
+            output_schema={"type": "object"},
+            handler=_news_get_system_status,
+        ),
+        _tool(
+            name="news.get_sources",
+            description="Listet konfigurierte calm_news-Quellen.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                },
+            },
+            output_schema={"type": "object"},
+            handler=_news_get_sources,
+        ),
+        _tool(
+            name="news.trigger_ingest",
+            description="Startet einen calm_news-Ingest ueber den Gateway.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                },
+            },
+            output_schema={"type": "object"},
+            handler=_news_trigger_ingest,
+            allowed_roles=(ROLE_ADMIN,),
+        ),
+        _tool(
+            name="news.get_last_ingest",
+            description="Laedt den letzten bekannten calm_news-Ingest-Status.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                },
+            },
+            output_schema={"type": "object"},
+            handler=_news_get_last_ingest,
+        ),
+        _tool(
+            name="news.set_source_status",
+            description="Aendert den Status einer calm_news-Quelle.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "enabled": {"type": "boolean"},
+                    "status": {"type": "string"},
+                    "payload": {"type": "object"},
+                },
+                "required": ["id"],
+            },
+            output_schema={"type": "object"},
+            handler=_news_set_source_status,
+            allowed_roles=(ROLE_ADMIN,),
+        ),
+        _tool(
+            name="mail.list_recent",
+            description="Listet aktuelle Gmail-Nachrichten inkl. Header-Hinweisen wie List-Unsubscribe.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer"},
+                    "q": {"type": "string"},
+                    "label_ids": {"type": ["array", "string"], "items": {"type": "string"}},
+                    "include_spam_trash": {"type": "boolean"},
+                },
+            },
+            output_schema={"type": "object"},
+            handler=_mail_list_recent,
+            allowed_roles=(ROLE_ADMIN,),
+        ),
+        _tool(
+            name="mail.get_message",
+            description="Laedt eine einzelne Gmail-Nachricht inkl. Textinhalt.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string"},
+                    "id": {"type": "string"},
+                },
+            },
+            output_schema={"type": "object"},
+            handler=_mail_get_message,
+            allowed_roles=(ROLE_ADMIN,),
+        ),
+        _tool(
+            name="mail.classify_recent",
+            description="Laedt aktuelle Gmail-Nachrichten und klassifiziert sie ueber das bestehende LLM.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer"},
+                    "q": {"type": "string"},
+                    "label_ids": {"type": ["array", "string"], "items": {"type": "string"}},
+                    "include_spam_trash": {"type": "boolean"},
+                },
+            },
+            output_schema={"type": "object"},
+            handler=_mail_classify_recent,
+            allowed_roles=(ROLE_ADMIN,),
+        ),
+        _tool(
+            name="math.calculate",
+            description="Berechnet deterministisch mathematische Ausdruecke.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string"},
+                },
+                "required": ["expression"],
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string"},
+                    "result": {"type": ["number", "integer"]},
+                },
+                "required": ["expression", "result"],
+            },
+            handler=_math_calculate,
+            allowed_roles=(ROLE_ADMIN, ROLE_DEVICE, ROLE_USER),
         ),
         _tool(
             name="storage.list",

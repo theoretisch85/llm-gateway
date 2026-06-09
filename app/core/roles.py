@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 
 ROLE_ADMIN = "admin"
+ROLE_USER = "user"
 ROLE_DEVICE = "device"
 ROLE_SERVICE = "service"
 

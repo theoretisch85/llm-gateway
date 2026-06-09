@@ -329,28 +329,107 @@ def _extract_percent_from_text(output: str, label: str) -> float | None:
     return None
 
 
-def _first_gpu_payload(payload):
+def _collect_gpu_payloads(payload):
     if isinstance(payload, dict):
-        for key, value in payload.items():
-            if isinstance(value, dict) and ("card" in str(key).lower() or "gpu" in str(key).lower()):
-                return value
+        direct_cards = [
+            (str(key), value)
+            for key, value in payload.items()
+            if isinstance(value, dict) and ("card" in str(key).lower() or "gpu" in str(key).lower())
+        ]
+        if direct_cards:
+            return direct_cards
         for value in payload.values():
-            if isinstance(value, dict):
-                nested = _first_gpu_payload(value)
-                if nested is not None:
+            if isinstance(value, (dict, list)):
+                nested = _collect_gpu_payloads(value)
+                if nested:
                     return nested
     elif isinstance(payload, list):
+        collected = []
         for item in payload:
-            nested = _first_gpu_payload(item)
-            if nested is not None:
-                return nested
-    return payload if isinstance(payload, dict) else None
+            nested = _collect_gpu_payloads(item)
+            if nested:
+                collected.extend(nested)
+        if collected:
+            return collected
+    return [("gpu0", payload)] if isinstance(payload, dict) else []
 
 
 def _bytes_to_gib(value: float | None) -> float | None:
     if value is None:
         return None
     return round(value / (1024**3), 2)
+
+
+def _compact_metric_text(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return f"{float(value):.1f}".rstrip("0").rstrip(".")
+
+
+def _extract_gpu_metrics(gpu_payload) -> dict[str, float | None]:
+    temperature_c = _find_metric_value(gpu_payload, ["temp"], ["junction", "mem"])
+    if temperature_c is None:
+        temperature_c = _find_metric_value(gpu_payload, ["temperature"], ["junction", "mem"])
+
+    gpu_usage_percent = _find_metric_value(gpu_payload, ["gpu", "use"], ["vram"])
+    if gpu_usage_percent is None:
+        gpu_usage_percent = _find_metric_value(gpu_payload, ["gpu", "percent"], ["vram"])
+
+    power_w = _find_metric_value(gpu_payload, ["power"], ["cap", "max"])
+    vram_used = _find_metric_value(gpu_payload, ["vram", "used"])
+    vram_total = _find_metric_value(gpu_payload, ["vram", "total"])
+    if vram_total is None:
+        vram_total = _find_metric_value(gpu_payload, ["vram", "usable"])
+    vram_percent = _find_metric_value(gpu_payload, ["vram", "percent"])
+    if vram_percent is None:
+        vram_percent = _find_metric_value(gpu_payload, ["vram", "use"])
+    if vram_percent is None:
+        vram_percent = _find_metric_value(gpu_payload, ["allocated", "vram"])
+    if vram_percent is None:
+        vram_percent = _find_metric_value(gpu_payload, ["vram"])
+
+    vram_used_gib = _bytes_to_gib(vram_used) if (vram_used or 0) > 4096 else round(vram_used, 2) if vram_used is not None else None
+    vram_total_gib = _bytes_to_gib(vram_total) if (vram_total or 0) > 4096 else round(vram_total, 2) if vram_total is not None else None
+    if vram_percent is None and vram_used is not None and vram_total not in (None, 0):
+        vram_percent = round((vram_used / vram_total) * 100, 1)
+
+    return {
+        "gpu_usage_percent": round(gpu_usage_percent, 1) if gpu_usage_percent is not None else None,
+        "temperature_c": round(temperature_c, 1) if temperature_c is not None else None,
+        "power_w": round(power_w, 1) if power_w is not None else None,
+        "vram_used_gib": vram_used_gib,
+        "vram_total_gib": vram_total_gib,
+        "vram_percent": round(vram_percent, 1) if vram_percent is not None else None,
+    }
+
+
+def _format_gpu_metric_summary(gpu_cards: list[dict[str, object]], field_name: str, suffix: str) -> str | None:
+    parts: list[str] = []
+    for card in gpu_cards:
+        value = card.get(field_name)
+        compact = _compact_metric_text(value if isinstance(value, (int, float)) else None)
+        if compact is None:
+            continue
+        parts.append(f"{card['short_label']} {compact}{suffix}")
+    return "/".join(parts) if parts else None
+
+
+def _format_gpu_vram_summary(gpu_cards: list[dict[str, object]]) -> str | None:
+    parts: list[str] = []
+    for card in gpu_cards:
+        vram_percent = card.get("vram_percent")
+        compact_percent = _compact_metric_text(vram_percent if isinstance(vram_percent, (int, float)) else None)
+        if compact_percent is not None:
+            parts.append(f"{card['short_label']} {compact_percent}%")
+            continue
+
+        vram_used = card.get("vram_used_gib")
+        vram_total = card.get("vram_total_gib")
+        compact_used = _compact_metric_text(vram_used if isinstance(vram_used, (int, float)) else None)
+        compact_total = _compact_metric_text(vram_total if isinstance(vram_total, (int, float)) else None)
+        if compact_used is not None and compact_total is not None:
+            parts.append(f"{card['short_label']} {compact_used}/{compact_total}G")
+    return "/".join(parts) if parts else None
 
 
 def _read_cpu_times() -> tuple[float, float] | None:
@@ -434,6 +513,12 @@ def gateway_system_telemetry() -> dict[str, object]:
         "vram_used_gib": None,
         "vram_total_gib": None,
         "vram_percent": None,
+        "gpu_count": 0,
+        "gpu_cards": [],
+        "gpu_summary_usage": None,
+        "gpu_summary_temp": None,
+        "gpu_summary_power": None,
+        "gpu_summary_vram": None,
     }
 
     try:
@@ -472,53 +557,44 @@ def kai_telemetry() -> dict[str, object]:
             "raw_output": output,
         }
 
-    gpu_payload = _first_gpu_payload(payload) or payload
-    temperature_c = _find_metric_value(gpu_payload, ["temp"], ["junction", "mem"])
-    if temperature_c is None:
-        temperature_c = _find_metric_value(gpu_payload, ["temperature"], ["junction", "mem"])
+    gpu_cards: list[dict[str, object]] = []
+    for index, (_raw_label, gpu_payload) in enumerate(_collect_gpu_payloads(payload)):
+        metrics = _extract_gpu_metrics(gpu_payload)
+        if all(
+            metrics.get(field_name) is None
+            for field_name in ["temperature_c", "gpu_usage_percent", "power_w", "vram_used_gib", "vram_total_gib", "vram_percent"]
+        ):
+            continue
+        gpu_cards.append(
+            {
+                "label": f"GPU{index}",
+                "short_label": f"G{index}",
+                **metrics,
+            }
+        )
 
-    gpu_usage_percent = _find_metric_value(gpu_payload, ["gpu", "use"], ["vram"])
-    if gpu_usage_percent is None:
-        gpu_usage_percent = _find_metric_value(gpu_payload, ["gpu", "percent"], ["vram"])
-
-    power_w = _find_metric_value(gpu_payload, ["power"], ["cap", "max"])
-    vram_used = _find_metric_value(gpu_payload, ["vram", "used"])
-    vram_total = _find_metric_value(gpu_payload, ["vram", "total"])
-    if vram_total is None:
-        vram_total = _find_metric_value(gpu_payload, ["vram", "usable"])
-    vram_percent = _find_metric_value(gpu_payload, ["vram", "percent"])
-    if vram_percent is None:
-        vram_percent = _find_metric_value(gpu_payload, ["vram", "use"])
-    if vram_percent is None:
-        vram_percent = _find_metric_value(gpu_payload, ["allocated", "vram"])
-    if vram_percent is None:
-        vram_percent = _find_metric_value(gpu_payload, ["vram"])
-
-    vram_used_gib = _bytes_to_gib(vram_used) if (vram_used or 0) > 4096 else round(vram_used, 2) if vram_used is not None else None
-    vram_total_gib = _bytes_to_gib(vram_total) if (vram_total or 0) > 4096 else round(vram_total, 2) if vram_total is not None else None
-    if vram_percent is None and vram_used is not None and vram_total not in (None, 0):
-        vram_percent = round((vram_used / vram_total) * 100, 1) if vram_total > 4096 else round((vram_used / vram_total) * 100, 1)
-
-    if vram_percent is None:
-        vram_percent = _extract_percent_from_text(output, "VRAM%")
-    if gpu_usage_percent is None:
-        gpu_usage_percent = _extract_percent_from_text(output, "GPU%")
-
-    if all(metric is None for metric in [temperature_c, gpu_usage_percent, power_w, vram_used_gib, vram_total_gib, vram_percent]):
+    if not gpu_cards:
         return {
             "status": "degraded",
             "message": "rocm-smi JSON erkannt, aber keine bekannten Kennzahlen gefunden.",
             "raw_output": output,
         }
 
+    primary_gpu = gpu_cards[0]
     return {
         "status": "ok",
-        "gpu_usage_percent": round(gpu_usage_percent, 1) if gpu_usage_percent is not None else None,
-        "temperature_c": round(temperature_c, 1) if temperature_c is not None else None,
-        "power_w": round(power_w, 1) if power_w is not None else None,
-        "vram_used_gib": vram_used_gib,
-        "vram_total_gib": vram_total_gib,
-        "vram_percent": vram_percent,
+        "gpu_usage_percent": primary_gpu.get("gpu_usage_percent"),
+        "temperature_c": primary_gpu.get("temperature_c"),
+        "power_w": primary_gpu.get("power_w"),
+        "vram_used_gib": primary_gpu.get("vram_used_gib"),
+        "vram_total_gib": primary_gpu.get("vram_total_gib"),
+        "vram_percent": primary_gpu.get("vram_percent"),
+        "gpu_count": len(gpu_cards),
+        "gpu_cards": gpu_cards,
+        "gpu_summary_usage": _format_gpu_metric_summary(gpu_cards, "gpu_usage_percent", "%"),
+        "gpu_summary_temp": _format_gpu_metric_summary(gpu_cards, "temperature_c", "C"),
+        "gpu_summary_power": _format_gpu_metric_summary(gpu_cards, "power_w", "W"),
+        "gpu_summary_vram": _format_gpu_vram_summary(gpu_cards),
     }
 
 

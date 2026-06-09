@@ -6,9 +6,11 @@ from fastapi.responses import JSONResponse
 from app.api_errors import error_response
 from app.auth import require_mcp_auth
 from app.config import get_settings
-from app.core.roles import ActorContext, normalize_mcp_role
+from app.core.request_context import RequestContext
+from app.core.roles import normalize_mcp_role
 from app.orchestrator import ToolOrchestrator
 from app.schemas.mcp import MCPCallRequest, MCPCallResponse, MCPToolsResponse, MCPTool
+from app.services.calm_news import CalmNewsConfigError, CalmNewsRequestError
 from app.services.home_assistant import HomeAssistantConfigError, HomeAssistantRequestError
 from app.tools.executor import ToolNotFoundError, ToolPermissionError
 
@@ -40,17 +42,17 @@ async def call_mcp_tool(
     auth_subject: str = Depends(require_mcp_auth),
 ) -> MCPCallResponse | JSONResponse:
     role = normalize_mcp_role(auth_subject)
-    actor = ActorContext(
-        actor_id=auth_subject or "unknown",
+    context = RequestContext(
+        request_id=request.state.request_id,
         role=role,
+        principal_id=auth_subject or "unknown",
         source="api.mcp",
     )
     settings = get_settings()
     try:
         result = await tool_orchestrator.execute_tool(
             settings=settings,
-            actor=actor,
-            request_id=request.state.request_id,
+            context=context,
             tool_name=payload.tool,
             arguments=payload.arguments,
         )
@@ -85,6 +87,27 @@ async def call_mcp_tool(
             message=exc.message,
             error_type="upstream_error",
             code="home_assistant_request_failed",
+        )
+    except CalmNewsConfigError as exc:
+        return error_response(
+            request_id=request.state.request_id,
+            status_code=exc.status_code,
+            message=exc.message,
+            error_type="service_unavailable",
+            code=exc.code,
+            headers={"X-Upstream-Service": "calm_news"},
+        )
+    except CalmNewsRequestError as exc:
+        headers = {"X-Upstream-Service": "calm_news"}
+        if exc.upstream_request_id:
+            headers["X-Upstream-Request-ID"] = exc.upstream_request_id
+        return error_response(
+            request_id=request.state.request_id,
+            status_code=exc.status_code,
+            message=exc.message,
+            error_type="upstream_error",
+            code=exc.code,
+            headers=headers,
         )
     except ValueError as exc:
         return error_response(

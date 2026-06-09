@@ -9,6 +9,7 @@ from app.config import get_settings
 from app.context_guard import ContextGuardError, fit_messages_to_budget
 from app.schemas.chat import ChatCompletionRequest
 from app.services.llamacpp_client import LlamaCppClient, LlamaCppError, LlamaCppTimeoutError
+from app.services.model_profiles import ModelProfileDisabledError, ModelProfileInvalidError
 
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,27 @@ async def create_chat_completion(
 
     backend_payload = payload.model_dump(exclude_none=True)
     backend_payload["messages"] = guard_result.messages
-    target = settings.resolve_target_for_public_model(payload.model)
+    try:
+        target = settings.resolve_target_for_public_model(payload.model)
+    except ModelProfileDisabledError as exc:
+        logger.warning("model profile disabled model=%s error=%s", payload.model, exc)
+        return error_response(
+            request_id=request_id,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="Requested model profile is disabled.",
+            error_type="model_profile_error",
+            code="model_profile_disabled",
+        )
+    except ModelProfileInvalidError as exc:
+        logger.error("model profile invalid model=%s error=%s", payload.model, exc)
+        return error_response(
+            request_id=request_id,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message="Requested model profile is not configured correctly.",
+            error_type="model_profile_error",
+            code="model_profile_invalid",
+        )
+
     backend_payload["model"] = target.backend_name
     if backend_payload.get("max_tokens") is None:
         backend_payload["max_tokens"] = settings.default_max_tokens

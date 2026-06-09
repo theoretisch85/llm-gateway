@@ -61,6 +61,14 @@ Dieses Grundgeruest stellt drei Endpunkte bereit:
 - `GET /api/admin/home-assistant/entities`
 - `POST /api/admin/home-assistant/action`
 - `POST /api/device/home-assistant/action`
+- `GET /api/news/latest`
+- `GET /api/news/calm`
+- `GET /api/news/positive`
+- `GET /api/news/relevant`
+- `GET /api/news/system/status`
+- `GET /api/news/sources`
+- `POST /api/news/ingest/run`
+- `GET /api/news/ingest/last`
 
 Die Minimalversion priorisiert:
 
@@ -624,6 +632,60 @@ curl -s http://127.0.0.1:8000/api/device/home-assistant/action \
   }'
 ```
 
+## calm_news-Integration
+
+Der Gateway kann eine bereits laufende `calm_news`-App als externen HTTP-Dienst davor schalten, ohne deren Business-Logik zu kopieren.
+
+Konfigurationsschalter:
+
+- `CALM_NEWS_ENABLED`
+- `CALM_NEWS_BASE_URL`
+- `CALM_NEWS_TIMEOUT`
+
+Direkte Gateway-Endpunkte:
+
+- `GET /api/news/latest`
+- `GET /api/news/calm`
+- `GET /api/news/positive`
+- `GET /api/news/relevant`
+- `GET /api/news/{id}`
+- `GET /api/news/system/status`
+- `GET /api/news/sources`
+- `POST /api/news/ingest/run`
+- `GET /api/news/ingest/last`
+- `PATCH /api/news/sources/{id}`
+
+Unterstuetzte Query-Parameter, wo sinnvoll:
+
+- `limit`
+- `tone`
+- `source`
+- `min_relevance`
+- `max_stress`
+
+Antworten werden im Gateway bewusst leicht vereinheitlicht:
+
+- `success`
+- `request_id` falls der Upstream einen liefert
+- `upstream: "calm_news"`
+- `data`
+
+Wenn `calm_news` nicht erreichbar ist, bleibt der Gateway stabil und gibt stattdessen einen normalisierten Upstream-Fehler mit Gateway-`request_id` zurueck. Timeouts und 4xx/5xx der News-App werden ebenfalls sauber weitergereicht.
+
+Beispiele:
+
+```bash
+TOKEN=$(sed -n 's/^API_BEARER_TOKEN=//p' /opt/llm-gateway/.env)
+
+curl -s "http://127.0.0.1:8000/api/news/latest?limit=5&max_stress=0.35" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```bash
+curl -s -X POST "http://127.0.0.1:8000/api/news/ingest/run?source=tagesschau" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
 ## Database- und Storage-Tab
 
 Im Admin-Hub gibt es jetzt zusaetzlich:
@@ -903,6 +965,7 @@ Auth:
 - Standard ist `Authorization: Bearer API_BEARER_TOKEN`
 - Optional fuer Devices: `Authorization: Bearer DEVICE_SHARED_TOKEN` oder `X-Device-Token`
 - Sensitive Gateway-Tools (`gateway.ops`, `gateway.custom_tool.*` und daraus abgeleitete Custom-Ops-Tools) sind bewusst nur fuer Admin/API-Token erlaubt, nicht fuer Device-Token.
+- Die eingebauten `news.get_*`-Tools koennen calm_news lesen; `news.trigger_ingest` und `news.set_source_status` bleiben bewusst Admin-only.
 
 Beispiel:
 
@@ -916,8 +979,8 @@ curl -s http://127.0.0.1:8000/api/mcp/call \
   -H "Authorization: Bearer API_BEARER_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "tool":"ha.entities",
-    "arguments":{"domain":"light","limit":20}
+    "tool":"news.get_latest",
+    "arguments":{"limit":5,"max_stress":0.4}
   }'
 ```
 
