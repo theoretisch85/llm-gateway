@@ -2,13 +2,22 @@
 
 ## Projektbeschreibung
 
-Dieses Repository dient dem Aufbau eines lokalen OpenAI-kompatiblen Orchestrators fuer VS Code Clients.
-Der Dienst soll Requests entgegennehmen, validieren und an ein externes `llama.cpp`-Backend mit `Qwen2.5-Coder` weiterleiten.
+Dieses Repository ist ein lokaler OpenAI-kompatibler KI-Orchestrator fuer Chat, Coding, Agenten, Tools und Voice.
+Der Gateway nimmt Anfragen von OpenWebUI, VS Code/Codex, der eigenen Weboberflaeche, einem Raspberry-Pi-Voice-Interface, Home Assistant/n8n und weiteren externen OpenAI-kompatiblen Clients entgegen.
+
+Die Inferenz laeuft nicht im Gateway selbst, sondern auf externen `llama.cpp`-Backends. Der Gateway uebernimmt Routing, Validierung, frei definierbare Modellprofile, Worker/Reviewer-Pipelines, Monitoring, Memory-Anbindung und die Admin UI.
+
+Es werden zwei Betriebsarten unterschieden:
+
+1. Arbeitsmodus/Systemmodus: technische oder systemnahe Aufgaben laufen ueber eine Worker + Reviewer Pipeline. Der Worker erstellt einen kurzen Loesungsvorschlag, der Reviewer prueft Korrektheit, Risiken und fehlende Punkte.
+2. Chatmodus/Kai-Modus: persoenlicher Chat ueber Web, OpenWebUI oder Voice mit Memory und einem weiterentwickelbaren Charakter fuer Kai.
+
+Ein Toolmodus ist vorgesehen, aber nur mit Safety Layer, klarer Tool-Registry und expliziter Bestaetigung fuer riskante Aktionen. Gefaehrliche Aktionen duerfen nicht direkt und nicht ohne Pruefung/Freigabe ausgefuehrt werden.
 
 ## Ziel
 
-Ziel ist ein moeglichst einfacher, robuster OpenAI-kompatibler Proxy-Orchestrator fuer `llama.cpp` und `Qwen2.5-Coder`.
-Die Minimalversion priorisiert lokale Nutzbarkeit, nachvollziehbare Architektur und geringe Komplexitaet vor Erweiterungen.
+Ziel ist ein robuster, lokal betreibbarer KI-Gateway fuer mehrere Clients und Modellprofile, der bestehende OpenAI-kompatible Nutzung erhaelt und schrittweise um Agenten, Memory, Voice und kontrollierte Tools erweitert wird.
+Die Architektur soll bewusst evolutionaer bleiben: kein neues Framework, keine unnoetigen Abstraktionen und keine direkte Ausfuehrung riskanter Aktionen ohne Policy-Check und Freigabe.
 
 ## Tech-Stack
 

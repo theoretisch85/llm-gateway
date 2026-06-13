@@ -16,6 +16,15 @@ from app.request_context import RequestIdFilter, request_id_var
 settings = get_settings()
 logger = logging.getLogger("llm_gateway")
 
+
+def _clean_client_header(value: str | None) -> str:
+    if not value:
+        return "unknown"
+    cleaned = "".join(
+        char for char in value.strip().lower()[:64] if char.isalnum() or char in {"-", "_", "."}
+    )
+    return cleaned or "unknown"
+
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s request_id=%(request_id)s %(message)s",
@@ -35,12 +44,22 @@ app = FastAPI(
 async def log_requests(request: Request, call_next):
     started_at = time.perf_counter()
     request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    client_source = _clean_client_header(request.headers.get("X-Client-Source"))
+    client_device = _clean_client_header(request.headers.get("X-Client-Device"))
     request.state.request_id = request_id
+    request.state.client_source = client_source
+    request.state.client_device = client_device
     token = request_id_var.set(request_id)
     backend_called = False
     request.state.backend_called = backend_called
     metrics.record_request(request.url.path)
-    logger.info("incoming request method=%s path=%s", request.method, request.url.path)
+    logger.info(
+        "incoming request method=%s path=%s client_source=%s client_device=%s",
+        request.method,
+        request.url.path,
+        client_source,
+        client_device,
+    )
 
     try:
         response = await call_next(request)
@@ -57,13 +76,15 @@ async def log_requests(request: Request, call_next):
     duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
     metrics.record_response(response.status_code, duration_ms)
     response.headers["X-Request-ID"] = request_id
+    response.headers["X-Client-Source"] = client_source
     logger.info(
-        "completed request method=%s path=%s status=%s backend_called=%s duration_ms=%s",
+        "completed request method=%s path=%s status=%s backend_called=%s duration_ms=%s client_source=%s",
         request.method,
         request.url.path,
         response.status_code,
         getattr(request.state, "backend_called", False),
         duration_ms,
+        client_source,
     )
     request_id_var.reset(token)
     return response
